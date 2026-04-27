@@ -1,4 +1,4 @@
-"""§7.1 verification — Steps 1, 2, 3, 5, 6 reference tests."""
+"""§7.1 verification — Steps 1, 2, 3, 4, 5, 6 reference tests."""
 
 from __future__ import annotations
 
@@ -11,18 +11,22 @@ import pytest
 from eth_keys import keys
 from eth_utils import keccak
 
-from eerful.errors import VerificationError
+from eerful.errors import StorageError, TrustViolation, VerificationError
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.verify import (
+    fetch_evaluator_bundle_bytes,
     verify_receipt,
+    verify_receipt_with_storage,
     verify_step_1_receipt_integrity,
     verify_step_2_evaluator_bundle,
     verify_step_3_output_schema,
+    verify_step_4_attestation_report,
     verify_step_5_compose_hash_gating,
     verify_step_6_enclave_signature,
     verify_through_step_3,
 )
+from eerful.zg.storage import MockStorageClient
 
 
 _TEST_PRIVKEY = b"\x42" * 32
@@ -442,6 +446,215 @@ def test_verify_receipt_short_circuits_at_step_2_before_step_5():
     with pytest.raises(VerificationError) as exc:
         verify_receipt(r, other.canonical_bytes(), report_bytes)
     assert exc.value.step == 2
+
+
+# ---------------- Step 4 + storage-aware orchestrator ----------------
+
+
+def test_step_4_returns_report_bytes_when_storage_has_them():
+    """Step 4: storage holds bytes whose sha256 equals
+    receipt.attestation_report_hash → fetch returns those bytes."""
+    storage = MockStorageClient()
+    report_bytes, _ = _build_report()
+    rh = storage.upload_blob(report_bytes)
+    r = _receipt(_bundle(), attestation_report_hash=rh)
+    out = verify_step_4_attestation_report(r, storage)
+    assert out == report_bytes
+
+
+def test_step_4_fails_when_storage_has_no_entry():
+    """Step 4: nothing at the receipt's attestation_report_hash → storage
+    raises StorageError, Step 4 wraps it as VerificationError(step=4)."""
+    storage = MockStorageClient()  # empty
+    r = _receipt(_bundle(), attestation_report_hash="0x" + "e" * 64)
+    with pytest.raises(VerificationError) as exc:
+        verify_step_4_attestation_report(r, storage)
+    assert exc.value.step == 4
+    assert "not retrievable" in exc.value.reason
+
+
+def test_step_4_locally_rehashes_storage_bytes_defense_in_depth():
+    """Defense in depth: if a `StorageClient` impl forgoes its own
+    content check (legal under the Protocol — it's not a normative
+    obligation), Step 4 still catches a mismatch by re-hashing locally.
+    Spec §7.1 puts the hash check on the verifier."""
+
+    class _UncheckedStorage:
+        """A StorageClient that returns bytes hashing to a different
+        value than the one requested. Our adapters check this, but the
+        Protocol doesn't enforce it."""
+
+        def upload_blob(self, data: bytes) -> str:
+            raise NotImplementedError
+
+        def download_blob(self, content_hash: str) -> bytes:
+            return b"this hashes to something else entirely"
+
+    r = _receipt(_bundle(), attestation_report_hash="0x" + "e" * 64)
+    with pytest.raises(VerificationError) as exc:
+        verify_step_4_attestation_report(r, _UncheckedStorage())
+    assert exc.value.step == 4
+    assert "content hash mismatch" in exc.value.reason
+    assert "hashing to" in exc.value.reason
+
+
+def test_step_4_fails_when_storage_returns_wrong_bytes_as_trust_violation():
+    """Step 4: storage tampers with bytes (key no longer hashes to the
+    requested hash) → adapter raises TrustViolation, Step 4 attributes it."""
+
+    class _LyingStorage:
+        def upload_blob(self, data: bytes) -> str:
+            raise NotImplementedError
+
+        def download_blob(self, content_hash: str) -> bytes:
+            raise TrustViolation(
+                f"download-blob hash mismatch: requested {content_hash}, "
+                "received bytes hash to 0x" + "0" * 64
+            )
+
+    r = _receipt(_bundle(), attestation_report_hash="0x" + "e" * 64)
+    with pytest.raises(VerificationError) as exc:
+        verify_step_4_attestation_report(r, _LyingStorage())
+    assert exc.value.step == 4
+    assert "content hash mismatch" in exc.value.reason
+
+
+def test_fetch_evaluator_bundle_bytes_returns_bytes_when_present():
+    storage = MockStorageClient()
+    b = _bundle()
+    storage.upload_blob(b.canonical_bytes())
+    r = _receipt(b)
+    assert fetch_evaluator_bundle_bytes(r, storage) == b.canonical_bytes()
+
+
+def test_fetch_evaluator_bundle_bytes_attributes_storage_miss_to_step_2():
+    storage = MockStorageClient()  # empty
+    r = _receipt(_bundle())
+    with pytest.raises(VerificationError) as exc:
+        fetch_evaluator_bundle_bytes(r, storage)
+    assert exc.value.step == 2
+    assert "not retrievable" in exc.value.reason
+
+
+def test_fetch_evaluator_bundle_bytes_attributes_trust_violation_to_step_2():
+    class _LyingStorage:
+        def upload_blob(self, data: bytes) -> str:
+            raise NotImplementedError
+
+        def download_blob(self, content_hash: str) -> bytes:
+            raise TrustViolation("byzantine")
+
+    r = _receipt(_bundle())
+    with pytest.raises(VerificationError) as exc:
+        fetch_evaluator_bundle_bytes(r, _LyingStorage())
+    assert exc.value.step == 2
+    assert "content hash mismatch" in exc.value.reason
+
+
+def test_verify_receipt_with_storage_passes_full_chain():
+    """End-to-end: bundle + report fetched from storage, all spec steps
+    pass, VerificationResult shows enforced gating."""
+    storage = MockStorageClient()
+    report_bytes, hash_hex = _build_report()
+    b = _bundle(accepted_compose_hashes=[hash_hex])
+    storage.upload_blob(b.canonical_bytes())
+    rh = storage.upload_blob(report_bytes)
+    r = _receipt(b, attestation_report_hash=rh)
+
+    result = verify_receipt_with_storage(r, storage)
+    assert result.bundle.evaluator_id() == b.evaluator_id()
+    assert result.step5 is not None
+    assert result.step5.gating == "enforced"
+
+
+def test_verify_receipt_with_storage_skips_step_5_when_fetch_report_false():
+    """Explicit offline-Step-5 mode: no report fetch, no Step 5, no error
+    even if the report wouldn't be in storage."""
+    storage = MockStorageClient()
+    b = _bundle()
+    storage.upload_blob(b.canonical_bytes())
+    # NOTE: report is intentionally NOT uploaded.
+    r = _receipt(b)
+    result = verify_receipt_with_storage(r, storage, fetch_report=False)
+    assert result.step5 is None
+
+
+def test_verify_receipt_with_storage_short_circuits_at_step_2_before_step_4():
+    """Spec §7.1 ordering is normative: Step 2 fails before Step 4 even
+    if Step 4 would also fail. Bundle missing from storage → Step 2."""
+    storage = MockStorageClient()  # bundle and report both missing
+    b = _bundle()
+    r = _receipt(b)
+    with pytest.raises(VerificationError) as exc:
+        verify_receipt_with_storage(r, storage)
+    assert exc.value.step == 2
+
+
+def test_verify_receipt_with_storage_step_4_runs_before_step_5():
+    """Bundle present + report missing → Step 4 fails (not Step 5).
+    Catches a regression where Step 4 attribution leaks to Step 5
+    because Step 5 is what touches the report bytes."""
+    storage = MockStorageClient()
+    b = _bundle(accepted_compose_hashes=["0x" + "f" * 64])
+    storage.upload_blob(b.canonical_bytes())
+    # Report intentionally absent — Step 4 fetch will fail.
+    r = _receipt(b)
+    with pytest.raises(VerificationError) as exc:
+        verify_receipt_with_storage(r, storage)
+    assert exc.value.step == 4
+
+
+def test_verify_receipt_with_storage_propagates_step_5_failure():
+    """Storage holds the right bytes but the bundle's allowlist excludes
+    the attested compose-hash → Step 5 fails through the storage path."""
+    storage = MockStorageClient()
+    report_bytes, _ = _build_report()
+    b = _bundle(accepted_compose_hashes=["0x" + "f" * 64])  # not the attested hash
+    storage.upload_blob(b.canonical_bytes())
+    rh = storage.upload_blob(report_bytes)
+    r = _receipt(b, attestation_report_hash=rh)
+    with pytest.raises(VerificationError) as exc:
+        verify_receipt_with_storage(r, storage)
+    assert exc.value.step == 5
+
+
+def test_verify_receipt_with_storage_step_4_fetches_attestation_report_hash_not_evaluator_id():
+    """Defensive: Step 4 must look up by `attestation_report_hash`, not
+    by `evaluator_id`. Catches a swapped-fetch-key regression that
+    would silently pass when the bundle and report happened to live in
+    the same store."""
+    storage = MockStorageClient()
+    b = _bundle()
+    storage.upload_blob(b.canonical_bytes())
+    # Report has a *different* sha256 than the bundle, so a lookup by
+    # evaluator_id would return the bundle bytes, fail to parse as a
+    # report at Step 5, and be misattributed.
+    report_bytes, _ = _build_report()
+    rh = storage.upload_blob(report_bytes)
+    assert rh != b.evaluator_id()
+    r = _receipt(b, attestation_report_hash=rh)
+    out = verify_step_4_attestation_report(r, storage)
+    assert out == report_bytes
+
+
+def test_verify_receipt_with_storage_storage_error_at_step_4_uses_storage_subtype():
+    """A non-mock storage that raises a real StorageError (not a
+    TrustViolation) still attributes to Step 4. Covers the
+    `StorageError` branch separately from the `TrustViolation` branch
+    above."""
+
+    class _FlakyStorage:
+        def upload_blob(self, data: bytes) -> str:
+            raise NotImplementedError
+
+        def download_blob(self, content_hash: str) -> bytes:
+            raise StorageError("bridge offline")
+
+    r = _receipt(_bundle(), attestation_report_hash="0x" + "e" * 64)
+    with pytest.raises(VerificationError) as exc:
+        verify_step_4_attestation_report(r, _FlakyStorage())
+    assert exc.value.step == 4
+    assert "bridge offline" in exc.value.reason
 
 
 def test_verify_receipt_runs_step_5_before_step_6():

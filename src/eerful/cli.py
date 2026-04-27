@@ -1,11 +1,14 @@
 """eerful CLI.
 
 The `verify` subcommand runs the spec §7.1 verification algorithm against
-an on-disk receipt and prints a human-readable verdict. Step 4 (fetching
-the attestation report from 0G Storage) is not yet wired here — the
-caller passes `--report` with the report bytes on disk for now. When 0G
-Storage integration lands, Step 4 will run from `attestation_report_hash`
-without an explicit flag.
+an on-disk receipt and prints a human-readable verdict. By default it
+fetches both the evaluator bundle (Step 2) and the attestation report
+(Step 4) from 0G Storage by content hash via the local zg-bridge —
+matching the spec's normative form. `--bundle` and `--report` allow
+overriding either artifact with a local file (offline verification, dev
+loops, cached blobs); `--skip-step-5` lets a verifier without storage
+access for the report skip Step 5 entirely while still running Steps
+1–3 + 6.
 
 The `publish-evaluator` subcommand uploads a bundle to 0G Storage via the
 local zg-bridge so verifiers can fetch it by `evaluator_id` (the bundle's
@@ -20,6 +23,7 @@ The `evaluate` subcommand lands with the jig adapter.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import os
 import sys
@@ -30,7 +34,13 @@ from eerful.canonical import Bytes32Hex
 from eerful.errors import StorageError, TrustViolation, VerificationError
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
-from eerful.verify import VerificationResult, verify_receipt
+from eerful.verify import (
+    VerificationResult,
+    fetch_evaluator_bundle_bytes,
+    verify_receipt,
+    verify_receipt_with_storage,
+    verify_step_4_attestation_report,
+)
 from eerful.zg.storage import BridgeStorageClient, StorageClient
 
 
@@ -96,13 +106,22 @@ def _category_blurb(category: str) -> str:
     return "§8 category — unknown (compose did not match A/B/C heuristics)."
 
 
-def _print_verification_result(result: VerificationResult) -> None:
+def _print_verification_result(
+    result: VerificationResult, *, skip_step_5: bool = False
+) -> None:
     print("OK — Steps 1–3 passed.")
     print(f"  evaluator: {result.bundle.version} ({result.bundle.model_identifier})")
 
     step5 = result.step5
     if step5 is None:
-        print("  Step 5: not run (no --report supplied; pass --report to enforce §6.5).")
+        if skip_step_5:
+            print("  Step 5: skipped (--skip-step-5).")
+        else:
+            # Library callers can pass `report_bytes=None` directly to
+            # `verify_receipt`; the CLI never lands here without
+            # --skip-step-5 (storage fetch is the default). Keep the
+            # generic message for the library-call shape.
+            print("  Step 5: not run (no attestation report supplied).")
         print(
             "  caveat: without Step 5, model-environment binding is unverified — "
             "the receipt is integrity-checked but the §8 category is unknown."
@@ -127,8 +146,9 @@ def _print_verification_result(result: VerificationResult) -> None:
 
 def _cmd_verify(args: argparse.Namespace) -> int:
     receipt_path: Path = args.receipt
-    bundle_path: Path = args.bundle
+    bundle_path: Path | None = args.bundle
     report_path: Path | None = args.report
+    skip_step_5: bool = args.skip_step_5
 
     try:
         receipt = EnhancedReceipt.model_validate_json(receipt_path.read_bytes())
@@ -136,29 +156,157 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print(f"failed to load receipt at {receipt_path}: {e}", file=sys.stderr)
         return 2
 
-    try:
-        bundle_bytes = bundle_path.read_bytes()
-    except OSError as e:
-        print(f"failed to load bundle at {bundle_path}: {e}", file=sys.stderr)
-        return 2
-
-    if report_path is not None:
+    # Determine which artifacts must come from storage. If a local file
+    # was given for an artifact, use it; otherwise fetch from the bridge.
+    # `--skip-step-5` short-circuits the report fetch entirely.
+    bundle_from_file: bytes | None = None
+    if bundle_path is not None:
         try:
-            report_bytes: bytes | None = report_path.read_bytes()
+            bundle_from_file = bundle_path.read_bytes()
+        except OSError as e:
+            print(f"failed to load bundle at {bundle_path}: {e}", file=sys.stderr)
+            return 2
+
+    report_from_file: bytes | None = None
+    if report_path is not None:
+        if skip_step_5:
+            print(
+                "--report and --skip-step-5 are mutually exclusive: "
+                "--report supplies the bytes Step 5 needs.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            report_from_file = report_path.read_bytes()
         except OSError as e:
             print(f"failed to load report at {report_path}: {e}", file=sys.stderr)
             return 2
-    else:
-        report_bytes = None
+        # Step 4's content check applies to file-supplied bytes too —
+        # otherwise --report becomes a way to bypass report binding
+        # entirely. Doing it here at read time means BOTH the
+        # bridge-fetched-bundle-but-file-report path and the all-files
+        # no-bridge path are covered by the same check.
+        try:
+            _check_report_override_hash(receipt, report_from_file)
+        except VerificationError as e:
+            print(f"FAIL — verification step {e.step}: {e.reason}", file=sys.stderr)
+            return 1
+
+    need_bridge = bundle_from_file is None or (
+        report_from_file is None and not skip_step_5
+    )
 
     try:
-        result = verify_receipt(receipt, bundle_bytes, report_bytes)
+        if need_bridge:
+            bridge_url = args.bridge_url
+            if not _is_loopback_bridge_url(bridge_url) and not args.allow_remote_bridge:
+                print(
+                    f"refusing to query non-loopback bridge {bridge_url!r}. "
+                    "Re-run with --allow-remote-bridge if this is intentional "
+                    "and you trust the network path.",
+                    file=sys.stderr,
+                )
+                return 2
+            with BridgeStorageClient(bridge_url=bridge_url) as storage:
+                result = _verify_with_overrides(
+                    receipt,
+                    storage,
+                    bundle_override=bundle_from_file,
+                    report_override=report_from_file,
+                    skip_step_5=skip_step_5,
+                )
+        else:
+            # Both artifacts (or bundle + skip-step-5) from local files —
+            # no bridge needed. Run the pure pipeline directly. Report
+            # bytes were already hash-checked above, bundle bytes get
+            # the Step 2 hash check inside `verify_receipt`.
+            assert bundle_from_file is not None  # narrowed by need_bridge
+            result = verify_receipt(
+                receipt,
+                bundle_from_file,
+                None if skip_step_5 else report_from_file,
+            )
     except VerificationError as e:
         print(f"FAIL — verification step {e.step}: {e.reason}", file=sys.stderr)
         return 1
 
-    _print_verification_result(result)
+    _print_verification_result(result, skip_step_5=skip_step_5)
     return 0
+
+
+def _verify_with_overrides(
+    receipt: EnhancedReceipt,
+    storage: StorageClient,
+    *,
+    bundle_override: bytes | None,
+    report_override: bytes | None,
+    skip_step_5: bool,
+) -> VerificationResult:
+    """Run verification, mixing storage fetches with caller-supplied bytes.
+
+    The matrix:
+      - bundle_override given: use those bytes; else fetch from storage.
+      - report_override given: use those bytes; else fetch from storage,
+        unless `skip_step_5` is set, in which case Step 5 is skipped.
+
+    File-supplied bytes get the same Step-2/Step-4 content-hash check
+    that the storage path does — a producer mistake (or a malicious
+    file) that hands us a report whose hash doesn't match the receipt's
+    `attestation_report_hash` must surface as `VerificationError(step=4)`,
+    not as a silent pass through Step 5. Bundle override is similarly
+    checked at Step 2 (`verify_step_2_evaluator_bundle` does the hash +
+    parse on whatever bytes we hand it).
+
+    When neither override is set, this collapses to
+    `verify_receipt_with_storage` exactly. The override path lets a
+    verifier mix sources (e.g. cached bundle on disk + storage report)
+    without losing per-step error attribution.
+    """
+    if bundle_override is None and report_override is None:
+        return verify_receipt_with_storage(
+            receipt, storage, fetch_report=not skip_step_5
+        )
+
+    bundle_bytes = (
+        bundle_override
+        if bundle_override is not None
+        else fetch_evaluator_bundle_bytes(receipt, storage)
+    )
+    if skip_step_5:
+        report_bytes: bytes | None = None
+    elif report_override is not None:
+        # File-supplied report bytes are hash-checked at read time in
+        # `_cmd_verify` (so the no-bridge path is covered too), so we
+        # can pass them through here.
+        report_bytes = report_override
+    else:
+        report_bytes = verify_step_4_attestation_report(receipt, storage)
+    return verify_receipt(receipt, bundle_bytes, report_bytes)
+
+
+def _check_report_override_hash(
+    receipt: EnhancedReceipt, report_bytes: bytes
+) -> None:
+    """Raise VerificationError(step=4) if file-supplied report bytes
+    don't hash to receipt.attestation_report_hash.
+
+    Step 4 is "fetch report from storage and confirm content hash."
+    A file-supplied report skipped the fetch but the content check
+    still applies — without it `--report` would become a way to bypass
+    report binding entirely (Step 5 might parse and pass the allowlist
+    check on the wrong report). Centralized here so every CLI code path
+    that loads a report from disk goes through the same check.
+    """
+    actual = "0x" + hashlib.sha256(report_bytes).hexdigest()
+    if actual != receipt.attestation_report_hash:
+        raise VerificationError(
+            step=4,
+            reason=(
+                f"attestation report content hash mismatch: receipt names "
+                f"{receipt.attestation_report_hash}, --report file hashes "
+                f"to {actual}"
+            ),
+        )
 
 
 def _publish_evaluator(
@@ -263,19 +411,58 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eerful")
     sub = p.add_subparsers(dest="command", required=True)
 
-    v = sub.add_parser("verify", help="verify a receipt against an evaluator bundle and report")
+    v = sub.add_parser(
+        "verify",
+        help=(
+            "verify a receipt; fetches the evaluator bundle and attestation "
+            "report from 0G Storage by content hash by default"
+        ),
+    )
     v.add_argument("receipt", type=Path, help="path to receipt JSON")
     v.add_argument(
         "--bundle",
         type=Path,
-        required=True,
-        help="path to evaluator bundle bytes (canonical JSON; matches receipt.evaluator_id)",
+        default=None,
+        help=(
+            "override: load the evaluator bundle from this local file "
+            "instead of fetching it from storage"
+        ),
     )
     v.add_argument(
         "--report",
         type=Path,
         default=None,
-        help="path to attestation report JSON (optional; enables Step 5 compose-hash gating)",
+        help=(
+            "override: load the attestation report from this local file "
+            "instead of fetching it from storage"
+        ),
+    )
+    v.add_argument(
+        "--skip-step-5",
+        action="store_true",
+        help=(
+            "skip Step 5 (compose-hash gate); does not fetch the report. "
+            "Use when the report is unavailable from storage and you only "
+            "need integrity + signature verification"
+        ),
+    )
+    v.add_argument(
+        "--bridge-url",
+        type=str,
+        default=os.environ.get("EERFUL_0G_BRIDGE_URL", _DEFAULT_BRIDGE_URL),
+        help=(
+            "URL of the zg-bridge (default: $EERFUL_0G_BRIDGE_URL or "
+            f"{_DEFAULT_BRIDGE_URL}). Non-loopback URLs are refused unless "
+            "--allow-remote-bridge is passed."
+        ),
+    )
+    v.add_argument(
+        "--allow-remote-bridge",
+        action="store_true",
+        help=(
+            "opt out of the loopback-only bridge guard. Required to fetch "
+            "from a bridge running off-host."
+        ),
     )
     v.set_defaults(func=_cmd_verify)
 
