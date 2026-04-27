@@ -20,6 +20,7 @@ The `evaluate` subcommand lands with the jig adapter.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import sys
 from pathlib import Path
@@ -34,7 +35,6 @@ from eerful.zg.storage import BridgeStorageClient, StorageClient
 
 
 _DEFAULT_BRIDGE_URL = "http://127.0.0.1:7878"
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 def _is_loopback_bridge_url(bridge_url: str) -> bool:
@@ -48,9 +48,28 @@ def _is_loopback_bridge_url(bridge_url: str) -> bool:
     of the same boundary needs the same guard — the bridge's bind-host
     check protects it from listening on a public interface, but does
     NOT stop a misconfigured client from connecting to one.
+
+    Loopback recognition delegates to `ipaddress.ip_address(...).is_loopback`
+    for IP literals so the entire 127.0.0.0/8 range counts (including
+    127.0.1.1, the default `/etc/hosts` entry on Debian/Ubuntu). The
+    "localhost" hostname is matched explicitly — `ip_address("localhost")`
+    raises, and we don't want to do DNS at this layer (a hostile resolver
+    could map `localhost` to a public IP, but a hostile resolver could
+    also map any name we whitelist; the right defense is operator
+    awareness via --allow-remote-bridge for any non-IP-literal off-list).
     """
     host = urlparse(bridge_url).hostname
-    return host is not None and host in _LOOPBACK_HOSTS
+    if host is None:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Hostname that isn't an IP literal and isn't "localhost":
+        # treat as remote. Forces `--allow-remote-bridge` for things
+        # like `bridge.internal`, which is the conservative default.
+        return False
 
 
 def _category_blurb(category: str) -> str:

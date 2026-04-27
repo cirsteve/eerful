@@ -216,10 +216,19 @@ def test_publish_evaluator_rejects_remote_bridge_url(tmp_path: Path) -> None:
         ("http://localhost:7878", True),
         ("http://[::1]:7878", True),
         ("https://localhost", True),
+        # Anywhere in 127.0.0.0/8 is RFC-loopback (delegated to
+        # ipaddress.is_loopback); 127.0.1.1 is the Debian/Ubuntu default
+        # /etc/hosts entry, 127.0.0.2 is a common alt-binding for tests.
+        ("http://127.0.1.1:7878", True),
+        ("http://127.0.0.2:7878", True),
         ("http://attacker.example.com:7878", False),
         ("http://10.0.0.5:7878", False),
         ("http://192.168.1.50:7878", False),
         ("http://0.0.0.0:7878", False),  # NOT loopback — listens on all ifaces
+        # Non-IP-literal hostnames other than "localhost" force opt-in,
+        # even ones that look intranet-y. Operator awareness over DNS
+        # trust at this layer.
+        ("http://bridge.internal:7878", False),
         ("not a url at all", False),
     ],
 )
