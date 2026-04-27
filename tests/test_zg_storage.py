@@ -128,6 +128,49 @@ def test_upload_blob_normalizes_uppercase_bridge_hash():
     assert out == expected
 
 
+def test_upload_blob_wraps_non_hex_bridge_response_as_storage_error():
+    """to_lower_hex raises ValueError on garbage input; the adapter
+    must wrap it so the documented error contract holds (only
+    StorageError / TrustViolation / RuntimeError leave the method)."""
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "content_hash": "not-a-hex-string",
+                "storage_uri": "zg://0xabc",
+                "root_hash": "0xabc",
+                "tx_hash": "0xtx",
+                "tx_seq": 1,
+                "size_bytes": 4,
+            },
+        )
+
+    with _make_bridge(httpx.MockTransport(handle)) as c:
+        with pytest.raises(StorageError, match="non-hex content_hash"):
+            c.upload_blob(b"abcd")
+
+
+def test_upload_blob_rejects_short_bridge_hash_as_storage_error():
+    """A bridge that returns hex of the wrong length is buggy, not
+    byzantine — surface as StorageError, not TrustViolation."""
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "content_hash": "0xdead",  # well-formed hex but too short
+                "storage_uri": "zg://0xabc",
+                "root_hash": "0xabc",
+                "tx_hash": "0xtx",
+                "tx_seq": 1,
+                "size_bytes": 4,
+            },
+        )
+
+    with _make_bridge(httpx.MockTransport(handle)) as c:
+        with pytest.raises(StorageError, match="non-bytes32 content_hash"):
+            c.upload_blob(b"abcd")
+
+
 def test_upload_blob_5xx_raises_storage_error():
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(502, json={"error": "upload_failed", "detail": "indexer down"})
@@ -177,6 +220,33 @@ def test_download_blob_round_trip():
     with _make_bridge(httpx.MockTransport(handle)) as c:
         out = c.download_blob(h)
     assert out == payload
+
+
+def test_download_blob_rejects_malformed_content_hash():
+    """Malformed input is caller's bug; raise ValueError before hitting
+    the wire (otherwise the bridge 400s and surfaces it as RuntimeError,
+    confusing the boundary)."""
+    sent: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, content=b"x")
+
+    with _make_bridge(httpx.MockTransport(handle)) as c:
+        with pytest.raises(ValueError, match="64-char lowercase hex"):
+            c.download_blob("0xdead")  # too short
+    assert sent == []  # request never went out
+
+
+def test_download_blob_5xx_raises_storage_error_when_body_is_list():
+    """Bridge regression returning a non-dict JSON envelope on error
+    must not AttributeError out of _raise_for_status."""
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json=["oops"])
+
+    with _make_bridge(httpx.MockTransport(handle)) as c:
+        with pytest.raises(StorageError):
+            c.download_blob("0x" + "0" * 64)
 
 
 def test_download_blob_404_raises_storage_error():
@@ -242,7 +312,7 @@ def test_download_blob_normalizes_input_hash():
     assert seen == [canonical]
 
 
-def test_bridge_client_context_manager_closes_owned_http():
+def test_bridge_client_does_not_close_borrowed_http():
     closed = {"flag": False}
 
     class _TrackedClient(httpx.Client):
@@ -257,6 +327,15 @@ def test_bridge_client_context_manager_closes_owned_http():
     assert closed["flag"] is False
     http.close()
     assert closed["flag"] is True
+
+
+def test_bridge_client_closes_owned_http():
+    """When the adapter constructs its own httpx.Client, it owns the
+    lifecycle and must close it on .close()."""
+    c = BridgeStorageClient(bridge_url="http://bridge.test")
+    assert c._http.is_closed is False
+    c.close()
+    assert c._http.is_closed is True
 
 
 # ---------------- MockStorageClient ----------------

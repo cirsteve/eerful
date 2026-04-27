@@ -96,6 +96,13 @@ type UploadIndexEntry = {
 };
 const uploadIndex = new Map<string, UploadIndexEntry>();
 
+// In-flight upload coalescing. Two requests carrying identical bytes
+// that arrive concurrently both miss `uploadIndex`; without coalescing
+// they would each call `indexer.upload` and pay separately. Same
+// pattern as `getBroker`'s `brokerInit`. Cleared in finally().
+type UploadResult = [UploadIndexEntry, null] | [null, Error];
+const inflightUploads = new Map<string, Promise<UploadResult>>();
+
 let broker: ZGComputeNetworkBroker | null = null;
 let brokerInit: Promise<ZGComputeNetworkBroker> | null = null;
 
@@ -413,23 +420,39 @@ app.get('/compute/attestation/:provider_address', async (req: Request, res: Resp
 async function getOrUpload(
   bytes: Buffer,
   contentHash: string,
-): Promise<[UploadIndexEntry, null] | [null, Error]> {
+): Promise<UploadResult> {
   const cached = uploadIndex.get(contentHash);
   if (cached) {
     return [cached, null];
   }
-  const [tx, err] = await indexer.upload(new MemData(bytes), RPC_URL, wallet);
-  if (err !== null || !('rootHash' in tx)) {
-    return [null, err ?? new Error('unknown SDK upload failure')];
+  const inflight = inflightUploads.get(contentHash);
+  if (inflight) {
+    return inflight;
   }
-  const entry: UploadIndexEntry = {
-    zgRoot: tx.rootHash,
-    txHash: tx.txHash,
-    txSeq: tx.txSeq,
-    size: bytes.length,
-  };
-  uploadIndex.set(contentHash, entry);
-  return [entry, null];
+  const p: Promise<UploadResult> = (async (): Promise<UploadResult> => {
+    const [tx, err] = await indexer.upload(new MemData(bytes), RPC_URL, wallet);
+    if (err !== null) {
+      return [null, err];
+    }
+    // Defensive: SDK contract says err === null implies a tx with
+    // rootHash, but null/undefined or a rootHash-less object would
+    // crash the property access below. Fail loudly instead.
+    if (tx == null || typeof tx !== 'object' || !('rootHash' in tx)) {
+      return [null, new Error('unknown SDK upload failure: missing rootHash on tx')];
+    }
+    const entry: UploadIndexEntry = {
+      zgRoot: tx.rootHash,
+      txHash: tx.txHash,
+      txSeq: tx.txSeq,
+      size: bytes.length,
+    };
+    uploadIndex.set(contentHash, entry);
+    return [entry, null];
+  })().finally(() => {
+    inflightUploads.delete(contentHash);
+  });
+  inflightUploads.set(contentHash, p);
+  return p;
 }
 
 const CONTENT_HASH_RE = /^0x[0-9a-f]{64}$/;
@@ -445,7 +468,11 @@ const CONTENT_HASH_RE = /^0x[0-9a-f]{64}$/;
 
 app.post(
   '/storage/upload-blob',
-  express.raw({ type: '*/*', limit: '8mb' }),
+  // Match only application/octet-stream so the global express.json
+  // middleware can't double-parse a misrouted JSON request before the
+  // raw body parser sees it. A request with the wrong Content-Type
+  // falls through to an empty req.body and 400s on the explicit check.
+  express.raw({ type: 'application/octet-stream', limit: '8mb' }),
   async (req: Request, res: Response) => {
     try {
       const bytes = req.body as Buffer;

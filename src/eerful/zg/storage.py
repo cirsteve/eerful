@@ -38,7 +38,7 @@ from typing import Any, NoReturn, Protocol, runtime_checkable
 
 import httpx
 
-from eerful.canonical import Bytes32Hex, to_lower_hex
+from eerful.canonical import Bytes32Hex, is_bytes32_hex, to_lower_hex
 from eerful.errors import StorageError, TrustViolation
 
 __all__ = [
@@ -115,7 +115,19 @@ class BridgeStorageClient:
             raise StorageError(
                 f"upload-blob: bridge returned no content_hash (body={body!r})"
             )
-        bridge_hash = to_lower_hex(bridge_hash_raw)
+        # to_lower_hex raises ValueError on non-hex input; wrap so the
+        # adapter's documented error contract holds (only StorageError /
+        # TrustViolation / RuntimeError leave this method).
+        try:
+            bridge_hash = to_lower_hex(bridge_hash_raw)
+        except (TypeError, ValueError) as exc:
+            raise StorageError(
+                f"upload-blob: bridge returned non-hex content_hash {bridge_hash_raw!r}"
+            ) from exc
+        if not is_bytes32_hex(bridge_hash):
+            raise StorageError(
+                f"upload-blob: bridge returned non-bytes32 content_hash {bridge_hash!r}"
+            )
         local_hash = _sha256_hex(data)
         if bridge_hash != local_hash:
             # Bridge claims a different sha256 for the same bytes. Either
@@ -129,6 +141,13 @@ class BridgeStorageClient:
 
     def download_blob(self, content_hash: Bytes32Hex) -> bytes:
         canonical = to_lower_hex(content_hash)
+        # Validate before sending: the bridge would 400 a malformed hash
+        # and surface it as RuntimeError, but that's caller-input
+        # validation dressed up as a programming bug. Catch it locally.
+        if not is_bytes32_hex(canonical):
+            raise ValueError(
+                f"content_hash must be 0x-prefixed 64-char lowercase hex, got {canonical!r}"
+            )
         try:
             r = self._http.get(
                 f"{self._bridge_url}/storage/download-blob",
@@ -157,12 +176,20 @@ class BridgeStorageClient:
     def _raise_for_status(r: httpx.Response, op: str) -> NoReturn:
         status = r.status_code
         try:
-            payload = r.json()
+            payload: Any = r.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
             error = payload.get("error", "unknown")
             detail = payload.get("detail", payload)
-        except ValueError:
+        elif payload is None:
             error = "unknown"
             detail = r.text[:500]
+        else:
+            # JSON list/scalar — possible if a future bridge change
+            # returns an envelope-less error. Don't AttributeError.
+            error = "unknown"
+            detail = payload
         msg = f"{op} failed ({status} {error}): {detail}"
         if status == 422:
             raise TrustViolation(msg)
