@@ -12,20 +12,42 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Annotated, Any
 
-Bytes32Hex = str
-"""0x-prefixed 64-character lowercase hex string. Spec §6.1."""
+from pydantic import BeforeValidator
 
-BytesHex = str
+
+def _normalize_hex_at_boundary(value: object) -> object:
+    """Pydantic BeforeValidator: canonicalize hex inputs at construction.
+
+    Strings and bytes flow through `to_lower_hex`; everything else
+    (including None for Optional fields) passes through so pydantic's own
+    type checks raise the appropriate error. Spec §6.4 mandates lowercase
+    hex; enforcing it at field-construction is what makes
+    `receipt_id`/`evaluator_id` derivation cross-implementation-stable.
+    """
+    if isinstance(value, (bytes, str)):
+        return to_lower_hex(value)
+    return value
+
+
+_HexNormalizer = BeforeValidator(_normalize_hex_at_boundary)
+
+Bytes32Hex = Annotated[str, _HexNormalizer]
+"""0x-prefixed 64-character lowercase hex string. Spec §6.1.
+
+Field-level uses pick up the BeforeValidator automatically; non-field
+uses (return-type annotations, type aliases) treat it as `str`."""
+
+BytesHex = Annotated[str, _HexNormalizer]
 """0x-prefixed lowercase hex string of variable length. Used for fields
 whose byte width depends on the underlying cryptographic primitive
 (e.g. enclave_pubkey, enclave_signature). Spec §6.1, amendment a."""
 
-Address = str
+Address = Annotated[str, _HexNormalizer]
 """0x-prefixed 40-character hex string. EVM address."""
 
-ZERO_BYTES32: Bytes32Hex = "0x" + "00" * 32
+ZERO_BYTES32: str = "0x" + "00" * 32
 
 _HEX_RE = re.compile(r"^0x[0-9a-f]*$")
 _BYTES32_RE = re.compile(r"^0x[0-9a-f]{64}$")

@@ -16,6 +16,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
     "mypy>=1.10",
+    "types-jsonschema>=4.18",
 ]
 
 [project.scripts]
@@ -41,3 +42,11 @@ target-version = "py312"
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[[tool.mypy.overrides]]
+# Relax fully-typed-signature enforcement on test functions while still
+# type-checking their bodies; helpers (e.g. `_bundle(**overrides: Any)`) must
+# still be annotated since check_untyped_defs runs over them.
+module = "tests.*"
+disallow_untyped_defs = false
+check_untyped_defs = true
