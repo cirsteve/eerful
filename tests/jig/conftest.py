@@ -19,11 +19,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 from eth_keys import keys
 from eth_utils import keccak
+from jig.core.types import (
+    EvalCase,
+    FeedbackLoop,
+    FeedbackQuery,
+    Score,
+    ScoreSource,
+    ScoredResult,
+    Span,
+    SpanKind,
+    TracingLogger,
+    Usage,
+)
 
 from eerful.canonical import to_lower_hex
 from eerful.evaluator import EvaluatorBundle
@@ -150,3 +163,134 @@ def critic_response_json() -> str:
 @pytest.fixture
 def fake_compute(critic_response_json: str) -> FakeComputeClient:
     return FakeComputeClient(response_content=critic_response_json)
+
+
+# ---------------- in-memory jig tracer + feedback fakes ----------------
+
+
+class RecordingTracer(TracingLogger):
+    """In-memory `TracingLogger` keyed by span id.
+
+    Lets tests reach in and pull spans by id (or by `kind`) for
+    metadata assertions. Implements every abstract method jig
+    requires; `start_trace` returns a span with a fixed `trace_id` so
+    related spans group cleanly in `get_trace`.
+    """
+
+    def __init__(self) -> None:
+        self.spans: dict[str, Span] = {}
+        self._counter = 0
+
+    def _new_id(self) -> str:
+        self._counter += 1
+        return f"span-{self._counter:03d}"
+
+    def start_trace(
+        self,
+        name: str,
+        metadata: dict[str, Any] | None = None,
+        kind: SpanKind = SpanKind.AGENT_RUN,
+    ) -> Span:
+        span = Span(
+            id=self._new_id(),
+            trace_id="trace-test",
+            kind=kind,
+            name=name,
+            started_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+            metadata=metadata,
+        )
+        self.spans[span.id] = span
+        return span
+
+    def start_span(
+        self, parent_id: str, kind: SpanKind, name: str, input: Any = None
+    ) -> Span:
+        span = Span(
+            id=self._new_id(),
+            trace_id="trace-test",
+            kind=kind,
+            name=name,
+            started_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
+            parent_id=parent_id,
+            input=input,
+        )
+        self.spans[span.id] = span
+        return span
+
+    def end_span(
+        self,
+        span_id: str,
+        output: Any = None,
+        error: str | None = None,
+        usage: Usage | None = None,
+    ) -> None:
+        span = self.spans[span_id]
+        span.output = output
+        span.error = error
+        span.usage = usage
+
+    async def get_trace(self, trace_id: str) -> list[Span]:
+        return [s for s in self.spans.values() if s.trace_id == trace_id]
+
+    async def list_traces(
+        self,
+        since: datetime | None = None,
+        limit: int = 50,
+        name: str | None = None,
+    ) -> list[Span]:
+        return list(self.spans.values())
+
+
+class RecordingFeedback(FeedbackLoop):
+    """In-memory `FeedbackLoop`.
+
+    Captures `store_result` + `score` calls so tests can assert what
+    got persisted. Mirrors the jig test fake pattern.
+    """
+
+    def __init__(self) -> None:
+        self.stored: list[dict[str, Any]] = []
+        self.scored: list[tuple[str, list[Score]]] = []
+        self._counter = 0
+
+    async def store_result(
+        self,
+        content: str,
+        input_text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        self._counter += 1
+        result_id = f"result-{self._counter:03d}"
+        self.stored.append(
+            {
+                "result_id": result_id,
+                "content": content,
+                "input_text": input_text,
+                "metadata": metadata,
+            }
+        )
+        return result_id
+
+    async def score(self, result_id: str, scores: list[Score]) -> None:
+        self.scored.append((result_id, scores))
+
+    async def get_signals(
+        self,
+        query: str,
+        limit: int = 3,
+        min_score: float | None = None,
+        source: ScoreSource | None = None,
+    ) -> list[ScoredResult]:
+        return []
+
+    async def query(self, q: FeedbackQuery) -> list[ScoredResult]:
+        return []
+
+    async def export_eval_set(
+        self,
+        since: datetime | None = None,
+        min_score: float | None = None,
+        max_score: float | None = None,
+        limit: int | None = None,
+    ) -> list[EvalCase]:
+        return []

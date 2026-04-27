@@ -13,28 +13,15 @@ Tests cover:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from typing import Any
 
 import pytest
-from jig.core.types import (
-    EvalCase,
-    FeedbackLoop,
-    FeedbackQuery,
-    Score,
-    ScoreSource,
-    ScoredResult,
-    Span,
-    SpanKind,
-    TracingLogger,
-    Usage,
-)
+from jig.core.types import ScoreSource, SpanKind
 
 from eerful.evaluator import EvaluatorBundle
 from eerful.jig import EvaluationClient, EvaluationGrader
 from eerful.zg.storage import MockStorageClient
 
-from tests.jig.conftest import FakeComputeClient
+from tests.jig.conftest import FakeComputeClient, RecordingFeedback, RecordingTracer
 
 
 # ---------------- helper: client constructor ----------------
@@ -134,58 +121,6 @@ async def test_grade_handles_nested_dicts_and_lists(
 # ---------------- feedback persistence ----------------
 
 
-class _RecordingFeedback(FeedbackLoop):
-    """Captures `store_result` + `score` calls so tests can assert
-    what got persisted. Mirrors the jig test fake pattern."""
-
-    def __init__(self) -> None:
-        self.stored: list[dict[str, Any]] = []
-        self.scored: list[tuple[str, list[Score]]] = []
-        self._counter = 0
-
-    async def store_result(
-        self,
-        content: str,
-        input_text: str,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        self._counter += 1
-        result_id = f"result-{self._counter:03d}"
-        self.stored.append(
-            {
-                "result_id": result_id,
-                "content": content,
-                "input_text": input_text,
-                "metadata": metadata,
-            }
-        )
-        return result_id
-
-    async def score(self, result_id: str, scores: list[Score]) -> None:
-        self.scored.append((result_id, scores))
-
-    async def get_signals(
-        self,
-        query: str,
-        limit: int = 3,
-        min_score: float | None = None,
-        source: ScoreSource | None = None,
-    ) -> list[ScoredResult]:
-        return []
-
-    async def query(self, q: FeedbackQuery) -> list[ScoredResult]:
-        return []
-
-    async def export_eval_set(
-        self,
-        since: datetime | None = None,
-        min_score: float | None = None,
-        max_score: float | None = None,
-        limit: int | None = None,
-    ) -> list[EvalCase]:
-        return []
-
-
 @pytest.mark.asyncio
 async def test_grade_persists_receipt_metadata_to_feedback(
     trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
@@ -193,7 +128,7 @@ async def test_grade_persists_receipt_metadata_to_feedback(
     """When a feedback loop is configured, the grader writes a stored
     result whose metadata carries the receipt's three identifiers and
     a tags list including the receipt_id."""
-    feedback = _RecordingFeedback()
+    feedback = RecordingFeedback()
     client = _make_client(trading_critic_bundle, fake_compute)
     grader = EvaluationGrader(client=client, feedback=feedback)
     scores = await grader.grade(input="strategy v1", output="raw output")
@@ -219,7 +154,7 @@ async def test_grade_skips_feedback_when_scores_empty(
 ) -> None:
     """Empty scores → no `store_result`, no `score`. Skipping prevents
     junk rows for malformed-response cases."""
-    feedback = _RecordingFeedback()
+    feedback = RecordingFeedback()
     fake = FakeComputeClient(response_content="not json")
     client = _make_client(trading_critic_bundle, fake)
     grader = EvaluationGrader(client=client, feedback=feedback)
@@ -244,81 +179,13 @@ async def test_grade_no_feedback_returns_scores_unchanged(
 # ---------------- tracer integration ----------------
 
 
-class _RecordingTracer(TracingLogger):
-    """Minimal in-memory tracer for assertions on span structure +
-    metadata. Records every span by id so tests can pull them back."""
-
-    def __init__(self) -> None:
-        self.spans: dict[str, Span] = {}
-        self._counter = 0
-
-    def _new_id(self) -> str:
-        self._counter += 1
-        return f"span-{self._counter:03d}"
-
-    def start_trace(
-        self,
-        name: str,
-        metadata: dict[str, Any] | None = None,
-        kind: SpanKind = SpanKind.AGENT_RUN,
-    ) -> Span:
-        span = Span(
-            id=self._new_id(),
-            trace_id="trace-test",
-            kind=kind,
-            name=name,
-            started_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-            metadata=metadata,
-        )
-        self.spans[span.id] = span
-        return span
-
-    def start_span(
-        self, parent_id: str, kind: SpanKind, name: str, input: Any = None
-    ) -> Span:
-        span = Span(
-            id=self._new_id(),
-            trace_id="trace-test",
-            kind=kind,
-            name=name,
-            started_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
-            parent_id=parent_id,
-            input=input,
-        )
-        self.spans[span.id] = span
-        return span
-
-    def end_span(
-        self,
-        span_id: str,
-        output: Any = None,
-        error: str | None = None,
-        usage: Usage | None = None,
-    ) -> None:
-        span = self.spans[span_id]
-        span.output = output
-        span.error = error
-        span.usage = usage
-
-    async def get_trace(self, trace_id: str) -> list[Span]:
-        return [s for s in self.spans.values() if s.trace_id == trace_id]
-
-    async def list_traces(
-        self,
-        since: datetime | None = None,
-        limit: int = 50,
-        name: str | None = None,
-    ) -> list[Span]:
-        return list(self.spans.values())
-
-
 @pytest.mark.asyncio
 async def test_grade_attaches_receipt_metadata_to_llm_call_span(
     trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
 ) -> None:
     """With _tracer + _span_id in context, grader opens an LLM_CALL
     child span carrying the receipt's identifiers."""
-    tracer = _RecordingTracer()
+    tracer = RecordingTracer()
     parent = tracer.start_trace("test", kind=SpanKind.PIPELINE_RUN)
 
     client = _make_client(trading_critic_bundle, fake_compute)
@@ -361,7 +228,7 @@ async def test_grade_partial_context_still_skips_tracer(
 ) -> None:
     """Half-set context (tracer but no span id, or vice-versa) means
     we don't have what we need to open a child span — skip silently."""
-    tracer = _RecordingTracer()
+    tracer = RecordingTracer()
     client = _make_client(trading_critic_bundle, fake_compute)
     grader = EvaluationGrader(client=client)
     # Only _tracer, no _span_id.
