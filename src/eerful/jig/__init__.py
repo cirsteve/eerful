@@ -22,10 +22,12 @@ from eerful.jig.client import (
     EerfulLLMResponse,
     EvaluationClient,
 )
+from eerful.jig.grader import EvaluationGrader
 from eerful.jig.tracer import attach_receipt_to_span
 
 __all__ = [
     "EerfulLLMResponse",
     "EvaluationClient",
+    "EvaluationGrader",
     "attach_receipt_to_span",
 ]
