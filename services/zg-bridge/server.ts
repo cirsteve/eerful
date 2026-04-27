@@ -311,7 +311,7 @@ app.post('/compute/inference', async (req: Request, res: Response) => {
     const completion = (await upstream.json()) as {
       id: string;
       choices: Array<{ message: { content: string } }>;
-      usage?: unknown;
+      usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
     };
     const effectiveChatId = chatId || completion.id;
     const responseContent = completion.choices?.[0]?.message?.content ?? '';
@@ -321,11 +321,24 @@ app.post('/compute/inference', async (req: Request, res: Response) => {
     const usageJson = JSON.stringify(completion.usage ?? {});
     await b.inference.processResponse(provider_address, effectiveChatId, usageJson);
 
+    // Surface the upstream OpenAI usage block so jig's BudgetTracker can see
+    // EER calls (Track C). The provider's /chat/completions returns standard
+    // OpenAI shape (`prompt_tokens`, `completion_tokens`); normalize to
+    // jig's (`input_tokens`, `output_tokens`) names here so the Python side
+    // doesn't need to know the wire format. Null when the provider didn't
+    // return a usage block — some don't, and `null` is honest about that.
+    const u = completion.usage;
+    const usage =
+      u && typeof u.prompt_tokens === 'number' && typeof u.completion_tokens === 'number'
+        ? { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens }
+        : null;
+
     res.json({
       chat_id: effectiveChatId,
       response_content: responseContent,
       model_served: meta.model,
       provider_endpoint: meta.endpoint,
+      usage,
     });
   } catch (err) {
     res.status(500).json({

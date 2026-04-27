@@ -290,6 +290,92 @@ def test_infer_full_end_to_end():
     assert result.attestation_report_bytes == raw_report
     assert result.attestation_report_hash == expected_hash
     assert result.model_served == "qwen/qwen-2.5-7b-instruct"
+    # No usage block in the inference response → ComputeResult.input_tokens
+    # and output_tokens stay None (Track C distinguishes "didn't report"
+    # from "definitely zero").
+    assert result.input_tokens is None
+    assert result.output_tokens is None
+
+
+def test_infer_full_surfaces_token_usage_when_bridge_returns_it():
+    """OpenAI-shape `usage` from the upstream provider flows through the
+    bridge as `{input_tokens, output_tokens}` and lands on the typed
+    `ComputeResult` fields. jig's `BudgetTracker` (Track C consumer)
+    needs these to see EER calls."""
+    text = "canonical-signed-body"
+    privkey = b"\x55" * 32
+    sig_hex, _, _ = _sign_personal(text, privkey)
+    raw_report = b'{"quote":"abc"}'
+    expected_hash = "0x" + hashlib.sha256(raw_report).hexdigest()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/compute/inference":
+            return httpx.Response(
+                200,
+                json={
+                    "chat_id": "chat-y",
+                    "response_content": "ignored",
+                    "model_served": "m",
+                    "provider_endpoint": "https://p",
+                    "usage": {"input_tokens": 142, "output_tokens": 71},
+                },
+            )
+        if path == "/compute/signature/chat-y":
+            return httpx.Response(200, json={"signature_hex": sig_hex, "message_text": text})
+        if path.startswith("/compute/attestation/"):
+            return httpx.Response(200, content=raw_report, headers={"X-Report-Hash": expected_hash})
+        return httpx.Response(404)
+
+    with _make_client(httpx.MockTransport(handle)) as c:
+        result = c.infer_full(
+            provider_address="0x" + "a" * 40,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    assert result.input_tokens == 142
+    assert result.output_tokens == 71
+
+
+def test_infer_full_handles_malformed_usage_as_none():
+    """Bridge returning a usage object with non-int values (or partial
+    data) must not crash — surface as None so consumers can fall back
+    to whatever budget policy they want."""
+    text = "x"
+    sig_hex, _, _ = _sign_personal(text, b"\x55" * 32)
+    raw_report = b"r"
+    expected_hash = "0x" + hashlib.sha256(raw_report).hexdigest()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/compute/inference":
+            return httpx.Response(
+                200,
+                json={
+                    "chat_id": "chat-z",
+                    "response_content": "ignored",
+                    "model_served": "m",
+                    "provider_endpoint": "https://p",
+                    # Partial / wrong-shape usage block — the bridge would
+                    # not normally produce this, but defending against it
+                    # keeps the boundary honest.
+                    "usage": {"input_tokens": "not-an-int"},
+                },
+            )
+        if path == "/compute/signature/chat-z":
+            return httpx.Response(200, json={"signature_hex": sig_hex, "message_text": text})
+        if path.startswith("/compute/attestation/"):
+            return httpx.Response(200, content=raw_report, headers={"X-Report-Hash": expected_hash})
+        return httpx.Response(404)
+
+    with _make_client(httpx.MockTransport(handle)) as c:
+        result = c.infer_full(
+            provider_address="0x" + "a" * 40,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    assert result.input_tokens is None
+    assert result.output_tokens is None
 
 
 def test_compute_result_is_immutable():

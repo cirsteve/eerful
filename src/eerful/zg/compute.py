@@ -80,6 +80,14 @@ class ComputeResult(BaseModel):
     attestation block; `response_content` is what the signature is over;
     `attestation_report_hash` is the §6.1 receipt field; the raw
     `attestation_report_bytes` are uploaded to Storage on Day 3.
+
+    `input_tokens` and `output_tokens` are surfaced from the upstream
+    provider's OpenAI-shape `usage` block so jig's `Usage` struct
+    (Track C) gets real counts instead of zeros — without this, EER
+    calls would be invisible to jig's `BudgetTracker`. Both default to
+    `None` because not every provider returns a usage block, and zeroing
+    a missing value would let "we don't know" silently merge with
+    "definitely zero."
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -93,6 +101,8 @@ class ComputeResult(BaseModel):
     signing_address: Address
     attestation_report_bytes: bytes
     attestation_report_hash: Bytes32Hex
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 class ComputeClient:
@@ -227,6 +237,19 @@ class ComputeClient:
         signature_hex = signature["signature_hex"]
         pubkey_hex, signing_address = recover_pubkey_from_personal_sign(signed_text, signature_hex)
 
+        # Bridge returns `usage` as either `{"input_tokens": int,
+        # "output_tokens": int}` or null. Coerce to ints when present;
+        # leave as None when the upstream provider didn't report usage.
+        usage_raw = inference.get("usage")
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+        if isinstance(usage_raw, dict):
+            it = usage_raw.get("input_tokens")
+            ot = usage_raw.get("output_tokens")
+            if isinstance(it, int) and isinstance(ot, int):
+                input_tokens = it
+                output_tokens = ot
+
         return ComputeResult(
             chat_id=inference["chat_id"],
             response_content=signed_text,
@@ -237,6 +260,8 @@ class ComputeClient:
             signing_address=signing_address,
             attestation_report_bytes=report_bytes,
             attestation_report_hash=report_hash,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     # ---------------- internals ----------------
