@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
 import pytest
 from eth_keys import keys
 from eth_utils import keccak
+from pydantic import ValidationError
 
 from eerful.zg.compute import (
     ComputeClient,
@@ -81,9 +84,16 @@ def test_recover_pubkey_rejects_wrong_length():
 # ---------------- ComputeClient with MockTransport ----------------
 
 
-def _make_client(handler: httpx.MockTransport) -> ComputeClient:
+@contextmanager
+def _make_client(handler: httpx.MockTransport) -> Iterator[ComputeClient]:
+    """Hand the test a ComputeClient backed by a MockTransport, then close
+    the underlying httpx.Client on exit. ComputeClient.close() no-ops here
+    because we're explicitly handing it a borrowed http (`_owns_http=False`)."""
     http = httpx.Client(transport=handler)
-    return ComputeClient(bridge_url="http://bridge.test", http=http)
+    try:
+        yield ComputeClient(bridge_url="http://bridge.test", http=http)
+    finally:
+        http.close()
 
 
 def test_healthz_ok():
@@ -261,5 +271,5 @@ def test_compute_result_is_immutable():
         attestation_report_bytes=b"r",
         attestation_report_hash="0x" + "4" * 64,
     )
-    with pytest.raises(Exception):  # pydantic ValidationError on frozen model
+    with pytest.raises(ValidationError, match="frozen"):
         result.chat_id = "y"

@@ -30,6 +30,14 @@ from eth_utils import keccak
 from pydantic import BaseModel, ConfigDict
 
 from eerful.canonical import Address, Bytes32Hex, BytesHex, to_lower_hex
+from eerful.errors import ComputeError
+
+__all__ = [
+    "ComputeClient",
+    "ComputeError",
+    "ComputeResult",
+    "recover_pubkey_from_personal_sign",
+]
 
 
 def recover_pubkey_from_personal_sign(
@@ -82,10 +90,6 @@ class ComputeResult(BaseModel):
     signing_address: Address
     attestation_report_bytes: bytes
     attestation_report_hash: Bytes32Hex
-
-
-class ComputeError(RuntimeError):
-    """Raised when the bridge or the upstream provider rejects a request."""
 
 
 class ComputeClient:
@@ -235,6 +239,6 @@ class ComputeClient:
         try:
             payload = r.json()
             detail = payload.get("error") or payload
-        except Exception:
+        except ValueError:  # JSONDecodeError subclasses ValueError
             detail = r.text[:500]
         raise ComputeError(f"{op} failed ({r.status_code}): {detail}")

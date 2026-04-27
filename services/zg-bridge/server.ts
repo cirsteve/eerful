@@ -44,11 +44,23 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
 let broker: ZGComputeNetworkBroker | null = null;
+let brokerInit: Promise<ZGComputeNetworkBroker> | null = null;
 
 async function getBroker(): Promise<ZGComputeNetworkBroker> {
   if (broker !== null) return broker;
-  broker = await createZGComputeNetworkBroker(wallet);
-  return broker;
+  if (brokerInit !== null) return brokerInit;
+  // Cache the in-flight init promise so concurrent first-callers share it
+  // instead of each invoking createZGComputeNetworkBroker (which races on
+  // ledger / signer state and last-write-wins on `broker`).
+  brokerInit = createZGComputeNetworkBroker(wallet)
+    .then((b) => {
+      broker = b;
+      return b;
+    })
+    .finally(() => {
+      brokerInit = null;
+    });
+  return brokerInit;
 }
 
 function sha256Hex(bytes: Buffer | Uint8Array): string {
@@ -98,9 +110,17 @@ app.post('/admin/add-ledger', async (req: Request, res: Response) => {
     let existed = true;
     try {
       await b.ledger.getLedger();
-    } catch {
+    } catch (probe) {
       existed = false;
+      console.warn(
+        `add-ledger: getLedger() probe failed, assuming ledger missing — ${
+          probe instanceof Error ? probe.message : String(probe)
+        }`,
+      );
     }
+    // The SDK doesn't surface a clean "not found" error code for ledgers, so
+    // we treat any getLedger() failure as "missing." Log the actual error so
+    // network/RPC issues aren't silently misclassified as a missing ledger.
     if (existed) {
       await b.ledger.depositFund(amount_0g);
     } else {
@@ -153,7 +173,9 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
 // ---------------- /compute/inference ----------------
 //
 // Body: { provider_address, messages: [{role, content}], temperature?, max_tokens? }
-// Returns: { chat_id, response_content, model_served, signing_address }
+// Returns: { chat_id, response_content, model_served, provider_endpoint }
+// (signing_address is recovered Python-side from the signature endpoint's
+//  response, not returned here.)
 //
 // Flow:
 //   1. getServiceMetadata → endpoint + on-chain model name
@@ -233,9 +255,10 @@ app.post('/compute/inference', async (req: Request, res: Response) => {
 
 // ---------------- /compute/signature/:chat_id ----------------
 //
-// Returns the signature the provider produced over the response content,
-// plus the signing address bound by attestation. Caller pins both into
-// the EER's attestation block.
+// Returns: { signature_hex, message_text } — the provider's per-chat
+// signature and the canonical text it was signed over. Address binding
+// (recovered pubkey ↔ on-chain teeSignerAddress) is verified Python-side
+// in ComputeClient.infer_full, not at the bridge boundary.
 
 app.get('/compute/signature/:chat_id', async (req: Request, res: Response) => {
   const chatId = req.params.chat_id;
