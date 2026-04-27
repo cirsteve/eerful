@@ -1,2 +1,15 @@
 /specs
+/research
 
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+.env
+*.salt
+examples/*/receipts/
+examples/*/strategies/v[23].md
