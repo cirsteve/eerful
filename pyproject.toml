@@ -8,6 +8,9 @@ dependencies = [
     "jsonschema>=4.18",
     "httpx>=0.27",
     "jig[anthropic]",
+    "eth-keys>=0.5",
+    "eth-utils>=4.0",
+    "eth-hash[pycryptodome]>=0.7",
 ]
 
 [project.optional-dependencies]
@@ -50,3 +53,9 @@ strict = true
 module = "tests.*"
 disallow_untyped_defs = false
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# eth-keys / eth-utils ship type stubs but don't follow explicit re-export
+# convention; their public surface is stable and well-documented.
+module = ["eth_keys", "eth_keys.*", "eth_utils", "eth_utils.*"]
+implicit_reexport = true

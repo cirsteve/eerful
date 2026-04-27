@@ -13,3 +13,6 @@ __pycache__/
 *.salt
 examples/*/receipts/
 examples/*/strategies/v[23].md
+
+node_modules/
+services/*/dist/
