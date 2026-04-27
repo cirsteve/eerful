@@ -299,6 +299,65 @@ def test_salt_store_top_level_array_rejected(tmp_path: Path) -> None:
         SaltStore(path).get(_receipt_id("aa"))
 
 
+def test_salt_store_non_dict_entry_rejected_at_read(tmp_path: Path) -> None:
+    """A hand-edited file where an entry is a string/list/scalar instead
+    of an object surfaces as a clear ValueError on read, not an
+    AttributeError when get() tries `.get` on the value."""
+    path = tmp_path / "salts.json"
+    path.write_text(
+        json.dumps({_receipt_id("aa"): "not an object"})
+    )
+    with pytest.raises(ValueError, match="not a JSON object"):
+        SaltStore(path).get(_receipt_id("aa"))
+
+
+def test_salt_store_one_corrupt_entry_poisons_whole_read(tmp_path: Path) -> None:
+    """Fail-fast on read: a malformed entry alongside healthy ones
+    fails the whole read rather than letting the producer fetch the
+    healthy half while losing the broken half silently."""
+    path = tmp_path / "salts.json"
+    path.write_text(
+        json.dumps(
+            {
+                _receipt_id("aa"): {"salt": "0x" + "01" * 32},  # healthy
+                _receipt_id("bb"): ["not", "an", "object"],  # broken
+            }
+        )
+    )
+    store = SaltStore(path)
+    with pytest.raises(ValueError, match="not a JSON object"):
+        store.get(_receipt_id("aa"))
+
+
+def test_salt_store_entry_missing_salt_field_raises(tmp_path: Path) -> None:
+    """Entry shape is right (dict) but the required `salt` field is
+    missing — surface clearly, don't return garbage bytes."""
+    path = tmp_path / "salts.json"
+    path.write_text(
+        json.dumps({_receipt_id("aa"): {"input_path": "v1.md"}})
+    )
+    with pytest.raises(ValueError, match="missing 'salt' field"):
+        SaltStore(path).get(_receipt_id("aa"))
+
+
+def test_salt_store_entry_with_non_string_input_path_raises(tmp_path: Path) -> None:
+    """input_path is optional, but if present must be a string. A
+    list/number is operator error and should fail loudly."""
+    path = tmp_path / "salts.json"
+    path.write_text(
+        json.dumps(
+            {
+                _receipt_id("aa"): {
+                    "salt": "0x" + "01" * 32,
+                    "input_path": ["v1.md"],  # wrong type
+                }
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="non-string input_path"):
+        SaltStore(path).get(_receipt_id("aa"))
+
+
 # ---------------- Integration: commitment ↔ SaltStore round-trip ----------------
 
 

@@ -159,6 +159,15 @@ class SaltStore:
         entry = data.get(canonical_id)
         if entry is None:
             raise KeyError(f"no salt entry for receipt_id {canonical_id}")
+        if not isinstance(entry, dict):
+            # `_read_all` already rejects this shape, but the type
+            # narrowing is local to that function — mypy can't see it
+            # here, and a future refactor of `_read_all` shouldn't be
+            # able to silently let an AttributeError leak from `.get`.
+            raise ValueError(
+                f"salt store entry for {canonical_id} is not a JSON object "
+                f"(got {type(entry).__name__})"
+            )
         salt_hex = entry.get("salt")
         if not isinstance(salt_hex, str):
             raise ValueError(
@@ -181,6 +190,23 @@ class SaltStore:
             raise ValueError(f"salt store at {self._path} is not valid JSON: {e}") from e
         if not isinstance(raw, dict):
             raise ValueError(f"salt store at {self._path} is not a JSON object")
+        # Structural shape check: every key is a string, every value is
+        # a dict. Per-field validation (salt is hex, input_path is
+        # string-or-None) runs in `get` against the entry actually being
+        # fetched. Failing fast at the top level is right: a corrupt
+        # entry usually means the file was hand-edited or partially
+        # restored, and silently skipping it could let a producer fetch
+        # the healthy half while losing the broken half without notice.
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"salt store at {self._path} has non-string key: {key!r}"
+                )
+            if not isinstance(value, dict):
+                raise ValueError(
+                    f"salt store at {self._path} entry for {key!r} is not a "
+                    f"JSON object (got {type(value).__name__})"
+                )
         return raw
 
     def _write_all(self, data: dict[str, dict[str, Any]]) -> None:
