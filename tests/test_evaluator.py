@@ -66,3 +66,40 @@ def test_uppercase_compose_hashes_normalized_on_construction():
     b_lower = _bundle(accepted_compose_hashes=[h_lower])
     assert b_upper.accepted_compose_hashes == [h_lower]
     assert b_upper.evaluator_id() == b_lower.evaluator_id()
+
+
+def test_accepted_compose_hashes_empty_list_rejected():
+    """Spec §6.5 docstring: empty list has no canonical form; absence (None)
+    is the only canonical 'no gating'. Without this rule, evaluator_id
+    would diverge between [] (encodes as `[]`) and None (encodes as
+    `null`) for what publishers intend as the same bundle."""
+    with pytest.raises(ValidationError) as exc:
+        _bundle(accepted_compose_hashes=[])
+    assert "accepted_compose_hashes" in str(exc.value)
+
+
+def test_accepted_compose_hashes_wrong_length_rejected():
+    """Bytes32Hex requires exactly 64 hex chars; the BeforeValidator only
+    lowercases, so a model_validator MUST enforce the length invariant or
+    short hashes propagate into Step 5's allowlist comparison."""
+    short = "0x" + "a" * 63  # 63 hex chars; valid hex, wrong length
+    with pytest.raises(ValidationError):
+        _bundle(accepted_compose_hashes=[short])
+
+
+def test_accepted_compose_hashes_canonical_form_is_none():
+    """Receipts derive evaluator_id from canonical_bytes(); we lock down that
+    the canonical 'no gating' form is None (not an absent key, not []),
+    since bundle hash drift breaks every receipt's receipt_id chain."""
+    b = _bundle()
+    assert b.accepted_compose_hashes is None
+    assert b'"accepted_compose_hashes":null' in b.canonical_bytes()
+
+
+def test_evaluator_id_stable_when_field_unset():
+    """Bundle hash must be byte-identical across runs/processes when the
+    field is unset; this is the load-bearing invariant for receipt_id
+    stability across every receipt produced under this bundle."""
+    expected = _bundle().evaluator_id()
+    for _ in range(3):
+        assert _bundle().evaluator_id() == expected

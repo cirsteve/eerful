@@ -49,11 +49,45 @@ verdict plus the structured score block.
 ## What an EER proves (and doesn't)
 
 A valid EER proves a specific response was produced by attested TEE hardware
-under publicly defined evaluation criteria. It does **not** prove the
-evaluation is correct, the score is meaningful, the model the TEE loaded
-matches the model the evaluator declared (see spec §8), or that the producer
-chose representative input.
+under publicly defined evaluation criteria, with the response signed by an
+enclave-born key. Authenticity is what EER provides.
 
-Authenticity is what EER provides; correctness, completeness, and good-faith
-use are higher-layer concerns. The spec is honest about this — read §2 and §8
-before relying on receipts.
+It does **not** prove the evaluation is correct, the score is meaningful, the
+producer chose representative input, or — most importantly for honest framing
+— that the model the TEE loaded matches the model the evaluator declared.
+
+That last gap is the subject of [spec §8](docs/spec.md#8-compose-vs-model-identity-binding),
+which lays out the empirical state of 0G TeeML providers as a three-tier
+spectrum:
+
+- **Category A — bound launch string.** RTMR3 binds a compose whose launch
+  command names the model identifier. The strongest model claim available
+  today on widely deployed primitives (1 of 7 mainnet providers as of
+  2026-04). Weights themselves still come from HuggingFace at runtime and
+  are not measured.
+- **Category B — unrelated compose.** RTMR3 binds a compose that does not
+  reference the advertised model at all (3 of 7 — observed running a Phala
+  demo Next.js starter). Receipts under such providers verify only that
+  "some dstack TD ran some app."
+- **Category C — centralized passthrough.** The compose attests a broker
+  proxy that routes to a centralized backend with no TEE attestation (3 of
+  7). The provider's own broker code admits this.
+
+EER's protocol-level mitigation is the **`accepted_compose_hashes`** allowlist
+(spec §6.5): an evaluator publisher pins the compose-hashes of providers whose
+configuration they have inspected; verification fails closed when the attested
+hash isn't in the list. Verifiers running `eerful verify --report ...` get the
+category and gating status surfaced on stdout.
+
+Read §2 and §8 before relying on receipts. The spec is deliberate about what
+an EER does and does not cryptographically establish.
+
+## Demo provider
+
+The reference demo runs against **Provider 1 — `zai-org/GLM-5-FP8` at
+`0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C`**, the only acknowledged 0G TeeML
+provider observed in Category A as of 2026-04. Its attested compose runs
+vLLM with `--model zai-org/GLM-5-FP8` on the launch command, so RTMR3 binds
+the model identifier as a string. The demo evaluator bundle pins this
+provider's compose-hash in `accepted_compose_hashes` so receipts produced
+against it pass Step 5 with `gating: enforced`.

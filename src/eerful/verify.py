@@ -1,10 +1,19 @@
-"""§7.1 verification algorithm — Steps 1–3.
+"""§7.1 verification algorithm.
 
-Steps 4–7 require 0G storage access and TEE attestation chain validation;
-they land alongside Track B. The functions here are I/O-free: callers fetch
-the bundle bytes (and, later, the attestation report bytes) and pass them
-in. Each step is a separately testable function per the plan; an
-orchestrator runs Steps 1–3 in spec order.
+The functions here are I/O-free: callers fetch the bundle bytes and (for
+Step 5) the attestation report bytes and pass them in. Each step is a
+separately testable function; an orchestrator runs them in spec order.
+
+Coverage as of v0.4 reference impl:
+
+- Steps 1–3 land in v0.4 (offline integrity + bundle binding + schema).
+- Step 5's compose-hash subset (§6.5 allowlist + §8.2 category diagnostic)
+  is implemented here. The TDX chain, NVIDIA GPU attestation, and pubkey
+  binding subsets of Step 5 are deferred to the dstack-verifier
+  integration in Track B follow-up; they are NOT yet enforced.
+- Step 4 (fetch the attestation report from Storage) is the caller's
+  responsibility for now; on Day 3 it will be wired to a 0G Storage
+  client and added here.
 
 Failures raise `VerificationError(step=N, reason=...)`.
 """
@@ -12,13 +21,58 @@ Failures raise `VerificationError(step=N, reason=...)`.
 from __future__ import annotations
 
 import hashlib
+from typing import Literal
 
 import jsonschema
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
+from eerful.canonical import Bytes32Hex
 from eerful.errors import VerificationError
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt, derive_receipt_id
+from eerful.zg.attestation import (
+    ComposeCategory,
+    ParsedAttestationReport,
+    categorize_compose,
+    parse_attestation_report,
+)
+
+ComposeHashGating = Literal["enforced", "skipped"]
+"""Whether Step 5's compose-hash gate ran. `enforced` means the bundle
+declared `accepted_compose_hashes` and the attested compose-hash was in
+the list; `skipped` means the bundle did not declare an allowlist (per
+§6.5, no gating is performed in that case)."""
+
+
+class Step5Result(BaseModel):
+    """What Step 5's compose-hash subset establishes.
+
+    `gating` reflects the §6.5 binary: `enforced` only when the bundle
+    populated `accepted_compose_hashes` AND the attested hash was in it;
+    `skipped` otherwise. `category` is the §8.2 diagnostic — informational,
+    not a gate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    compose_hash: Bytes32Hex
+    gating: ComposeHashGating
+    category: ComposeCategory
+
+
+class VerificationResult(BaseModel):
+    """Aggregated outcome of a successful (Steps 1–3 + 5-compose) run.
+
+    The CLI uses this to render the verdict; downstream consumers (jig,
+    higher-layer reputation systems) take it as the verified handle on the
+    receipt. Construction implies all enforced steps passed; failure paths
+    raise `VerificationError` instead of returning a result with a flag."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    bundle: EvaluatorBundle
+    step5: Step5Result | None = None
+    """`None` when the caller didn't pass an attestation report (e.g. running
+    Steps 1–3 only). Present once Step 5's compose-hash subset has run."""
 
 
 def verify_step_1_receipt_integrity(receipt: EnhancedReceipt) -> None:
@@ -79,6 +133,56 @@ def verify_step_3_output_schema(
         ) from e
 
 
+def verify_step_5_compose_hash_gating(
+    bundle: EvaluatorBundle,
+    report_bytes: bytes,
+) -> Step5Result:
+    """Step 5 (compose-hash subset): enforce §6.5's `accepted_compose_hashes`.
+
+    Parses the attestation report, extracts the compose-hash that RTMR3
+    binds (cross-checked against the dstack event log), and:
+
+    - If the bundle declares `accepted_compose_hashes`, fails when the
+      attested hash is not in the list (`gating="enforced"` on success).
+    - If the bundle does not declare it, skips gating per §6.5 ("no
+      compose-hash gating is performed") and returns `gating="skipped"`.
+
+    The §8.2 category is computed either way as a diagnostic.
+
+    This function does NOT yet perform the rest of Step 5 (TDX quote chain
+    against Intel roots, NVIDIA GPU attestation, pubkey-to-receipt
+    binding); those are deferred to the dstack-verifier integration. A
+    receipt that passes the compose-hash gate has not been fully Step-5
+    verified — see this module's docstring.
+    """
+    parsed: ParsedAttestationReport = parse_attestation_report(report_bytes)
+    category = categorize_compose(
+        parsed,
+        expected_model_identifier=bundle.model_identifier,
+    )
+
+    allowlist = bundle.accepted_compose_hashes
+    if allowlist is None:
+        return Step5Result(
+            compose_hash=parsed.compose_hash,
+            gating="skipped",
+            category=category,
+        )
+    if parsed.compose_hash not in allowlist:
+        raise VerificationError(
+            step=5,
+            reason=(
+                f"attested compose-hash {parsed.compose_hash} is not in the "
+                f"evaluator bundle's accepted_compose_hashes (size {len(allowlist)})"
+            ),
+        )
+    return Step5Result(
+        compose_hash=parsed.compose_hash,
+        gating="enforced",
+        category=category,
+    )
+
+
 def verify_through_step_3(
     receipt: EnhancedReceipt,
     bundle_bytes: bytes,
@@ -88,3 +192,25 @@ def verify_through_step_3(
     bundle = verify_step_2_evaluator_bundle(receipt, bundle_bytes)
     verify_step_3_output_schema(receipt, bundle)
     return bundle
+
+
+def verify_receipt(
+    receipt: EnhancedReceipt,
+    bundle_bytes: bytes,
+    report_bytes: bytes | None = None,
+) -> VerificationResult:
+    """Run all currently-implemented verification steps in spec order.
+
+    Steps 1–3 always run. Step 5's compose-hash subset runs when
+    `report_bytes` is provided (Step 4 — fetching the report — is the
+    caller's responsibility until 0G Storage integration lands).
+
+    Returns the aggregated `VerificationResult` on success. On failure,
+    raises `VerificationError(step=N, ...)` from the first step that
+    fails; later steps don't run.
+    """
+    bundle = verify_through_step_3(receipt, bundle_bytes)
+    if report_bytes is None:
+        return VerificationResult(bundle=bundle)
+    step5 = verify_step_5_compose_hash_gating(bundle, report_bytes)
+    return VerificationResult(bundle=bundle, step5=step5)
