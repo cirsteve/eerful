@@ -61,7 +61,7 @@ def _signing_payload_dict(
     }
 
 
-def _derive_receipt_id(payload: dict[str, Any]) -> Bytes32Hex:
+def derive_receipt_id(payload: dict[str, Any]) -> Bytes32Hex:
     return "0x" + hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
@@ -161,7 +161,7 @@ class EnhancedReceipt(BaseModel):
             response_content=response_content,
         )
         return cls(
-            receipt_id=_derive_receipt_id(payload),
+            receipt_id=derive_receipt_id(payload),
             created_at=created_at,
             evaluator_id=evaluator_id,
             evaluator_version=evaluator_version,
@@ -179,7 +179,7 @@ class EnhancedReceipt(BaseModel):
 
     @model_validator(mode="after")
     def _verify_receipt_id(self) -> EnhancedReceipt:
-        expected = _derive_receipt_id(self.signing_payload())
+        expected = derive_receipt_id(self.signing_payload())
         if expected != self.receipt_id:
             raise VerificationError(
                 step=1,
