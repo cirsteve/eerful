@@ -138,6 +138,18 @@ def test_step_3_fails_when_score_missing_required():
     assert exc.value.step == 3
 
 
+def test_step_3_wraps_schema_error_when_output_schema_invalid():
+    """A malformed `output_schema` raises jsonschema.SchemaError; Step 3 must
+    wrap it as VerificationError(step=3) per the module's contract that all
+    failures surface through VerificationError, not the underlying library."""
+    bad_schema: dict[str, Any] = {"type": "object", "required": "score"}  # required must be a list
+    b = _bundle(output_schema=bad_schema)
+    with pytest.raises(VerificationError) as exc:
+        verify_step_3_output_schema(_receipt(b, output_score_block={"score": 0.5}), b)
+    assert exc.value.step == 3
+    assert "invalid output_schema" in exc.value.reason
+
+
 # ---------------- Orchestration ----------------
 
 

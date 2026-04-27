@@ -45,14 +45,21 @@ def test_round_trip_through_json():
     assert r2.response_content == r.response_content
 
 
-def test_attestation_block_does_not_affect_receipt_id():
-    """attestation_report_hash, enclave_pubkey, enclave_signature are NOT
-    part of the canonical signing payload (spec §6.3)."""
-    a = EnhancedReceipt.build(**{**BASE, "enclave_signature": "0x" + "1" * 128})
-    b = EnhancedReceipt.build(**{**BASE, "enclave_signature": "0x" + "2" * 128})
-    c = EnhancedReceipt.build(**{**BASE, "attestation_report_hash": "0x" + "f" * 64})
-    d = EnhancedReceipt.build(**{**BASE, "enclave_pubkey": "0x" + "9" * 64})
-    assert a.receipt_id == b.receipt_id == c.receipt_id == d.receipt_id
+def test_signature_material_does_not_affect_receipt_id():
+    """enclave_pubkey and enclave_signature are NOT in the canonical signing
+    payload (spec §6.3 — a signature cannot be over itself)."""
+    base = EnhancedReceipt.build(**BASE)
+    sig_changed = EnhancedReceipt.build(**{**BASE, "enclave_signature": "0x" + "1" * 128})
+    pubkey_changed = EnhancedReceipt.build(**{**BASE, "enclave_pubkey": "0x" + "9" * 64})
+    assert base.receipt_id == sig_changed.receipt_id == pubkey_changed.receipt_id
+
+
+def test_attestation_report_hash_affects_receipt_id():
+    """attestation_report_hash IS in the canonical signing payload (spec §6.3);
+    binding it forecloses a same-key/different-report swap post-construction."""
+    base = EnhancedReceipt.build(**BASE)
+    report_changed = EnhancedReceipt.build(**{**BASE, "attestation_report_hash": "0x" + "f" * 64})
+    assert base.receipt_id != report_changed.receipt_id
 
 
 def test_response_content_change_changes_receipt_id():
@@ -109,19 +116,22 @@ def test_tampered_receipt_id_fails_step1():
     assert exc.value.step == 1
 
 
-def test_signing_payload_excludes_attestation_block():
+def test_signing_payload_excludes_only_signature_material_and_receipt_id():
+    """Spec §6.3: only receipt_id, enclave_pubkey, enclave_signature are
+    excluded. attestation_report_hash IS in the payload."""
     r = EnhancedReceipt.build(**BASE)
     payload = r.signing_payload()
-    assert "attestation_report_hash" not in payload
+    assert "receipt_id" not in payload
     assert "enclave_pubkey" not in payload
     assert "enclave_signature" not in payload
-    assert "receipt_id" not in payload
+    assert "attestation_report_hash" in payload
 
 
-def test_signing_payload_includes_all_producer_fields():
+def test_signing_payload_includes_all_canonical_fields():
     r = EnhancedReceipt.build(**BASE)
     payload = r.signing_payload()
     expected = {
+        "attestation_report_hash",
         "chat_id",
         "created_at",
         "evaluator_id",
@@ -134,6 +144,25 @@ def test_signing_payload_includes_all_producer_fields():
         "response_content",
     }
     assert set(payload.keys()) == expected
+
+
+def test_uppercase_hex_normalized_on_construction():
+    """Spec §6.4 mandates lowercase hex. Receipts built with uppercase input
+    must derive the same receipt_id as receipts built with lowercase input."""
+    upper = {
+        **BASE,
+        "evaluator_id": "0x" + "A" * 64,
+        "provider_address": "0x" + "B" * 40,
+        "attestation_report_hash": "0x" + "E" * 64,
+        "enclave_pubkey": "0x" + "C" * 64,
+        "enclave_signature": "0x" + "D" * 128,
+    }
+    r_upper = EnhancedReceipt.build(**upper)
+    r_lower = EnhancedReceipt.build(**BASE)
+    assert r_upper.receipt_id == r_lower.receipt_id
+    assert r_upper.evaluator_id == r_lower.evaluator_id
+    assert r_upper.provider_address == r_lower.provider_address
+    assert r_upper.attestation_report_hash == r_lower.attestation_report_hash
 
 
 def test_created_at_serialized_as_rfc3339_z():

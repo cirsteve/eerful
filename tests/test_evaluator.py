@@ -54,3 +54,15 @@ def test_accepted_compose_hashes_changes_evaluator_id():
 def test_extra_fields_forbidden():
     with pytest.raises(ValidationError):
         EvaluatorBundle(version="v", model_identifier="m", system_prompt="p", surprise=1)  # type: ignore[call-arg]
+
+
+def test_uppercase_compose_hashes_normalized_on_construction():
+    """Spec §6.4 mandates lowercase hex; bundles built with uppercase
+    `accepted_compose_hashes` must hash to the same `evaluator_id` as
+    bundles built with lowercase."""
+    h_upper = "0x" + "A" * 64
+    h_lower = "0x" + "a" * 64
+    b_upper = _bundle(accepted_compose_hashes=[h_upper])
+    b_lower = _bundle(accepted_compose_hashes=[h_lower])
+    assert b_upper.accepted_compose_hashes == [h_lower]
+    assert b_upper.evaluator_id() == b_lower.evaluator_id()

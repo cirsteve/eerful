@@ -67,6 +67,11 @@ def verify_step_3_output_schema(
         return
     try:
         jsonschema.validate(receipt.output_score_block, bundle.output_schema)
+    except jsonschema.SchemaError as e:
+        raise VerificationError(
+            step=3,
+            reason=f"invalid output_schema in evaluator bundle: {e.message}",
+        ) from e
     except jsonschema.ValidationError as e:
         raise VerificationError(
             step=3,

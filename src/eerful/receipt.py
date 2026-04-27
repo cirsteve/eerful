@@ -18,7 +18,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from eerful.canonical import Address, Bytes32Hex, BytesHex, canonical_json_bytes
+from eerful.canonical import Address, Bytes32Hex, BytesHex, canonical_json_bytes, to_lower_hex
 from eerful.errors import VerificationError
 
 
@@ -58,11 +58,15 @@ class EnhancedReceipt(BaseModel):
     # Structured evaluation (in canonical signing payload)
     output_score_block: dict[str, Any] | None = None
 
-    # Attestation block (NOT in canonical signing payload; spec §6.3).
+    # Attestation report identity (in canonical signing payload, spec §6.3).
+    # Binding the report hash into receipt_id forecloses a same-key /
+    # different-report swap post-construction.
+    attestation_report_hash: Bytes32Hex
+
+    # Attestation signature material (NOT in canonical signing payload, spec §6.3).
     # Cached for offline verification; integrity is established by the Step 5
     # report-binds-pubkey check and the Step 6 signature verification, not
-    # by receipt_id.
-    attestation_report_hash: Bytes32Hex
+    # by receipt_id (a signature cannot be over itself).
     enclave_pubkey: BytesHex
     enclave_signature: BytesHex
 
@@ -70,6 +74,7 @@ class EnhancedReceipt(BaseModel):
     extensions: dict[str, Any] | None = None
 
     SIGNING_PAYLOAD_FIELDS: ClassVar[tuple[str, ...]] = (
+        "attestation_report_hash",
         "chat_id",
         "created_at",
         "evaluator_id",
@@ -82,6 +87,16 @@ class EnhancedReceipt(BaseModel):
         "response_content",
     )
 
+    SIGNING_PAYLOAD_HEX_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "attestation_report_hash",
+            "evaluator_id",
+            "input_commitment",
+            "previous_receipt_id",
+            "provider_address",
+        }
+    )
+
     @classmethod
     def _payload_from_source(cls, source: dict[str, Any]) -> dict[str, Any]:
         """Project `source` to the canonical signing payload shape (spec §6.3).
@@ -89,13 +104,18 @@ class EnhancedReceipt(BaseModel):
         `source` must contain every name in `SIGNING_PAYLOAD_FIELDS`. The
         single source of truth is that tuple; adding a field there
         automatically pulls it into `signing_payload()`, `build()`, and
-        `_verify_receipt_id` together.
+        `_verify_receipt_id` together. Hex fields are canonicalized to
+        lowercase here (idempotent on already-canonical input) so `build()`
+        and `signing_payload()` agree whether the projection runs before or
+        after pydantic's BeforeValidator (spec §6.4).
         """
         payload: dict[str, Any] = {}
         for name in cls.SIGNING_PAYLOAD_FIELDS:
             value = source[name]
             if name == "created_at":
                 value = _to_rfc3339_z(value)
+            elif name in cls.SIGNING_PAYLOAD_HEX_FIELDS and value is not None:
+                value = to_lower_hex(value)
             payload[name] = value
         return payload
 
