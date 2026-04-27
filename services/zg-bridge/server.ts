@@ -40,6 +40,39 @@ const RPC_URL = process.env.EERFUL_0G_RPC ?? 'https://evmrpc-testnet.0g.ai';
 const PORT = Number(process.env.EERFUL_0G_BRIDGE_PORT ?? '7878');
 const BIND_HOST = process.env.EERFUL_0G_BRIDGE_BIND_HOST ?? '127.0.0.1';
 
+// The bridge holds a hot wallet key in process and exposes admin/compute
+// endpoints with no authentication (the security model assumes the only
+// reachable client is the local Python adapter). Refuse to start on a
+// non-loopback bind unless the operator opts in explicitly. Without this
+// guard, a fat-fingered EERFUL_0G_BRIDGE_BIND_HOST=0.0.0.0 hands the
+// wallet to anyone on the network.
+function normalizeBindHost(host: string): string {
+  const trimmed = host.trim();
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function isLoopbackBindHost(host: string): boolean {
+  const normalized = normalizeBindHost(host).toLowerCase();
+  return normalized === '127.0.0.1' || normalized === '::1' || normalized === 'localhost';
+}
+
+const ALLOW_NON_LOOPBACK_BIND =
+  (process.env.EERFUL_0G_BRIDGE_BIND_HOST_I_UNDERSTAND ?? '').toLowerCase() === 'true';
+
+if (!isLoopbackBindHost(BIND_HOST) && !ALLOW_NON_LOOPBACK_BIND) {
+  console.error(
+    `zg-bridge: refusing to bind to non-loopback host "${BIND_HOST}". ` +
+      'This service holds a hot private key and exposes unauthenticated endpoints. ' +
+      'Use EERFUL_0G_BRIDGE_BIND_HOST=127.0.0.1 (or ::1), or set ' +
+      'EERFUL_0G_BRIDGE_BIND_HOST_I_UNDERSTAND=true if you accept the risk and ' +
+      'are providing your own network protections.',
+  );
+  process.exit(1);
+}
+
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 

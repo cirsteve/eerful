@@ -107,6 +107,39 @@ def test_healthz_ok():
     assert out["chain_id"] == 16602
 
 
+def test_add_ledger_posts_amount_and_parses_response():
+    captured: dict[str, Any] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/admin/add-ledger"
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "created": True,
+                "total_balance_neuron": "1100000000000000000",
+                "available_balance_neuron": "1100000000000000000",
+                "total_balance_0g": 1.1,
+            },
+        )
+
+    with _make_client(httpx.MockTransport(handle)) as c:
+        out = c.add_ledger(1.1)
+    assert captured["body"] == {"amount_0g": 1.1}
+    assert out["created"] is True
+    assert out["total_balance_0g"] == 1.1
+
+
+def test_add_ledger_wraps_bridge_error():
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "missing or invalid 'amount_0g'"})
+
+    with _make_client(httpx.MockTransport(handle)) as c:
+        with pytest.raises(ComputeError, match="amount_0g"):
+            c.add_ledger(0)
+
+
 def test_acknowledge_posts_provider_address():
     captured: dict[str, Any] = {}
 
