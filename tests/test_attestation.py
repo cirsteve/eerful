@@ -102,14 +102,39 @@ def test_parse_rejects_missing_tcb_info() -> None:
     assert "tcb_info" in exc.value.reason
 
 
-def test_parse_rejects_compose_hash_mismatch() -> None:
+def test_parse_rejects_rtmr3_event_mismatch() -> None:
     """tcb_info.compose_hash must match the RTMR3 event log entry; otherwise
-    the report is internally inconsistent and Step 5 must reject it."""
-    bogus = "ab" * 32
+    the report is internally inconsistent and Step 5 must reject it.
+
+    Forced via `event_payload_override` only — leaving `tcb_info.compose_hash`
+    at the real `sha256(app_compose)` so the app_compose cross-check passes
+    and we exercise the RTMR3 path specifically."""
     with pytest.raises(VerificationError) as exc:
-        parse_attestation_report(_build_report(compose_hash_override=bogus))
+        parse_attestation_report(_build_report(event_payload_override="ab" * 32))
     assert exc.value.step == 5
     assert "compose-hash mismatch" in exc.value.reason
+
+
+def test_parse_rejects_app_compose_mutation() -> None:
+    """The §7.1 Step 5 anchor is `sha256(app_compose) == declared compose_hash`.
+    Without this check, a provider could publish any `app_compose` they like
+    and pair it with a fixed declared/event hash, breaking the §8.2
+    categorization that reads `app_compose` directly. Mutate the raw
+    `app_compose` after construction while leaving both hash fields
+    untouched and assert Step 5 fails."""
+    valid = _build_report()
+    envelope = json.loads(valid)
+    tcb = json.loads(envelope["tcb_info"])
+    # Swap the bytes of app_compose so its real sha256 no longer matches
+    # `compose_hash`. Keep the event_payload aligned with `compose_hash` so
+    # the RTMR3 check would still pass — only the new anchor catches this.
+    tcb["app_compose"] = json.dumps({"docker_compose_file": "services: {}\n"})
+    envelope["tcb_info"] = json.dumps(tcb)
+
+    with pytest.raises(VerificationError) as exc:
+        parse_attestation_report(json.dumps(envelope).encode())
+    assert exc.value.step == 5
+    assert "app_compose hash mismatch" in exc.value.reason
 
 
 def test_parse_rejects_missing_compose_event() -> None:
@@ -119,16 +144,77 @@ def test_parse_rejects_missing_compose_event() -> None:
     assert "compose-hash" in exc.value.reason
 
 
+def test_parse_rejects_compose_event_under_wrong_imr() -> None:
+    """Events extended into RTMR3 carry imr=3. A compose-hash event recorded
+    under a different IMR is not bound by RTMR3 and must be ignored —
+    otherwise a provider could plant a placeholder under (say) imr=0 to
+    satisfy this parser while RTMR3 measures something entirely different."""
+    valid = _build_report()
+    envelope = json.loads(valid)
+    tcb = json.loads(envelope["tcb_info"])
+    for e in tcb["event_log"]:
+        if e.get("event") == "compose-hash":
+            e["imr"] = 0
+    envelope["tcb_info"] = json.dumps(tcb)
+    with pytest.raises(VerificationError) as exc:
+        parse_attestation_report(json.dumps(envelope).encode())
+    assert exc.value.step == 5
+    assert "RTMR3 'compose-hash' event" in exc.value.reason
+
+
+def test_parse_rejects_multiple_compose_events() -> None:
+    """Two RTMR3 compose-hash events make the binding ambiguous; fail closed."""
+    valid = _build_report()
+    envelope = json.loads(valid)
+    tcb = json.loads(envelope["tcb_info"])
+    compose_event = next(e for e in tcb["event_log"] if e.get("event") == "compose-hash")
+    tcb["event_log"].append({**compose_event})  # duplicate
+    envelope["tcb_info"] = json.dumps(tcb)
+    with pytest.raises(VerificationError) as exc:
+        parse_attestation_report(json.dumps(envelope).encode())
+    assert exc.value.step == 5
+    assert "multiple" in exc.value.reason or "ambiguous" in exc.value.reason
+
+
+def test_parse_rejects_non_dict_tcb_info() -> None:
+    """`tcb_info` must be a JSON object. A list or string parses as valid JSON
+    but `.get(...)` would crash with AttributeError; the parser must
+    raise `VerificationError(step=5)` instead so callers see structured
+    failures."""
+    envelope = {
+        "quote": "00",
+        "event_log": "[]",
+        "report_data": "",
+        "vm_config": "{}",
+        "tcb_info": json.dumps(["not", "a", "dict"]),
+        "nvidia_payload": {},
+    }
+    with pytest.raises(VerificationError) as exc:
+        parse_attestation_report(json.dumps(envelope).encode())
+    assert exc.value.step == 5
+    assert "tcb_info" in exc.value.reason
+
+
 def test_parse_normalizes_uppercase_compose_hash() -> None:
     """The bridge / provider may serialize the compose-hash uppercase; spec
     §6.4 forces lowercase. The parser MUST canonicalize on the way in or
-    `accepted_compose_hashes` membership checks will spuriously fail."""
-    h_lower = "ab" * 32
-    h_upper = h_lower.upper()
-    parsed = parse_attestation_report(
-        _build_report(compose_hash_override=h_upper, event_payload_override=h_upper)
-    )
-    assert parsed.compose_hash == "0x" + h_lower
+    `accepted_compose_hashes` membership checks will spuriously fail.
+
+    Mutates the envelope post-construction so the declared/event hashes go
+    uppercase but still match `sha256(app_compose)` byte-for-byte."""
+    valid = _build_report()
+    envelope = json.loads(valid)
+    tcb = json.loads(envelope["tcb_info"])
+    real_hash = tcb["compose_hash"]
+    upper = real_hash.upper()
+    tcb["compose_hash"] = upper
+    for e in tcb["event_log"]:
+        if e.get("event") == "compose-hash":
+            e["event_payload"] = upper
+    envelope["tcb_info"] = json.dumps(tcb)
+
+    parsed = parse_attestation_report(json.dumps(envelope).encode())
+    assert parsed.compose_hash == "0x" + real_hash
 
 
 def test_categorize_a_via_model_identifier() -> None:

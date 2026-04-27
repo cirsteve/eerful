@@ -26,6 +26,7 @@ scope for this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Literal
 
@@ -111,6 +112,11 @@ def parse_attestation_report(report_bytes: bytes) -> ParsedAttestationReport:
         tcb_info = json.loads(tcb_info_raw)
     except json.JSONDecodeError as e:
         raise VerificationError(step=5, reason=f"tcb_info is not valid JSON: {e}") from e
+    if not isinstance(tcb_info, dict):
+        raise VerificationError(
+            step=5,
+            reason=f"tcb_info is not an object (got {type(tcb_info).__name__})",
+        )
 
     declared_hash_raw = tcb_info.get("compose_hash")
     if not isinstance(declared_hash_raw, str):
@@ -141,6 +147,21 @@ def parse_attestation_report(report_bytes: bytes) -> ParsedAttestationReport:
     if not isinstance(app_compose, dict):
         raise VerificationError(step=5, reason="app_compose is not an object")
 
+    # Anchor the declared compose-hash to the actual app_compose bytes. Without
+    # this check, a provider can set `tcb_info.compose_hash` and the RTMR3
+    # event payload to the same arbitrary value unrelated to `app_compose`,
+    # and the categorization heuristic — which reads `app_compose` directly
+    # — would be running on data that the TDX quote never bound.
+    computed_hash = "0x" + hashlib.sha256(app_compose_raw.encode("utf-8")).hexdigest()
+    if computed_hash != declared_hash:
+        raise VerificationError(
+            step=5,
+            reason=(
+                f"app_compose hash mismatch: sha256(app_compose) = {computed_hash}, "
+                f"tcb_info declares {declared_hash}"
+            ),
+        )
+
     # RTMR3 cross-check — without it, tcb_info.compose_hash is just a self-reported
     # field; the event log is the path that actually feeds RTMR3 and gets bound by
     # the TDX quote.
@@ -149,15 +170,31 @@ def parse_attestation_report(report_bytes: bytes) -> ParsedAttestationReport:
     except (ValueError, json.JSONDecodeError) as e:
         raise VerificationError(step=5, reason=f"tcb_info.event_log malformed: {e}") from e
 
-    compose_event = next(
-        (e for e in event_log if isinstance(e, dict) and e.get("event") == "compose-hash"),
-        None,
-    )
-    if compose_event is None:
+    # Filter on imr==3: events extended into RTMR3 carry imr=3. A compose-hash
+    # event recorded under a different IMR is not bound by RTMR3 at all, and
+    # accepting it would let a provider record a placeholder compose-hash
+    # under (say) imr=0 to satisfy this parser while RTMR3 measures something
+    # entirely different. Require exactly one such event so a duplicate or
+    # ambiguous binding fails closed.
+    compose_events = [
+        e
+        for e in event_log
+        if isinstance(e, dict) and e.get("event") == "compose-hash" and e.get("imr") == 3
+    ]
+    if not compose_events:
         raise VerificationError(
             step=5,
-            reason="event_log does not contain a 'compose-hash' event (RTMR3 binding missing)",
+            reason=(
+                "event_log does not contain an RTMR3 'compose-hash' event "
+                "(RTMR3 binding missing)"
+            ),
         )
+    if len(compose_events) > 1:
+        raise VerificationError(
+            step=5,
+            reason="event_log contains multiple RTMR3 'compose-hash' events (binding ambiguous)",
+        )
+    compose_event = compose_events[0]
     payload_raw = compose_event.get("event_payload")
     if not isinstance(payload_raw, str):
         raise VerificationError(

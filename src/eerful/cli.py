@@ -86,8 +86,20 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print(f"failed to load receipt at {receipt_path}: {e}", file=sys.stderr)
         return 2
 
-    bundle_bytes = bundle_path.read_bytes()
-    report_bytes = report_path.read_bytes() if report_path is not None else None
+    try:
+        bundle_bytes = bundle_path.read_bytes()
+    except OSError as e:
+        print(f"failed to load bundle at {bundle_path}: {e}", file=sys.stderr)
+        return 2
+
+    if report_path is not None:
+        try:
+            report_bytes: bytes | None = report_path.read_bytes()
+        except OSError as e:
+            print(f"failed to load report at {report_path}: {e}", file=sys.stderr)
+            return 2
+    else:
+        report_bytes = None
 
     try:
         result = verify_receipt(receipt, bundle_bytes, report_bytes)

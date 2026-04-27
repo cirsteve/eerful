@@ -272,20 +272,23 @@ def test_step_5_uppercase_allowlist_matches_lowercase_report():
 
 
 def test_step_5_propagates_parse_errors():
-    """Malformed report (compose-hash mismatch between tcb_info and event log)
-    is a Step 5 failure regardless of allowlist status; the parser raises
-    VerificationError(step=5) and Step 5 must not swallow it."""
-    bogus = "ab" * 32
-    report_bytes, _ = _build_report(compose_hash_override=bogus)
-    # Manually corrupt only one of the two locations to force mismatch:
+    """Malformed report is a Step 5 failure regardless of allowlist status;
+    the parser raises VerificationError(step=5) and Step 5 must not swallow
+    it. Forces the RTMR3 mismatch path: keeps `tcb_info.compose_hash`
+    aligned with `sha256(app_compose)` so the app_compose anchor passes,
+    then diverges only the event log payload."""
+    report_bytes, _ = _build_report()
     envelope = json.loads(report_bytes)
     tcb = json.loads(envelope["tcb_info"])
-    tcb["compose_hash"] = "cd" * 32  # diverge from event_log payload
+    for e in tcb["event_log"]:
+        if e.get("event") == "compose-hash":
+            e["event_payload"] = "cd" * 32  # diverge from tcb_info.compose_hash
     envelope["tcb_info"] = json.dumps(tcb)
     b = _bundle()
     with pytest.raises(VerificationError) as exc:
         verify_step_5_compose_hash_gating(b, json.dumps(envelope).encode())
     assert exc.value.step == 5
+    assert "compose-hash mismatch" in exc.value.reason
 
 
 # ---------------- end-to-end orchestrator ----------------
