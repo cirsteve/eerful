@@ -82,6 +82,54 @@ category and gating status surfaced on stdout.
 Read §2 and §8 before relying on receipts. The spec is deliberate about what
 an EER does and does not cryptographically establish.
 
+## Producing receipts from a jig pipeline
+
+`eerful.jig` plugs into [jig](https://github.com/rankonelabs/jig)'s
+`LLMClient` / `Grader` / `TracingLogger` interfaces so any pipeline step
+graded by an `EvaluationGrader` produces a verifying receipt as a side
+effect.
+
+```python
+from eerful.jig import EvaluationClient, EvaluationGrader
+from eerful.evaluator import EvaluatorBundle
+from eerful.zg.compute import ComputeClient
+from eerful.zg.storage import BridgeStorageClient
+from jig.core.pipeline import PipelineConfig, Step, run_pipeline
+from jig.tracing.sqlite import SQLiteTracer
+
+bundle = EvaluatorBundle.model_validate_json(open("bundle.json").read())
+
+with (
+    ComputeClient(bridge_url="http://127.0.0.1:7878") as compute,
+    BridgeStorageClient(bridge_url="http://127.0.0.1:7878") as storage,
+):
+    client = EvaluationClient(
+        compute=compute,
+        storage=storage,
+        bundle=bundle,
+        evaluator_id=bundle.evaluator_id(),
+        provider_address="0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C",
+    )
+    grader = EvaluationGrader(client=client)
+
+    config = PipelineConfig(
+        name="trading-critic",
+        steps=[Step(name="critic", fn=my_step, grader=grader)],
+        tracer=SQLiteTracer("traces.db"),
+    )
+    result = await run_pipeline(config, input="market-neutral-v1")
+
+# Each grader call produced an EER. The receipt is on the LLM_CALL span's
+# metadata under `eerful.receipt_id`, and persisted to FeedbackLoop (when
+# one is configured on the grader). Subsequent calls auto-chain via
+# `previous_receipt_id`; pin per-call with provider_params.
+```
+
+The grader only emits scores for top-level numeric fields of the bundle's
+`output_schema`; `score_dimensions=[...]` filters further. Tools, mismatched
+system prompts, and conflicting inference params raise `EvaluationClientError`
+— the receipt has to attest the bundle's criteria, not the caller's.
+
 ## Demo provider
 
 The reference demo runs against **Provider 1 — `zai-org/GLM-5-FP8` at
