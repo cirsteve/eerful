@@ -11,6 +11,9 @@ Coverage as of v0.4 reference impl:
   is implemented here. The TDX chain, NVIDIA GPU attestation, and pubkey
   binding subsets of Step 5 are deferred to the dstack-verifier
   integration in Track B follow-up; they are NOT yet enforced.
+- Step 6 (enclave signature) is implemented: recovers the secp256k1
+  pubkey from `enclave_signature` over `response_content` via EIP-191
+  personal_sign and confirms it equals `enclave_pubkey`.
 - Step 4 (fetch the attestation report from Storage) is the caller's
   responsibility for now; on Day 3 it will be wired to a 0G Storage
   client and added here.
@@ -24,6 +27,7 @@ import hashlib
 from typing import Literal
 
 import jsonschema
+from eth_keys.exceptions import BadSignature, ValidationError as EthKeysValidationError
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from eerful.canonical import Bytes32Hex
@@ -36,6 +40,7 @@ from eerful.zg.attestation import (
     categorize_compose,
     parse_attestation_report,
 )
+from eerful.zg.compute import recover_pubkey_from_personal_sign
 
 ComposeHashGating = Literal["enforced", "skipped"]
 """Whether Step 5's compose-hash gate ran. `enforced` means the bundle
@@ -183,6 +188,42 @@ def verify_step_5_compose_hash_gating(
     )
 
 
+def verify_step_6_enclave_signature(receipt: EnhancedReceipt) -> None:
+    """Step 6: enclave_signature is a valid EIP-191 personal_sign over
+    response_content under enclave_pubkey.
+
+    The 0G TeeML provider signs response bodies via EIP-191
+    `personal_sign` (`keccak256("\\x19Ethereum Signed Message:\\n" + len + msg)`).
+    Step 6 recovers the secp256k1 pubkey from `(response_content, signature)`
+    and confirms it matches `receipt.enclave_pubkey` byte-for-byte after
+    canonicalization. Equivalent to "the signature is valid" because
+    secp256k1 recovery is unambiguous for a well-formed (r, s, v) triple.
+    """
+    try:
+        recovered_pubkey, _recovered_address = recover_pubkey_from_personal_sign(
+            receipt.response_content,
+            receipt.enclave_signature,
+        )
+    except (ValueError, TypeError, BadSignature, EthKeysValidationError) as e:
+        # ValueError/TypeError: bad hex, wrong length, non-string input.
+        # BadSignature: secp256k1 recovery rejected the (r, s, v) triple.
+        # EthKeysValidationError: signature bytes failed Signature() init checks.
+        # All three are "this signature can't be recovered to a pubkey" — same
+        # Step 6 attribution, never escape unwrapped.
+        raise VerificationError(
+            step=6,
+            reason=f"enclave_signature could not be recovered: {e}",
+        ) from e
+    if recovered_pubkey != receipt.enclave_pubkey:
+        raise VerificationError(
+            step=6,
+            reason=(
+                f"recovered pubkey {recovered_pubkey} does not match "
+                f"enclave_pubkey {receipt.enclave_pubkey}"
+            ),
+        )
+
+
 def verify_through_step_3(
     receipt: EnhancedReceipt,
     bundle_bytes: bytes,
@@ -201,16 +242,23 @@ def verify_receipt(
 ) -> VerificationResult:
     """Run all currently-implemented verification steps in spec order.
 
-    Steps 1–3 always run. Step 5's compose-hash subset runs when
-    `report_bytes` is provided (Step 4 — fetching the report — is the
-    caller's responsibility until 0G Storage integration lands).
+    §7.1 ordering is normative: Steps 1–3 always run, then Step 5
+    (compose-hash gate) when `report_bytes` is provided, then Step 6
+    (enclave signature). Step 4 (fetching the report from Storage) is
+    the caller's responsibility until 0G Storage integration lands;
+    Step 7 (provider crosscheck) is deferred.
+
+    Step 6 runs regardless of `report_bytes` because it does not depend
+    on the attestation report — only on `(response_content,
+    enclave_pubkey, enclave_signature)` already in the receipt.
 
     Returns the aggregated `VerificationResult` on success. On failure,
     raises `VerificationError(step=N, ...)` from the first step that
     fails; later steps don't run.
     """
     bundle = verify_through_step_3(receipt, bundle_bytes)
-    if report_bytes is None:
-        return VerificationResult(bundle=bundle)
-    step5 = verify_step_5_compose_hash_gating(bundle, report_bytes)
+    step5: Step5Result | None = None
+    if report_bytes is not None:
+        step5 = verify_step_5_compose_hash_gating(bundle, report_bytes)
+    verify_step_6_enclave_signature(receipt)
     return VerificationResult(bundle=bundle, step5=step5)
