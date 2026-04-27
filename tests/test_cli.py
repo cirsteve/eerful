@@ -1,28 +1,34 @@
-"""CLI smoke tests — argparse wiring + publish-evaluator behavior.
+"""CLI smoke tests — argparse wiring + publish-evaluator + verify behavior.
 
-The verify subcommand has its own behavioral coverage in test_verify.py
-(those exercise the underlying verify_receipt directly). This file
-focuses on:
+`verify_receipt` and the storage-aware orchestrator have their own coverage
+in test_verify.py. This file focuses on:
 
 - publish-evaluator's canonical-bytes upload contract
 - dry-run path
 - error mapping (storage error, trust violation, bundle validation)
 - summary lines that surface §6.5 / §8 caveats
+- verify subcommand wiring: storage-by-default, --bundle/--report
+  overrides, --skip-step-5, loopback guard, mutual-exclusion errors
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
+from eth_keys import keys
+from eth_utils import keccak
 
 from eerful.cli import _is_loopback_bridge_url, _publish_evaluator, main
 from eerful.errors import StorageError, TrustViolation
 from eerful.evaluator import EvaluatorBundle
+from eerful.receipt import EnhancedReceipt
 from eerful.zg.storage import MockStorageClient
 
 
@@ -307,3 +313,342 @@ def test_publish_evaluator_dry_run_skips_loopback_check(tmp_path: Path) -> None:
     )
     assert rc == 0
     assert "dry run" in out
+
+
+# ---------------- verify subcommand ----------------
+
+
+_TEST_PRIVKEY = b"\x42" * 32
+
+
+def _sign_personal(text: str) -> tuple[str, str]:
+    text_bytes = text.encode("utf-8")
+    msg_hash = keccak(
+        b"\x19Ethereum Signed Message:\n" + str(len(text_bytes)).encode() + text_bytes
+    )
+    pk = keys.PrivateKey(_TEST_PRIVKEY)
+    sig = pk.sign_msg_hash(msg_hash)
+    return "0x" + pk.public_key.to_bytes().hex(), "0x" + sig.to_bytes().hex()
+
+
+def _build_report_bytes(compose_str: str = "model=zai-org/GLM-5-FP8") -> tuple[bytes, str]:
+    """Build a minimal attestation report and return (bytes, compose_hash)."""
+    app_compose = {
+        "docker_compose_file": (
+            "services:\n  vllm:\n    image: vllm/vllm-openai:nightly\n"
+            f"    command: --{compose_str}\n"
+        ),
+    }
+    raw = json.dumps(app_compose, sort_keys=True)
+    real_hash = hashlib.sha256(raw.encode()).hexdigest()
+    event_log: list[dict[str, Any]] = [
+        {
+            "imr": 3,
+            "event_type": 134217729,
+            "digest": "00" * 48,
+            "event": "compose-hash",
+            "event_payload": real_hash,
+        }
+    ]
+    tcb = {
+        "compose_hash": real_hash,
+        "event_log": event_log,
+        "app_compose": raw,
+    }
+    envelope = {
+        "quote": "00",
+        "event_log": json.dumps(event_log),
+        "report_data": "",
+        "vm_config": "{}",
+        "tcb_info": json.dumps(tcb),
+        "nvidia_payload": {},
+    }
+    return json.dumps(envelope).encode(), "0x" + real_hash.lower()
+
+
+def _make_receipt_and_artifacts(
+    *,
+    accepted_compose_hashes: list[str] | None = None,
+) -> tuple[EnhancedReceipt, bytes, bytes]:
+    """Build a verifying receipt + the bundle bytes + the report bytes
+    that storage should hold for the verify subcommand to succeed."""
+    bundle_kwargs: dict[str, Any] = dict(
+        version="trading-critic@1.0.0",
+        model_identifier="zai-org/GLM-5-FP8",
+        system_prompt="rate it",
+    )
+    if accepted_compose_hashes is not None:
+        bundle_kwargs["accepted_compose_hashes"] = accepted_compose_hashes
+    bundle = EvaluatorBundle(**bundle_kwargs)
+    bundle_canonical = bundle.canonical_bytes()
+    report_bytes, _ = _build_report_bytes()
+    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
+
+    pubkey, sig = _sign_personal("hello")
+    receipt = EnhancedReceipt.build(
+        created_at=datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc),
+        evaluator_id=bundle.evaluator_id(),
+        evaluator_version=bundle.version,
+        provider_address="0x" + "b" * 40,
+        chat_id="chat-123",
+        response_content="hello",
+        attestation_report_hash=rh,
+        enclave_pubkey=pubkey,
+        enclave_signature=sig,
+    )
+    return receipt, bundle_canonical, report_bytes
+
+
+def _patch_bridge_with_storage(
+    monkeypatch: pytest.MonkeyPatch, storage: MockStorageClient
+) -> dict[str, Any]:
+    """Replace BridgeStorageClient in the CLI with a context-manager
+    wrapper around `storage`. Captures the bridge_url for assertions."""
+    captured: dict[str, Any] = {}
+
+    class _BridgeWrapper:
+        def __init__(self, *, bridge_url: str) -> None:
+            captured["url"] = bridge_url
+            self._storage = storage
+
+        def __enter__(self) -> MockStorageClient:
+            return self._storage
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    monkeypatch.setattr("eerful.cli.BridgeStorageClient", _BridgeWrapper)
+    return captured
+
+
+def test_verify_fetches_bundle_and_report_from_storage_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default verify path: no --bundle, no --report. Storage holds both
+    artifacts; the CLI fetches by content hash and verifies through
+    Steps 1–3 + 5 (gating skipped, no allowlist) + 6."""
+    receipt, bundle_canonical, report_bytes = _make_receipt_and_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle_canonical)
+    storage.upload_blob(report_bytes)
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, out, err = _run_main(["verify", str(receipt_path)])
+    assert rc == 0, err
+    assert "OK" in out
+    assert "trading-critic@1.0.0" in out
+    # Default: no allowlist on the bundle → gating skipped
+    assert "compose-hash gating: skipped" in out
+
+
+def test_verify_storage_path_enforces_allowlist_when_bundle_declares_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Storage-fetched bundle declares an allowlist that includes the
+    attested compose-hash → Step 5 gating reads `enforced` in the output."""
+    _, _, report_bytes = _make_receipt_and_artifacts()
+    real_hash = "0x" + hashlib.sha256(
+        json.dumps(
+            {
+                "docker_compose_file": (
+                    "services:\n  vllm:\n    image: vllm/vllm-openai:nightly\n"
+                    "    command: --model=zai-org/GLM-5-FP8\n"
+                ),
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    receipt, bundle_canonical, _ = _make_receipt_and_artifacts(
+        accepted_compose_hashes=[real_hash]
+    )
+    storage = MockStorageClient()
+    storage.upload_blob(bundle_canonical)
+    storage.upload_blob(report_bytes)
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, out, err = _run_main(["verify", str(receipt_path)])
+    assert rc == 0, err
+    assert "compose-hash gating: enforced" in out
+    assert "allowlist match" in out
+
+
+def test_verify_skip_step_5_does_not_fetch_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--skip-step-5 means we never look up the report. Storage holding
+    only the bundle is sufficient; the CLI completes Steps 1–3 + 6."""
+    receipt, bundle_canonical, _ = _make_receipt_and_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle_canonical)
+    # Report intentionally NOT in storage.
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, out, err = _run_main(["verify", str(receipt_path), "--skip-step-5"])
+    assert rc == 0, err
+    assert "Step 5" in out  # appears in the "not run" message
+    assert "--skip-step-5 set" in out
+
+
+def test_verify_falls_back_to_bundle_override_without_bridge(tmp_path: Path) -> None:
+    """If both --bundle and --skip-step-5 are given, the CLI does not
+    open a bridge connection at all. We assert this implicitly: no
+    monkeypatch on BridgeStorageClient, and the CLI still succeeds.
+    A regression that opens the bridge anyway would raise a connection
+    error here."""
+    receipt, bundle_canonical, _ = _make_receipt_and_artifacts()
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(bundle_canonical)
+
+    rc, out, err = _run_main(
+        [
+            "verify",
+            str(receipt_path),
+            "--bundle",
+            str(bundle_path),
+            "--skip-step-5",
+        ]
+    )
+    assert rc == 0, err
+    assert "OK" in out
+
+
+def test_verify_uses_report_override_with_bundle_from_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed-source verification: bundle from storage, report from local
+    file. Step 5 runs against the file's bytes; storage is touched only
+    for the bundle."""
+    receipt, bundle_canonical, report_bytes = _make_receipt_and_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle_canonical)
+    # Report NOT uploaded to storage; we'll pass --report.
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+    report_path = tmp_path / "report.json"
+    report_path.write_bytes(report_bytes)
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, out, err = _run_main(
+        ["verify", str(receipt_path), "--report", str(report_path)]
+    )
+    assert rc == 0, err
+    assert "compose-hash gating" in out
+
+
+def test_verify_report_and_skip_step_5_are_mutually_exclusive(tmp_path: Path) -> None:
+    receipt, bundle_canonical, report_bytes = _make_receipt_and_artifacts()
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(bundle_canonical)
+    report_path = tmp_path / "report.json"
+    report_path.write_bytes(report_bytes)
+
+    rc, _, err = _run_main(
+        [
+            "verify",
+            str(receipt_path),
+            "--bundle",
+            str(bundle_path),
+            "--report",
+            str(report_path),
+            "--skip-step-5",
+        ]
+    )
+    assert rc == 2
+    assert "mutually exclusive" in err
+
+
+def test_verify_rejects_remote_bridge_url(tmp_path: Path) -> None:
+    """Same loopback guard as publish-evaluator: a non-loopback bridge
+    URL is refused unless --allow-remote-bridge is given. Important for
+    verify too — verifier privacy depends on which queries leak."""
+    receipt, _, _ = _make_receipt_and_artifacts()
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    rc, _, err = _run_main(
+        [
+            "verify",
+            str(receipt_path),
+            "--bridge-url",
+            "http://attacker.example.com:7878",
+        ]
+    )
+    assert rc == 2
+    assert "non-loopback bridge" in err
+    assert "--allow-remote-bridge" in err
+
+
+def test_verify_remote_bridge_with_opt_in_passes_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt, bundle_canonical, report_bytes = _make_receipt_and_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle_canonical)
+    storage.upload_blob(report_bytes)
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    captured = _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, out, err = _run_main(
+        [
+            "verify",
+            str(receipt_path),
+            "--bridge-url",
+            "http://offsite.example:7878",
+            "--allow-remote-bridge",
+        ]
+    )
+    assert rc == 0, err
+    assert captured["url"] == "http://offsite.example:7878"
+    assert "OK" in out
+
+
+def test_verify_surfaces_step_attribution_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A storage-fetched bundle whose hash mismatches surfaces as Step 2
+    failure, not a generic error. Important for ops triage: the spec
+    step number tells you which assumption broke."""
+    receipt, bundle_canonical, report_bytes = _make_receipt_and_artifacts()
+    storage = MockStorageClient()
+    # Upload a *different* bundle under a *different* hash, but don't
+    # upload the receipt's actual bundle. Storage lookup by
+    # receipt.evaluator_id will miss → Step 2.
+    storage.upload_blob(b"some unrelated bytes")
+    storage.upload_blob(report_bytes)
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, _, err = _run_main(["verify", str(receipt_path)])
+    assert rc == 1
+    assert "verification step 2" in err
+
+    # Bonus assertion to make sure we're verifying the right thing —
+    # the unrelated bytes haven't been silently treated as the bundle.
+    assert "evaluator bundle not retrievable" in err
+
+    # The local bundle bytes should still be valid (sanity check that
+    # the receipt isn't broken — the failure is purely Step 2 fetch).
+    assert bundle_canonical not in err.encode()

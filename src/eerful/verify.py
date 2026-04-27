@@ -1,12 +1,24 @@
 """§7.1 verification algorithm.
 
-The functions here are I/O-free: callers fetch the bundle bytes and (for
-Step 5) the attestation report bytes and pass them in. Each step is a
-separately testable function; an orchestrator runs them in spec order.
+The pure step functions are I/O-free: callers fetch the bundle bytes and
+(for Step 5) the attestation report bytes and pass them in. Each step is
+a separately testable function; an orchestrator runs them in spec order.
 
-Coverage as of v0.4 reference impl:
+`verify_receipt_with_storage` is the storage-aware counterpart: it pulls
+the bundle (Step 2) and attestation report (Step 4) from a `StorageClient`
+by content hash, attributes any fetch failure to its step, and runs the
+same pure pipeline. Production callers (the CLI, jig adapters) should use
+the storage path; tests and offline-with-local-files callers can keep
+passing bytes through `verify_receipt`.
+
+Coverage as of v0.5 reference impl:
 
 - Steps 1–3 land in v0.4 (offline integrity + bundle binding + schema).
+- Step 4 fetches the attestation report from a `StorageClient` and
+  confirms its content hash equals `receipt.attestation_report_hash`.
+  Storage adapters already content-check on download; Step 4 owns the
+  attribution so a fetch failure surfaces as VerificationError(step=4),
+  never raw StorageError/TrustViolation.
 - Step 5's compose-hash subset (§6.5 allowlist + §8.2 category diagnostic)
   is implemented here. The TDX chain, NVIDIA GPU attestation, and pubkey
   binding subsets of Step 5 are deferred to the dstack-verifier
@@ -14,9 +26,6 @@ Coverage as of v0.4 reference impl:
 - Step 6 (enclave signature) is implemented: recovers the secp256k1
   pubkey from `enclave_signature` over `response_content` via EIP-191
   personal_sign and confirms it equals `enclave_pubkey`.
-- Step 4 (fetch the attestation report from Storage) is the caller's
-  responsibility for now; on Day 3 it will be wired to a 0G Storage
-  client and added here.
 
 Failures raise `VerificationError(step=N, reason=...)`.
 """
@@ -31,7 +40,7 @@ from eth_keys.exceptions import BadSignature, ValidationError as EthKeysValidati
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from eerful.canonical import Bytes32Hex
-from eerful.errors import VerificationError
+from eerful.errors import StorageError, TrustViolation, VerificationError
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt, derive_receipt_id
 from eerful.zg.attestation import (
@@ -41,6 +50,7 @@ from eerful.zg.attestation import (
     parse_attestation_report,
 )
 from eerful.zg.compute import recover_pubkey_from_personal_sign
+from eerful.zg.storage import StorageClient
 
 ComposeHashGating = Literal["enforced", "skipped"]
 """Whether Step 5's compose-hash gate ran. `enforced` means the bundle
@@ -135,6 +145,66 @@ def verify_step_3_output_schema(
         raise VerificationError(
             step=3,
             reason=f"output_score_block schema validation failed: {e.message}",
+        ) from e
+
+
+def verify_step_4_attestation_report(
+    receipt: EnhancedReceipt,
+    storage: StorageClient,
+) -> bytes:
+    """Step 4: fetch the attestation report from storage by content hash.
+
+    Returns the report bytes for Step 5 to parse. Storage adapters
+    already content-check the bytes they return (see
+    `BridgeStorageClient.download_blob` and `MockStorageClient`); we
+    re-wrap their exceptions as `VerificationError(step=4)` so the
+    spec-step attribution stays consistent. A `TrustViolation` from the
+    adapter — bytes returned that don't hash to the requested hash — is
+    also a Step 4 failure: it's the same condition spec §7.1 Step 4
+    fails on (storage returned the wrong report).
+    """
+    try:
+        return storage.download_blob(receipt.attestation_report_hash)
+    except TrustViolation as e:
+        raise VerificationError(
+            step=4,
+            reason=f"attestation report content hash mismatch: {e}",
+        ) from e
+    except StorageError as e:
+        raise VerificationError(
+            step=4,
+            reason=f"attestation report not retrievable: {e}",
+        ) from e
+
+
+def fetch_evaluator_bundle_bytes(
+    receipt: EnhancedReceipt,
+    storage: StorageClient,
+) -> bytes:
+    """Fetch the evaluator bundle bytes from storage for Step 2.
+
+    Step 2's hash + parse runs on the bytes we return; this helper just
+    re-wraps storage exceptions so they surface as `VerificationError(
+    step=2)` rather than raw `StorageError` / `TrustViolation`.
+    `verify_step_2_evaluator_bundle` then runs the hash + parse against
+    the fetched bytes — keeping the pure-function contract intact.
+
+    Symmetric with `verify_step_4_attestation_report`, which does the
+    same wrapping for the report side. Together they let storage-aware
+    callers compose Steps 2 + 4 with consistent error attribution while
+    the pure step functions stay I/O-free.
+    """
+    try:
+        return storage.download_blob(receipt.evaluator_id)
+    except TrustViolation as e:
+        raise VerificationError(
+            step=2,
+            reason=f"evaluator bundle content hash mismatch: {e}",
+        ) from e
+    except StorageError as e:
+        raise VerificationError(
+            step=2,
+            reason=f"evaluator bundle not retrievable: {e}",
         ) from e
 
 
@@ -262,3 +332,30 @@ def verify_receipt(
         step5 = verify_step_5_compose_hash_gating(bundle, report_bytes)
     verify_step_6_enclave_signature(receipt)
     return VerificationResult(bundle=bundle, step5=step5)
+
+
+def verify_receipt_with_storage(
+    receipt: EnhancedReceipt,
+    storage: StorageClient,
+    *,
+    fetch_report: bool = True,
+) -> VerificationResult:
+    """Verify a receipt by fetching artifacts from `storage` by content hash.
+
+    Spec §7.1's normative form: the verifier fetches the evaluator bundle
+    by `receipt.evaluator_id` (Step 2) and the attestation report by
+    `receipt.attestation_report_hash` (Step 4). This orchestrator does
+    both, attributing fetch failures to the correct spec step, then runs
+    the same offline pipeline as `verify_receipt`.
+
+    `fetch_report=False` is an explicit escape hatch for verifiers
+    operating without storage access for the report (e.g. air-gapped
+    integrity check on the receipt + bundle alone). Step 5 is skipped
+    in that case and the §8 caveat applies — the receipt is
+    integrity-checked but the §6.5 compose-hash gate is not enforced.
+    """
+    bundle_bytes = fetch_evaluator_bundle_bytes(receipt, storage)
+    report_bytes: bytes | None = None
+    if fetch_report:
+        report_bytes = verify_step_4_attestation_report(receipt, storage)
+    return verify_receipt(receipt, bundle_bytes, report_bytes)

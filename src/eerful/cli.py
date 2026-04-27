@@ -1,11 +1,14 @@
 """eerful CLI.
 
 The `verify` subcommand runs the spec §7.1 verification algorithm against
-an on-disk receipt and prints a human-readable verdict. Step 4 (fetching
-the attestation report from 0G Storage) is not yet wired here — the
-caller passes `--report` with the report bytes on disk for now. When 0G
-Storage integration lands, Step 4 will run from `attestation_report_hash`
-without an explicit flag.
+an on-disk receipt and prints a human-readable verdict. By default it
+fetches both the evaluator bundle (Step 2) and the attestation report
+(Step 4) from 0G Storage by content hash via the local zg-bridge —
+matching the spec's normative form. `--bundle` and `--report` allow
+overriding either artifact with a local file (offline verification, dev
+loops, cached blobs); `--skip-step-5` lets a verifier without storage
+access for the report skip Step 5 entirely while still running Steps
+1–3 + 6.
 
 The `publish-evaluator` subcommand uploads a bundle to 0G Storage via the
 local zg-bridge so verifiers can fetch it by `evaluator_id` (the bundle's
@@ -30,7 +33,13 @@ from eerful.canonical import Bytes32Hex
 from eerful.errors import StorageError, TrustViolation, VerificationError
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
-from eerful.verify import VerificationResult, verify_receipt
+from eerful.verify import (
+    VerificationResult,
+    fetch_evaluator_bundle_bytes,
+    verify_receipt,
+    verify_receipt_with_storage,
+    verify_step_4_attestation_report,
+)
 from eerful.zg.storage import BridgeStorageClient, StorageClient
 
 
@@ -127,8 +136,9 @@ def _print_verification_result(result: VerificationResult) -> None:
 
 def _cmd_verify(args: argparse.Namespace) -> int:
     receipt_path: Path = args.receipt
-    bundle_path: Path = args.bundle
+    bundle_path: Path | None = args.bundle
     report_path: Path | None = args.report
+    skip_step_5: bool = args.skip_step_5
 
     try:
         receipt = EnhancedReceipt.model_validate_json(receipt_path.read_bytes())
@@ -136,29 +146,113 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print(f"failed to load receipt at {receipt_path}: {e}", file=sys.stderr)
         return 2
 
-    try:
-        bundle_bytes = bundle_path.read_bytes()
-    except OSError as e:
-        print(f"failed to load bundle at {bundle_path}: {e}", file=sys.stderr)
-        return 2
-
-    if report_path is not None:
+    # Determine which artifacts must come from storage. If a local file
+    # was given for an artifact, use it; otherwise fetch from the bridge.
+    # `--skip-step-5` short-circuits the report fetch entirely.
+    bundle_from_file: bytes | None = None
+    if bundle_path is not None:
         try:
-            report_bytes: bytes | None = report_path.read_bytes()
+            bundle_from_file = bundle_path.read_bytes()
+        except OSError as e:
+            print(f"failed to load bundle at {bundle_path}: {e}", file=sys.stderr)
+            return 2
+
+    report_from_file: bytes | None = None
+    if report_path is not None:
+        if skip_step_5:
+            print(
+                "--report and --skip-step-5 are mutually exclusive: "
+                "--report supplies the bytes Step 5 needs.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            report_from_file = report_path.read_bytes()
         except OSError as e:
             print(f"failed to load report at {report_path}: {e}", file=sys.stderr)
             return 2
-    else:
-        report_bytes = None
+
+    need_bridge = bundle_from_file is None or (
+        report_from_file is None and not skip_step_5
+    )
 
     try:
-        result = verify_receipt(receipt, bundle_bytes, report_bytes)
+        if need_bridge:
+            bridge_url = args.bridge_url
+            if not _is_loopback_bridge_url(bridge_url) and not args.allow_remote_bridge:
+                print(
+                    f"refusing to query non-loopback bridge {bridge_url!r}. "
+                    "Re-run with --allow-remote-bridge if this is intentional "
+                    "and you trust the network path.",
+                    file=sys.stderr,
+                )
+                return 2
+            with BridgeStorageClient(bridge_url=bridge_url) as storage:
+                result = _verify_with_overrides(
+                    receipt,
+                    storage,
+                    bundle_override=bundle_from_file,
+                    report_override=report_from_file,
+                    skip_step_5=skip_step_5,
+                )
+        else:
+            # Both artifacts (or bundle + skip-step-5) from local files —
+            # no bridge needed. Run the pure pipeline directly.
+            assert bundle_from_file is not None  # narrowed by need_bridge
+            result = verify_receipt(
+                receipt,
+                bundle_from_file,
+                None if skip_step_5 else report_from_file,
+            )
     except VerificationError as e:
         print(f"FAIL — verification step {e.step}: {e.reason}", file=sys.stderr)
         return 1
 
     _print_verification_result(result)
+    if skip_step_5:
+        print(
+            "  note: --skip-step-5 set; Step 5 (compose-hash gate) was not run."
+        )
     return 0
+
+
+def _verify_with_overrides(
+    receipt: EnhancedReceipt,
+    storage: StorageClient,
+    *,
+    bundle_override: bytes | None,
+    report_override: bytes | None,
+    skip_step_5: bool,
+) -> VerificationResult:
+    """Run verification, mixing storage fetches with caller-supplied bytes.
+
+    The matrix:
+      - bundle_override given: use those bytes; else fetch from storage.
+      - report_override given: use those bytes; else fetch from storage,
+        unless `skip_step_5` is set, in which case Step 5 is skipped.
+
+    When neither override is set, this collapses to
+    `verify_receipt_with_storage` exactly. The override path lets a
+    verifier mix sources (e.g. cached bundle on disk + storage report)
+    without losing per-step error attribution.
+    """
+    if bundle_override is None and report_override is None:
+        return verify_receipt_with_storage(
+            receipt, storage, fetch_report=not skip_step_5
+        )
+
+    bundle_bytes = (
+        bundle_override
+        if bundle_override is not None
+        else fetch_evaluator_bundle_bytes(receipt, storage)
+    )
+    if skip_step_5:
+        report_bytes: bytes | None = None
+    elif report_override is not None:
+        report_bytes = report_override
+    else:
+        report_bytes = verify_step_4_attestation_report(receipt, storage)
+    return verify_receipt(receipt, bundle_bytes, report_bytes)
 
 
 def _publish_evaluator(
@@ -263,19 +357,58 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eerful")
     sub = p.add_subparsers(dest="command", required=True)
 
-    v = sub.add_parser("verify", help="verify a receipt against an evaluator bundle and report")
+    v = sub.add_parser(
+        "verify",
+        help=(
+            "verify a receipt; fetches the evaluator bundle and attestation "
+            "report from 0G Storage by content hash by default"
+        ),
+    )
     v.add_argument("receipt", type=Path, help="path to receipt JSON")
     v.add_argument(
         "--bundle",
         type=Path,
-        required=True,
-        help="path to evaluator bundle bytes (canonical JSON; matches receipt.evaluator_id)",
+        default=None,
+        help=(
+            "override: load the evaluator bundle from this local file "
+            "instead of fetching it from storage"
+        ),
     )
     v.add_argument(
         "--report",
         type=Path,
         default=None,
-        help="path to attestation report JSON (optional; enables Step 5 compose-hash gating)",
+        help=(
+            "override: load the attestation report from this local file "
+            "instead of fetching it from storage"
+        ),
+    )
+    v.add_argument(
+        "--skip-step-5",
+        action="store_true",
+        help=(
+            "skip Step 5 (compose-hash gate); does not fetch the report. "
+            "Use when the report is unavailable from storage and you only "
+            "need integrity + signature verification"
+        ),
+    )
+    v.add_argument(
+        "--bridge-url",
+        type=str,
+        default=os.environ.get("EERFUL_0G_BRIDGE_URL", _DEFAULT_BRIDGE_URL),
+        help=(
+            "URL of the zg-bridge (default: $EERFUL_0G_BRIDGE_URL or "
+            f"{_DEFAULT_BRIDGE_URL}). Non-loopback URLs are refused unless "
+            "--allow-remote-bridge is passed."
+        ),
+    )
+    v.add_argument(
+        "--allow-remote-bridge",
+        action="store_true",
+        help=(
+            "opt out of the loopback-only bridge guard. Required to fetch "
+            "from a bridge running off-host."
+        ),
     )
     v.set_defaults(func=_cmd_verify)
 
