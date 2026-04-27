@@ -135,7 +135,7 @@ def _receipt_id(suffix: str = "00") -> str:
     return "0x" + suffix * 32
 
 
-def test_salt_store_put_get_roundtrip(tmp_path: Path):
+def test_salt_store_put_get_roundtrip(tmp_path: Path) -> None:
     store = SaltStore(tmp_path / "salts.json")
     salt = b"\x77" * 32
     store.put(_receipt_id("aa"), salt, input_path="strategies/v1.md")
@@ -144,7 +144,7 @@ def test_salt_store_put_get_roundtrip(tmp_path: Path):
     assert out_path == "strategies/v1.md"
 
 
-def test_salt_store_get_missing_raises_keyerror(tmp_path: Path):
+def test_salt_store_get_missing_raises_keyerror(tmp_path: Path) -> None:
     """Lost-salt scenario — silently returning a default would let a
     producer build a wrong commitment. Surface loud."""
     store = SaltStore(tmp_path / "salts.json")
@@ -152,7 +152,7 @@ def test_salt_store_get_missing_raises_keyerror(tmp_path: Path):
         store.get(_receipt_id("ff"))
 
 
-def test_salt_store_handles_missing_file(tmp_path: Path):
+def test_salt_store_handles_missing_file(tmp_path: Path) -> None:
     """First read against a nonexistent store returns an empty mapping,
     not an OSError — producers don't have to pre-create the file."""
     store = SaltStore(tmp_path / "doesnt-exist.json")
@@ -160,7 +160,7 @@ def test_salt_store_handles_missing_file(tmp_path: Path):
         store.get(_receipt_id("aa"))
 
 
-def test_salt_store_put_creates_parent_directories(tmp_path: Path):
+def test_salt_store_put_creates_parent_directories(tmp_path: Path) -> None:
     """Producers point at `examples/trading_critic/.salt` by convention
     — the parent dir may not yet exist on a fresh clone. put() creates it."""
     nested = tmp_path / "deeply" / "nested" / "salts.json"
@@ -170,7 +170,7 @@ def test_salt_store_put_creates_parent_directories(tmp_path: Path):
     assert nested.parent.exists()
 
 
-def test_salt_store_put_overwrites_existing_entry(tmp_path: Path):
+def test_salt_store_put_overwrites_existing_entry(tmp_path: Path) -> None:
     """Receipts have unique receipt_ids in normal operation — an
     overwrite means the producer is re-running with a fresh salt for
     the same receipt_id, which is fine. We don't guard against it."""
@@ -182,7 +182,7 @@ def test_salt_store_put_overwrites_existing_entry(tmp_path: Path):
     assert path == "v1-rerun.md"
 
 
-def test_salt_store_input_path_is_optional(tmp_path: Path):
+def test_salt_store_input_path_is_optional(tmp_path: Path) -> None:
     store = SaltStore(tmp_path / "salts.json")
     store.put(_receipt_id("aa"), b"\x01" * 32)
     salt, path = store.get(_receipt_id("aa"))
@@ -190,7 +190,7 @@ def test_salt_store_input_path_is_optional(tmp_path: Path):
     assert path is None
 
 
-def test_salt_store_persists_across_instances(tmp_path: Path):
+def test_salt_store_persists_across_instances(tmp_path: Path) -> None:
     """A new SaltStore pointing at the same file reads the same data.
     Producers commonly construct the store fresh per run."""
     path = tmp_path / "salts.json"
@@ -200,7 +200,7 @@ def test_salt_store_persists_across_instances(tmp_path: Path):
     assert ip == "v1.md"
 
 
-def test_salt_store_canonicalizes_receipt_id_case(tmp_path: Path):
+def test_salt_store_canonicalizes_receipt_id_case(tmp_path: Path) -> None:
     """Get with uppercase receipt_id hits the entry put with lowercase
     (and vice-versa). Receipts canonicalize to lowercase but a hand
     query with uppercase shouldn't silently miss."""
@@ -210,7 +210,7 @@ def test_salt_store_canonicalizes_receipt_id_case(tmp_path: Path):
     assert salt == b"\x01" * 32
 
 
-def test_salt_store_rejects_invalid_receipt_id_on_put(tmp_path: Path):
+def test_salt_store_rejects_invalid_receipt_id_on_put(tmp_path: Path) -> None:
     """Invalid receipt_id at put-time is a programming error — refuse
     early so the file never accumulates junk keys."""
     store = SaltStore(tmp_path / "salts.json")
@@ -218,7 +218,7 @@ def test_salt_store_rejects_invalid_receipt_id_on_put(tmp_path: Path):
         store.put("0xnothex", b"\x01" * 32)
 
 
-def test_salt_store_file_is_human_readable_json(tmp_path: Path):
+def test_salt_store_file_is_human_readable_json(tmp_path: Path) -> None:
     """Producers may inspect the salt store by hand. Confirm the file
     is sorted-key indented JSON, not pickled or otherwise opaque."""
     path = tmp_path / "salts.json"
@@ -232,7 +232,7 @@ def test_salt_store_file_is_human_readable_json(tmp_path: Path):
     }
 
 
-def test_salt_store_corrupt_file_raises_value_error(tmp_path: Path):
+def test_salt_store_corrupt_file_raises_value_error(tmp_path: Path) -> None:
     """A non-JSON file at the salt store path is operator surprise (typo,
     accidental edit) — surface as ValueError, not silent pass."""
     path = tmp_path / "salts.json"
@@ -241,7 +241,7 @@ def test_salt_store_corrupt_file_raises_value_error(tmp_path: Path):
         SaltStore(path).get(_receipt_id("aa"))
 
 
-def test_salt_store_top_level_array_rejected(tmp_path: Path):
+def test_salt_store_top_level_array_rejected(tmp_path: Path) -> None:
     """A salt file whose top level is a JSON array is malformed — the
     schema is `dict[receipt_id, entry]`."""
     path = tmp_path / "salts.json"
@@ -253,7 +253,7 @@ def test_salt_store_top_level_array_rejected(tmp_path: Path):
 # ---------------- Integration: commitment ↔ SaltStore round-trip ----------------
 
 
-def test_commitment_reconstructed_from_salt_store_matches_original(tmp_path: Path):
+def test_commitment_reconstructed_from_salt_store_matches_original(tmp_path: Path) -> None:
     """Producer flow: generate salt, compute commitment, persist salt
     by receipt_id, later reload salt and reconstruct the same
     commitment. This is the load-bearing pattern for the trading-critic
