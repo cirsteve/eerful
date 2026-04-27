@@ -154,14 +154,18 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
   }
   try {
     const b = await getBroker();
-    const status = await b.inference.checkProviderSignerStatus(provider_address);
-    if (!status.isAcknowledged) {
+    const preStatus = await b.inference.checkProviderSignerStatus(provider_address);
+    let finalStatus = preStatus;
+    if (!preStatus.isAcknowledged) {
       await b.inference.acknowledgeProviderSigner(provider_address);
+      // Re-check after the on-chain ack so callers see the current
+      // teeSignerAddress, not whatever was bound pre-ack.
+      finalStatus = await b.inference.checkProviderSignerStatus(provider_address);
     }
     res.json({
       provider_address,
-      tee_signer_address: status.teeSignerAddress,
-      already_acknowledged: status.isAcknowledged,
+      tee_signer_address: finalStatus.teeSignerAddress,
+      already_acknowledged: preStatus.isAcknowledged,
     });
   } catch (err) {
     res.status(500).json({
@@ -189,6 +193,23 @@ app.post('/compute/inference', async (req: Request, res: Response) => {
   if (typeof provider_address !== 'string' || !Array.isArray(messages)) {
     res.status(400).json({ error: "missing 'provider_address' or 'messages'" });
     return;
+  }
+  // Validate each message has string role + content. Without this, malformed
+  // input either throws a 500 inside the broker SDK or, worse, signs/bills
+  // `undefined` content silently.
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (
+      m === null ||
+      typeof m !== 'object' ||
+      typeof (m as { role?: unknown }).role !== 'string' ||
+      typeof (m as { content?: unknown }).content !== 'string'
+    ) {
+      res.status(400).json({
+        error: `messages[${i}] must be { role: string, content: string }`,
+      });
+      return;
+    }
   }
   try {
     const b = await getBroker();
@@ -309,6 +330,16 @@ app.get('/compute/attestation/:provider_address', async (req: Request, res: Resp
     const b = await getBroker();
     // getQuote() does not hit disk; downloadQuoteReport() does. We want bytes.
     const result = await b.inference.requestProcessor.getQuote(providerAddress);
+    // Today the SDK's getQuote returns rawReport as a UTF-8 string (the JSON
+    // body of /v1/quote). Guard explicitly so a future SDK change to bytes /
+    // base64 / Uint8Array fails loudly here instead of silently corrupting
+    // the hash and producing receipts that can't be verified.
+    if (typeof result.rawReport !== 'string') {
+      throw new Error(
+        `getQuote returned non-string rawReport (${typeof result.rawReport}); ` +
+          `update bridge to handle the new SDK shape before producing receipts`,
+      );
+    }
     const reportBytes = Buffer.from(result.rawReport, 'utf8');
     const reportHash = sha256Hex(reportBytes);
     res.set('Content-Type', 'application/octet-stream');

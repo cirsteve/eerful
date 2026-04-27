@@ -66,7 +66,10 @@ def main() -> int:
         print(f"  bridge wallet={h['wallet']} chain={h['chain_id']}")
 
         # ---- Step 1a: ensure ledger sub-account exists / top up
-        ledger_amount = float(os.environ.get("EERFUL_0G_LEDGER_DEPOSIT", "0.4"))
+        # Default 1.1: just above the broker's MIN_LOCKED_BALANCE = 1 0G,
+        # with a small buffer for the inference fee. Smaller values fail
+        # at the inference call with "balance below minimum lock".
+        ledger_amount = float(os.environ.get("EERFUL_0G_LEDGER_DEPOSIT", "1.1"))
         ledger = client.add_ledger(ledger_amount)
         print(
             f"  ledger: created={ledger['created']} "

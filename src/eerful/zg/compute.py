@@ -58,7 +58,10 @@ def recover_pubkey_from_personal_sign(
     text_bytes = message_text.encode("utf-8")
     prefix = b"\x19Ethereum Signed Message:\n" + str(len(text_bytes)).encode() + text_bytes
     msg_hash = keccak(prefix)
-    sig_bytes = bytes.fromhex(signature_hex.removeprefix("0x"))
+    # Normalize through to_lower_hex so uppercase / mixed-case / 0X-prefixed
+    # input from the bridge or provider doesn't trip bytes.fromhex (spec §6.4).
+    canonical = to_lower_hex(signature_hex)
+    sig_bytes = bytes.fromhex(canonical.removeprefix("0x"))
     if len(sig_bytes) != 65:
         raise ValueError(f"signature must be 65 bytes, got {len(sig_bytes)}")
     # EVM convention: v is 27 or 28; eth-keys expects 0 or 1 as the last byte.
@@ -177,12 +180,18 @@ class ComputeClient:
         r = self._http.get(f"{self._bridge_url}/compute/attestation/{provider_address}")
         self._raise_for_status(r, "GET /compute/attestation")
         report_bytes = r.content
-        bridge_hash = r.headers.get("X-Report-Hash", "")
+        bridge_hash_raw = r.headers.get("X-Report-Hash", "")
         local_hash = "0x" + hashlib.sha256(report_bytes).hexdigest()
-        if bridge_hash and bridge_hash != local_hash:
-            raise ComputeError(
-                f"attestation hash mismatch: bridge said {bridge_hash}, local computed {local_hash}"
-            )
+        # Normalize the bridge-supplied hash before comparing — spec §6.4
+        # mandates lowercase hex but a future bridge change could emit
+        # uppercase or 0X-prefixed and false-positive a mismatch here.
+        if bridge_hash_raw:
+            bridge_hash = to_lower_hex(bridge_hash_raw)
+            if bridge_hash != local_hash:
+                raise ComputeError(
+                    f"attestation hash mismatch: bridge said {bridge_hash}, "
+                    f"local computed {local_hash}"
+                )
         return report_bytes, local_hash
 
     # ---------------- orchestration ----------------
