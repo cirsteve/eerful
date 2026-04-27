@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from eerful.canonical import Bytes32Hex
 from eerful.errors import StorageError, TrustViolation, VerificationError
@@ -33,6 +34,23 @@ from eerful.zg.storage import BridgeStorageClient, StorageClient
 
 
 _DEFAULT_BRIDGE_URL = "http://127.0.0.1:7878"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _is_loopback_bridge_url(bridge_url: str) -> bool:
+    """True iff `bridge_url`'s host is loopback.
+
+    The bridge holds the wallet key and bundles uploaded through it are
+    signed-and-paid actions; sending them to a non-loopback host without
+    explicit operator opt-in is the same class of risk as binding the
+    bridge itself to a non-loopback interface (which the bridge already
+    refuses by default, see services/zg-bridge/server.ts). The CLI side
+    of the same boundary needs the same guard — the bridge's bind-host
+    check protects it from listening on a public interface, but does
+    NOT stop a misconfigured client from connecting to one.
+    """
+    host = urlparse(bridge_url).hostname
+    return host is not None and host in _LOOPBACK_HOSTS
 
 
 def _category_blurb(category: str) -> str:
@@ -173,6 +191,14 @@ def _cmd_publish_evaluator(args: argparse.Namespace) -> int:
         return 0
 
     bridge_url = args.bridge_url
+    if not _is_loopback_bridge_url(bridge_url) and not args.allow_remote_bridge:
+        print(
+            f"refusing to send bundle to non-loopback bridge {bridge_url!r}. "
+            "Re-run with --allow-remote-bridge if this is intentional and you "
+            "trust the network path.",
+            file=sys.stderr,
+        )
+        return 2
     try:
         with BridgeStorageClient(bridge_url=bridge_url) as storage:
             evaluator_id, bundle = _publish_evaluator(bundle_bytes, storage)
@@ -250,8 +276,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("EERFUL_0G_BRIDGE_URL", _DEFAULT_BRIDGE_URL),
         help=(
             "URL of the zg-bridge (default: $EERFUL_0G_BRIDGE_URL or "
-            f"{_DEFAULT_BRIDGE_URL}; must be loopback unless the bridge "
-            "operator opts in)"
+            f"{_DEFAULT_BRIDGE_URL}). Non-loopback URLs are refused unless "
+            "--allow-remote-bridge is passed."
+        ),
+    )
+    pub.add_argument(
+        "--allow-remote-bridge",
+        action="store_true",
+        help=(
+            "opt out of the loopback-only bridge guard. Required to upload "
+            "bundles to a bridge running off-host. Mirrors the bridge's own "
+            "EERFUL_0G_BRIDGE_BIND_HOST_I_UNDERSTAND opt-in."
         ),
     )
     pub.add_argument(

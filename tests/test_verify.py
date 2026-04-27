@@ -393,6 +393,25 @@ def test_step_6_wraps_malformed_signature_as_step_6_error():
     assert "could not be recovered" in exc.value.reason
 
 
+def test_step_6_wraps_eth_keys_bad_signature_as_step_6_error():
+    """A 65-byte signature that's structurally invalid (e.g. all-zero r/s)
+    raises eth_keys.exceptions.BadSignature, not ValueError. Step 6 must
+    still attribute the failure to itself, never let the underlying
+    library exception escape."""
+    # 64 bytes of zeros + v=0 — passes length check, fails secp256k1
+    # recovery (s=0 is rejected; an all-zero signature doesn't lift to a
+    # valid pubkey).
+    r = _receipt(
+        _bundle(),
+        response_content="hello",
+        enclave_signature="0x" + "00" * 65,
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_step_6_enclave_signature(r)
+    assert exc.value.step == 6
+    assert "could not be recovered" in exc.value.reason
+
+
 # ---------------- verify_receipt orchestrator ----------------
 
 
@@ -423,3 +442,25 @@ def test_verify_receipt_short_circuits_at_step_2_before_step_5():
     with pytest.raises(VerificationError) as exc:
         verify_receipt(r, other.canonical_bytes(), report_bytes)
     assert exc.value.step == 2
+
+
+def test_verify_receipt_runs_step_5_before_step_6():
+    """When both Step 5 and Step 6 would fail, §7.1 ordering attributes
+    the failure to Step 5. A receipt with a bogus signature AND a
+    compose-hash that's not in the bundle's allowlist must surface as
+    Step 5, not Step 6."""
+    report_bytes, hash_hex = _build_report()
+    # Allowlist contains some other hash, so Step 5 would fail.
+    different_hash = "0x" + "f" * 64
+    b = _bundle(accepted_compose_hashes=[different_hash])
+    # Fresh receipt with default valid signature, then swap the
+    # signature for a structurally-invalid one. Step 5 should fire
+    # first; Step 6 never runs.
+    r = _receipt(
+        b,
+        enclave_signature="0x" + "ab" * 30,  # would fail Step 6 if reached
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_receipt(r, b.canonical_bytes(), report_bytes)
+    assert exc.value.step == 5
+    assert hash_hex in exc.value.reason

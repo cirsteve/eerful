@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from eerful.cli import _publish_evaluator, main
+from eerful.cli import _is_loopback_bridge_url, _publish_evaluator, main
 from eerful.errors import StorageError, TrustViolation
 from eerful.evaluator import EvaluatorBundle
 from eerful.zg.storage import MockStorageClient
@@ -183,3 +183,118 @@ def test_publish_evaluator_rejects_empty_allowlist(tmp_path: Path) -> None:
 def test_main_rejects_unknown_subcommand() -> None:
     with pytest.raises(SystemExit):
         _run_main(["nonexistent-command"])
+
+
+# ---------------- loopback bridge guard ----------------
+
+
+def test_publish_evaluator_rejects_remote_bridge_url(tmp_path: Path) -> None:
+    """Without --allow-remote-bridge, a non-loopback URL must not result
+    in any upload — bundles uploaded through a malicious bridge would
+    leak the publisher's evaluator definition before they meant to."""
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(_bundle_bytes())
+
+    rc, _, err = _run_main(
+        [
+            "publish-evaluator",
+            "--bundle",
+            str(bundle_path),
+            "--bridge-url",
+            "http://attacker.example.com:7878",
+        ]
+    )
+    assert rc == 2
+    assert "non-loopback bridge" in err
+    assert "--allow-remote-bridge" in err
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("http://127.0.0.1:7878", True),
+        ("http://localhost:7878", True),
+        ("http://[::1]:7878", True),
+        ("https://localhost", True),
+        ("http://attacker.example.com:7878", False),
+        ("http://10.0.0.5:7878", False),
+        ("http://192.168.1.50:7878", False),
+        ("http://0.0.0.0:7878", False),  # NOT loopback — listens on all ifaces
+        ("not a url at all", False),
+    ],
+)
+def test_is_loopback_bridge_url(url: str, expected: bool) -> None:
+    """Unit test the host parser directly so the loopback contract is
+    pinned independent of networking. 0.0.0.0 explicitly is NOT
+    treated as loopback — a service bound to 0.0.0.0 listens on every
+    interface, so a client connecting to it could still leak."""
+    assert _is_loopback_bridge_url(url) is expected
+
+
+def test_publish_evaluator_remote_with_opt_in_passes_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With --allow-remote-bridge, the loopback guard yields. We verify
+    that by monkeypatching BridgeStorageClient to record the URL it
+    was given — testing the guard's pass-through, not the network."""
+    captured: dict[str, str] = {}
+
+    class _FakeBridge:
+        def __init__(self, *, bridge_url: str) -> None:
+            captured["url"] = bridge_url
+
+        def __enter__(self) -> "_FakeBridge":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def upload_blob(self, data: bytes) -> str:
+            # Return the canonical hash so _publish_evaluator's
+            # defense-in-depth check passes; we want to verify the
+            # guard, not exercise upload-mismatch handling.
+            bundle = EvaluatorBundle.model_validate_json(data)
+            return bundle.evaluator_id()
+
+        def download_blob(self, content_hash: str) -> bytes:
+            raise NotImplementedError
+
+    monkeypatch.setattr("eerful.cli.BridgeStorageClient", _FakeBridge)
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(_bundle_bytes())
+
+    rc, out, err = _run_main(
+        [
+            "publish-evaluator",
+            "--bundle",
+            str(bundle_path),
+            "--bridge-url",
+            "http://offsite.example:7878",
+            "--allow-remote-bridge",
+        ]
+    )
+    assert rc == 0, err
+    assert captured["url"] == "http://offsite.example:7878"
+    assert "uploaded" in out
+
+
+def test_publish_evaluator_dry_run_skips_loopback_check(tmp_path: Path) -> None:
+    """Dry-run never connects, so the loopback guard does not apply.
+    Surface design: telling someone they need --allow-remote-bridge to
+    *not connect* would be confusing."""
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(_bundle_bytes())
+
+    rc, out, _ = _run_main(
+        [
+            "publish-evaluator",
+            "--bundle",
+            str(bundle_path),
+            "--bridge-url",
+            "http://attacker.example.com:7878",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    assert "dry run" in out
