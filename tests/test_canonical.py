@@ -40,9 +40,10 @@ def test_byte_identical_across_runs():
     assert canonical_json_bytes(obj) == canonical_json_bytes(obj)
 
 
-def test_nan_rejected():
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_rejected(bad: float) -> None:
     with pytest.raises(ValueError):
-        canonical_json_bytes({"x": float("nan")})
+        canonical_json_bytes({"x": bad})
 
 
 def test_to_lower_hex_bytes():

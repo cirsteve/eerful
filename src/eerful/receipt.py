@@ -34,33 +34,6 @@ def _to_rfc3339_z(dt: datetime) -> str:
     return s
 
 
-def _signing_payload_dict(
-    *,
-    chat_id: str,
-    created_at: datetime,
-    evaluator_id: Bytes32Hex,
-    evaluator_version: str,
-    extensions: dict[str, Any] | None,
-    input_commitment: Bytes32Hex | None,
-    output_score_block: dict[str, Any] | None,
-    previous_receipt_id: Bytes32Hex | None,
-    provider_address: Address,
-    response_content: str,
-) -> dict[str, Any]:
-    return {
-        "chat_id": chat_id,
-        "created_at": _to_rfc3339_z(created_at),
-        "evaluator_id": evaluator_id,
-        "evaluator_version": evaluator_version,
-        "extensions": extensions,
-        "input_commitment": input_commitment,
-        "output_score_block": output_score_block,
-        "previous_receipt_id": previous_receipt_id,
-        "provider_address": provider_address,
-        "response_content": response_content,
-    }
-
-
 def derive_receipt_id(payload: dict[str, Any]) -> Bytes32Hex:
     return "0x" + hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
@@ -109,19 +82,27 @@ class EnhancedReceipt(BaseModel):
         "response_content",
     )
 
+    @classmethod
+    def _payload_from_source(cls, source: dict[str, Any]) -> dict[str, Any]:
+        """Project `source` to the canonical signing payload shape (spec §6.3).
+
+        `source` must contain every name in `SIGNING_PAYLOAD_FIELDS`. The
+        single source of truth is that tuple; adding a field there
+        automatically pulls it into `signing_payload()`, `build()`, and
+        `_verify_receipt_id` together.
+        """
+        payload: dict[str, Any] = {}
+        for name in cls.SIGNING_PAYLOAD_FIELDS:
+            value = source[name]
+            if name == "created_at":
+                value = _to_rfc3339_z(value)
+            payload[name] = value
+        return payload
+
     def signing_payload(self) -> dict[str, Any]:
         """Fields included in receipt_id derivation (spec §6.3)."""
-        return _signing_payload_dict(
-            chat_id=self.chat_id,
-            created_at=self.created_at,
-            evaluator_id=self.evaluator_id,
-            evaluator_version=self.evaluator_version,
-            extensions=self.extensions,
-            input_commitment=self.input_commitment,
-            output_score_block=self.output_score_block,
-            previous_receipt_id=self.previous_receipt_id,
-            provider_address=self.provider_address,
-            response_content=self.response_content,
+        return self._payload_from_source(
+            {name: getattr(self, name) for name in self.SIGNING_PAYLOAD_FIELDS}
         )
 
     def signing_payload_bytes(self) -> bytes:
@@ -148,34 +129,23 @@ class EnhancedReceipt(BaseModel):
     ) -> EnhancedReceipt:
         """Construct a receipt with receipt_id derived from the canonical
         signing payload."""
-        payload = _signing_payload_dict(
-            chat_id=chat_id,
-            created_at=created_at,
-            evaluator_id=evaluator_id,
-            evaluator_version=evaluator_version,
-            extensions=extensions,
-            input_commitment=input_commitment,
-            output_score_block=output_score_block,
-            previous_receipt_id=previous_receipt_id,
-            provider_address=provider_address,
-            response_content=response_content,
-        )
-        return cls(
-            receipt_id=derive_receipt_id(payload),
-            created_at=created_at,
-            evaluator_id=evaluator_id,
-            evaluator_version=evaluator_version,
-            input_commitment=input_commitment,
-            previous_receipt_id=previous_receipt_id,
-            provider_address=provider_address,
-            chat_id=chat_id,
-            response_content=response_content,
-            output_score_block=output_score_block,
-            attestation_report_hash=attestation_report_hash,
-            enclave_pubkey=enclave_pubkey,
-            enclave_signature=enclave_signature,
-            extensions=extensions,
-        )
+        all_fields: dict[str, Any] = {
+            "chat_id": chat_id,
+            "created_at": created_at,
+            "evaluator_id": evaluator_id,
+            "evaluator_version": evaluator_version,
+            "input_commitment": input_commitment,
+            "previous_receipt_id": previous_receipt_id,
+            "provider_address": provider_address,
+            "response_content": response_content,
+            "output_score_block": output_score_block,
+            "attestation_report_hash": attestation_report_hash,
+            "enclave_pubkey": enclave_pubkey,
+            "enclave_signature": enclave_signature,
+            "extensions": extensions,
+        }
+        payload = cls._payload_from_source(all_fields)
+        return cls(receipt_id=derive_receipt_id(payload), **all_fields)
 
     @model_validator(mode="after")
     def _verify_receipt_id(self) -> EnhancedReceipt:

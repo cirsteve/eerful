@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
 from eerful.evaluator import EvaluatorBundle
 
 
-def _bundle(**overrides) -> EvaluatorBundle:
-    fields = dict(version="trading-critic@1.0.0", model_identifier="zai-org/GLM-5-FP8", system_prompt="rate it")
+def _bundle(**overrides: Any) -> EvaluatorBundle:
+    fields: dict[str, Any] = dict(
+        version="trading-critic@1.0.0",
+        model_identifier="zai-org/GLM-5-FP8",
+        system_prompt="rate it",
+    )
     fields.update(overrides)
     return EvaluatorBundle(**fields)
 
@@ -47,4 +53,4 @@ def test_accepted_compose_hashes_changes_evaluator_id():
 
 def test_extra_fields_forbidden():
     with pytest.raises(ValidationError):
-        EvaluatorBundle(version="v", model_identifier="m", system_prompt="p", surprise=1)
+        EvaluatorBundle(version="v", model_identifier="m", system_prompt="p", surprise=1)  # type: ignore[call-arg]

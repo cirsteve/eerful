@@ -47,8 +47,13 @@ class EvaluatorBundle(BaseModel):
     """Publisher-defined; informational."""
 
     def canonical_bytes(self) -> bytes:
-        """Canonical JSON encoding of the bundle (spec §6.4)."""
-        return canonical_json_bytes(self.model_dump())
+        """Canonical JSON encoding of the bundle (spec §6.4).
+
+        `mode="json"` defends against future fields whose Python-native form
+        isn't JSON-serializable (datetime, UUID, Decimal, etc.) — keeps
+        canonicalization total even as the bundle schema grows.
+        """
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
     def evaluator_id(self) -> Bytes32Hex:
         """Content hash of the bundle. The receipt's `evaluator_id` field is

@@ -4,15 +4,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from eerful.errors import VerificationError
 from eerful.receipt import EnhancedReceipt
 
 CREATED = datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc)
 
-BASE = dict(
+BASE: dict[str, Any] = dict(
     created_at=CREATED,
     evaluator_id="0x" + "a" * 64,
     evaluator_version="trading-critic@1.0.0",
@@ -94,7 +96,7 @@ def test_tampered_response_content_fails_step1():
     r = EnhancedReceipt.build(**BASE)
     j = r.model_dump_json()
     tampered = j.replace('"hello"', '"goodbye"')
-    with pytest.raises(Exception) as exc:
+    with pytest.raises((ValidationError, VerificationError)) as exc:
         EnhancedReceipt.model_validate_json(tampered)
     assert "step 1" in str(exc.value).lower() or "receipt_id" in str(exc.value).lower()
 

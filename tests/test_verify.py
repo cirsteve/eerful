@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -88,10 +89,16 @@ def test_step_2_fails_when_hash_mismatch():
 
 
 def test_step_2_fails_when_bundle_malformed():
-    r = _receipt(_bundle())
+    """Receipt's evaluator_id matches the bytes' hash, so the hash check
+    passes and we exercise the JSON parse / pydantic-validation branch
+    rather than re-testing the hash mismatch path."""
+    malformed = b"not valid json"
+    digest = "0x" + hashlib.sha256(malformed).hexdigest()
+    r = _receipt(_bundle(), evaluator_id=digest)
     with pytest.raises(VerificationError) as exc:
-        verify_step_2_evaluator_bundle(r, b"not valid json")
+        verify_step_2_evaluator_bundle(r, malformed)
     assert exc.value.step == 2
+    assert "deserialization" in exc.value.reason
 
 
 # ---------------- Step 3 ----------------
