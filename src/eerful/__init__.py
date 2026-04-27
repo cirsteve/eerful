@@ -13,6 +13,7 @@ from eerful.canonical import (
     is_bytes_hex,
     to_lower_hex,
 )
+from eerful.commitment import SaltStore, compute_input_commitment, generate_salt
 from eerful.errors import (
     ComputeError,
     EerError,
@@ -35,11 +36,14 @@ __all__ = [
     "EnhancedReceipt",
     "EvaluationClientError",
     "EvaluatorBundle",
+    "SaltStore",
     "StorageError",
     "TrustViolation",
     "VerificationError",
     "__version__",
     "canonical_json_bytes",
+    "compute_input_commitment",
+    "generate_salt",
     "is_address",
     "is_bytes32_hex",
     "is_bytes_hex",
