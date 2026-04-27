@@ -10,9 +10,9 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
-from eerful.canonical import Bytes32Hex, canonical_json_bytes
+from eerful.canonical import Bytes32Hex, canonical_json_bytes, is_bytes32_hex
 
 
 class EvaluatorBundle(BaseModel):
@@ -41,10 +41,41 @@ class EvaluatorBundle(BaseModel):
     """Allowlist of attested compose-hashes (spec §6.5, §8.3). When set,
     verification Step 5 fails if the report's compose-hash is not in this
     list. The strongest defense against the §8 model-binding gap that the
-    receipt format alone can offer."""
+    receipt format alone can offer.
+
+    Canonicalization: `None` means "no allowlist, no gating"; a populated
+    list means "gate Step 5 on these hashes". An empty list is rejected at
+    construction so there is exactly one canonical form for "no gating"
+    (mirrors §10.1's `extensions={}` → `null` policy). Without this rule,
+    `None` and `[]` would canonical-JSON-encode differently (`null` vs `[]`)
+    and produce diverging `evaluator_id`s for what publishers intend as the
+    same bundle."""
 
     metadata: dict[str, Any] | None = None
     """Publisher-defined; informational."""
+
+    @model_validator(mode="after")
+    def _validate_accepted_compose_hashes(self) -> EvaluatorBundle:
+        """Enforce the §6.5 / §6.4 invariants the type alias can't express:
+
+        - Each entry is a syntactically valid `Bytes32Hex` (the
+          `BeforeValidator` lowercases but does not bound length).
+        - The list is non-empty when present (canonical-form rule above).
+        """
+        items = self.accepted_compose_hashes
+        if items is None:
+            return self
+        if len(items) == 0:
+            raise ValueError(
+                "accepted_compose_hashes must be omitted (None) rather than empty; "
+                "an empty list has no canonical form (see §6.5 docstring)."
+            )
+        for h in items:
+            if not is_bytes32_hex(h):
+                raise ValueError(
+                    f"accepted_compose_hashes entry is not a valid Bytes32Hex: {h!r}"
+                )
+        return self
 
     def canonical_bytes(self) -> bytes:
         """Canonical JSON encoding of the bundle (spec §6.4).
