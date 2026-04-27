@@ -11,6 +11,9 @@ Coverage as of v0.4 reference impl:
   is implemented here. The TDX chain, NVIDIA GPU attestation, and pubkey
   binding subsets of Step 5 are deferred to the dstack-verifier
   integration in Track B follow-up; they are NOT yet enforced.
+- Step 6 (enclave signature) is implemented: recovers the secp256k1
+  pubkey from `enclave_signature` over `response_content` via EIP-191
+  personal_sign and confirms it equals `enclave_pubkey`.
 - Step 4 (fetch the attestation report from Storage) is the caller's
   responsibility for now; on Day 3 it will be wired to a 0G Storage
   client and added here.
@@ -36,6 +39,7 @@ from eerful.zg.attestation import (
     categorize_compose,
     parse_attestation_report,
 )
+from eerful.zg.compute import recover_pubkey_from_personal_sign
 
 ComposeHashGating = Literal["enforced", "skipped"]
 """Whether Step 5's compose-hash gate ran. `enforced` means the bundle
@@ -183,6 +187,37 @@ def verify_step_5_compose_hash_gating(
     )
 
 
+def verify_step_6_enclave_signature(receipt: EnhancedReceipt) -> None:
+    """Step 6: enclave_signature is a valid EIP-191 personal_sign over
+    response_content under enclave_pubkey.
+
+    The 0G TeeML provider signs response bodies via EIP-191
+    `personal_sign` (`keccak256("\\x19Ethereum Signed Message:\\n" + len + msg)`).
+    Step 6 recovers the secp256k1 pubkey from `(response_content, signature)`
+    and confirms it matches `receipt.enclave_pubkey` byte-for-byte after
+    canonicalization. Equivalent to "the signature is valid" because
+    secp256k1 recovery is unambiguous for a well-formed (r, s, v) triple.
+    """
+    try:
+        recovered_pubkey, _recovered_address = recover_pubkey_from_personal_sign(
+            receipt.response_content,
+            receipt.enclave_signature,
+        )
+    except (ValueError, TypeError) as e:
+        raise VerificationError(
+            step=6,
+            reason=f"enclave_signature could not be recovered: {e}",
+        ) from e
+    if recovered_pubkey != receipt.enclave_pubkey:
+        raise VerificationError(
+            step=6,
+            reason=(
+                f"recovered pubkey {recovered_pubkey} does not match "
+                f"enclave_pubkey {receipt.enclave_pubkey}"
+            ),
+        )
+
+
 def verify_through_step_3(
     receipt: EnhancedReceipt,
     bundle_bytes: bytes,
@@ -201,15 +236,17 @@ def verify_receipt(
 ) -> VerificationResult:
     """Run all currently-implemented verification steps in spec order.
 
-    Steps 1–3 always run. Step 5's compose-hash subset runs when
-    `report_bytes` is provided (Step 4 — fetching the report — is the
-    caller's responsibility until 0G Storage integration lands).
+    Steps 1–3 always run, then Step 6 (enclave signature). Step 5's
+    compose-hash subset runs when `report_bytes` is provided (Step 4 —
+    fetching the report — is the caller's responsibility until 0G Storage
+    integration lands).
 
     Returns the aggregated `VerificationResult` on success. On failure,
     raises `VerificationError(step=N, ...)` from the first step that
     fails; later steps don't run.
     """
     bundle = verify_through_step_3(receipt, bundle_bytes)
+    verify_step_6_enclave_signature(receipt)
     if report_bytes is None:
         return VerificationResult(bundle=bundle)
     step5 = verify_step_5_compose_hash_gating(bundle, report_bytes)

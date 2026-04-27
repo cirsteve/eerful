@@ -1,4 +1,4 @@
-"""§7.1 Steps 1-3 verification."""
+"""§7.1 verification — Steps 1, 2, 3, 5, 6 reference tests."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from eth_keys import keys
+from eth_utils import keccak
 
 from eerful.errors import VerificationError
 from eerful.evaluator import EvaluatorBundle
@@ -18,8 +20,27 @@ from eerful.verify import (
     verify_step_2_evaluator_bundle,
     verify_step_3_output_schema,
     verify_step_5_compose_hash_gating,
+    verify_step_6_enclave_signature,
     verify_through_step_3,
 )
+
+
+_TEST_PRIVKEY = b"\x42" * 32
+
+
+def _sign_personal(text: str, privkey_bytes: bytes = _TEST_PRIVKEY) -> tuple[str, str]:
+    """EIP-191 personal_sign over `text`. Returns (pubkey_hex, signature_hex).
+
+    Mirrors what the 0G TeeML provider's signature endpoint produces,
+    minus the 27/28 v-shift (eth-keys emits v in {0, 1}; both forms are
+    accepted by `recover_pubkey_from_personal_sign`)."""
+    text_bytes = text.encode("utf-8")
+    msg_hash = keccak(
+        b"\x19Ethereum Signed Message:\n" + str(len(text_bytes)).encode() + text_bytes
+    )
+    pk = keys.PrivateKey(privkey_bytes)
+    sig = pk.sign_msg_hash(msg_hash)
+    return "0x" + pk.public_key.to_bytes().hex(), "0x" + sig.to_bytes().hex()
 
 
 def _build_report(
@@ -88,16 +109,22 @@ def _bundle(**overrides: Any) -> EvaluatorBundle:
 
 
 def _receipt(bundle: EvaluatorBundle, **overrides: Any) -> EnhancedReceipt:
+    """Build a receipt whose enclave signature is genuinely valid for
+    `response_content` (so Step 6 passes by default). Tests exercising
+    Step 6 failure modes override `enclave_signature` or `enclave_pubkey`
+    explicitly."""
+    response_content = overrides.get("response_content", "hello")
+    pubkey, sig = _sign_personal(response_content)
     fields: dict[str, Any] = dict(
         created_at=CREATED,
         evaluator_id=bundle.evaluator_id(),
         evaluator_version=bundle.version,
         provider_address="0x" + "b" * 40,
         chat_id="chat-123",
-        response_content="hello",
+        response_content=response_content,
         attestation_report_hash="0x" + "e" * 64,
-        enclave_pubkey="0x" + "c" * 64,
-        enclave_signature="0x" + "d" * 128,
+        enclave_pubkey=pubkey,
+        enclave_signature=sig,
     )
     fields.update(overrides)
     return EnhancedReceipt.build(**fields)
@@ -292,6 +319,81 @@ def test_step_5_propagates_parse_errors():
 
 
 # ---------------- end-to-end orchestrator ----------------
+
+
+# ---------------- Step 6 ----------------
+
+
+def test_step_6_passes_for_valid_signature():
+    verify_step_6_enclave_signature(_receipt(_bundle()))
+
+
+def test_step_6_fails_when_signature_over_wrong_message():
+    """Construct a receipt where the signature was computed over a
+    different message than response_content — recovered pubkey will
+    differ from enclave_pubkey."""
+    pubkey, sig = _sign_personal("a different message")
+    r = _receipt(
+        _bundle(),
+        response_content="this is the response that the receipt asserts",
+        enclave_pubkey=pubkey,
+        enclave_signature=sig,
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_step_6_enclave_signature(r)
+    assert exc.value.step == 6
+    assert "does not match" in exc.value.reason
+
+
+def test_step_6_fails_when_pubkey_belongs_to_different_key():
+    """response_content was signed by privkey A, but receipt declares
+    pubkey of privkey B."""
+    _, sig_a = _sign_personal("hello", b"\x01" * 32)
+    pubkey_b, _ = _sign_personal("hello", b"\x02" * 32)
+    r = _receipt(
+        _bundle(),
+        response_content="hello",
+        enclave_pubkey=pubkey_b,
+        enclave_signature=sig_a,
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_step_6_enclave_signature(r)
+    assert exc.value.step == 6
+
+
+def test_step_6_fails_when_signature_tampered():
+    """Flip a byte in the signature; recovery still produces *some*
+    pubkey, just not the right one."""
+    pubkey, sig = _sign_personal("hello")
+    # Flip one nibble in the middle (avoid touching the v byte at the end).
+    flipped = sig[:-30] + ("e" if sig[-30] != "e" else "f") + sig[-29:]
+    r = _receipt(
+        _bundle(),
+        response_content="hello",
+        enclave_pubkey=pubkey,
+        enclave_signature=flipped,
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_step_6_enclave_signature(r)
+    assert exc.value.step == 6
+
+
+def test_step_6_wraps_malformed_signature_as_step_6_error():
+    """A signature that's the wrong byte-length raises ValueError inside
+    the recovery helper; the verifier must wrap it as a Step 6 failure
+    so the spec-step attribution stays consistent."""
+    r = _receipt(
+        _bundle(),
+        response_content="hello",
+        enclave_signature="0x" + "ab" * 30,  # 30 bytes, not 65
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_step_6_enclave_signature(r)
+    assert exc.value.step == 6
+    assert "could not be recovered" in exc.value.reason
+
+
+# ---------------- verify_receipt orchestrator ----------------
 
 
 def test_verify_receipt_runs_full_chain_when_report_provided():

@@ -7,19 +7,32 @@ caller passes `--report` with the report bytes on disk for now. When 0G
 Storage integration lands, Step 4 will run from `attestation_report_hash`
 without an explicit flag.
 
-Other subcommands (`publish-evaluator`, `evaluate`) land alongside the
-remaining Step 4 wiring and the jig adapter.
+The `publish-evaluator` subcommand uploads a bundle to 0G Storage via the
+local zg-bridge so verifiers can fetch it by `evaluator_id` (the bundle's
+content hash). The bundle bytes that get uploaded are the canonical
+encoding produced by `EvaluatorBundle.canonical_bytes()` — uploading the
+on-disk file directly would break Step 2 verification if the source file
+is not byte-identical to canonical form.
+
+The `evaluate` subcommand lands with the jig adapter.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-from eerful.errors import VerificationError
+from eerful.canonical import Bytes32Hex
+from eerful.errors import StorageError, TrustViolation, VerificationError
+from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.verify import VerificationResult, verify_receipt
+from eerful.zg.storage import BridgeStorageClient, StorageClient
+
+
+_DEFAULT_BRIDGE_URL = "http://127.0.0.1:7878"
 
 
 def _category_blurb(category: str) -> str:
@@ -111,6 +124,96 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _publish_evaluator(
+    bundle_bytes: bytes,
+    storage: StorageClient,
+) -> tuple[Bytes32Hex, EvaluatorBundle]:
+    """Validate and upload a bundle. Returns (storage-side content hash, bundle).
+
+    The upload sends the bundle's canonical encoding (sort-keys etc),
+    not the on-disk bytes verbatim. A bundle file authored by hand may
+    have whitespace / key-order differences from canonical form; verifiers
+    re-derive `evaluator_id` from canonical bytes during Step 2, so the
+    publisher must upload canonical bytes for fetched-bundle ↔
+    receipt.evaluator_id round-trips to match.
+
+    The caller's defense-in-depth check: storage's returned hash MUST
+    equal `bundle.evaluator_id()`. A mismatch means the storage backend
+    served back different bytes than what was sent (or our canonical
+    encoder disagreed with itself between calls — the test suite catches
+    that elsewhere). Surfaces as a TrustViolation in either case.
+    """
+    bundle = EvaluatorBundle.model_validate_json(bundle_bytes)
+    canonical = bundle.canonical_bytes()
+    expected_id = bundle.evaluator_id()
+    uploaded = storage.upload_blob(canonical)
+    if uploaded != expected_id:
+        raise TrustViolation(
+            f"upload returned {uploaded} but bundle.evaluator_id()={expected_id} "
+            "(canonical encoder drift or storage byte tampering)"
+        )
+    return uploaded, bundle
+
+
+def _cmd_publish_evaluator(args: argparse.Namespace) -> int:
+    bundle_path: Path = args.bundle
+    try:
+        bundle_bytes = bundle_path.read_bytes()
+    except OSError as e:
+        print(f"failed to load bundle at {bundle_path}: {e}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        try:
+            bundle = EvaluatorBundle.model_validate_json(bundle_bytes)
+        except Exception as e:
+            print(f"bundle does not validate: {e}", file=sys.stderr)
+            return 1
+        _print_publish_summary(bundle.evaluator_id(), bundle, uploaded=False)
+        return 0
+
+    bridge_url = args.bridge_url
+    try:
+        with BridgeStorageClient(bridge_url=bridge_url) as storage:
+            evaluator_id, bundle = _publish_evaluator(bundle_bytes, storage)
+    except (StorageError, TrustViolation) as e:
+        print(f"publish failed: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # Bundle validation, JSON parse, etc — caller-fixable input issues.
+        print(f"bundle does not validate: {e}", file=sys.stderr)
+        return 1
+
+    _print_publish_summary(evaluator_id, bundle, uploaded=True)
+    return 0
+
+
+def _print_publish_summary(
+    evaluator_id: Bytes32Hex,
+    bundle: EvaluatorBundle,
+    *,
+    uploaded: bool,
+) -> None:
+    if uploaded:
+        print("OK — evaluator bundle uploaded to 0G Storage.")
+    else:
+        print("OK — bundle validates (dry run; nothing uploaded).")
+    print(f"  evaluator_id: {evaluator_id}")
+    print(f"  version: {bundle.version}")
+    print(f"  model_identifier: {bundle.model_identifier}")
+    allowlist = bundle.accepted_compose_hashes
+    if allowlist:
+        print(
+            f"  accepted_compose_hashes: {len(allowlist)} entries "
+            "(verifiers will enforce §6.5 compose-hash gating)."
+        )
+    else:
+        print(
+            "  accepted_compose_hashes: not set "
+            "(no compose-hash gating; see §8 for what verifiers can prove)."
+        )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eerful")
     sub = p.add_subparsers(dest="command", required=True)
@@ -130,6 +233,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to attestation report JSON (optional; enables Step 5 compose-hash gating)",
     )
     v.set_defaults(func=_cmd_verify)
+
+    pub = sub.add_parser(
+        "publish-evaluator",
+        help="upload an evaluator bundle to 0G Storage via the local zg-bridge",
+    )
+    pub.add_argument(
+        "--bundle",
+        type=Path,
+        required=True,
+        help="path to evaluator bundle JSON (any valid encoding; canonical bytes are uploaded)",
+    )
+    pub.add_argument(
+        "--bridge-url",
+        type=str,
+        default=os.environ.get("EERFUL_0G_BRIDGE_URL", _DEFAULT_BRIDGE_URL),
+        help=(
+            "URL of the zg-bridge (default: $EERFUL_0G_BRIDGE_URL or "
+            f"{_DEFAULT_BRIDGE_URL}; must be loopback unless the bridge "
+            "operator opts in)"
+        ),
+    )
+    pub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate the bundle and print evaluator_id without uploading",
+    )
+    pub.set_defaults(func=_cmd_publish_evaluator)
 
     return p
 
