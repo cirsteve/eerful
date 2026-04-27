@@ -125,6 +125,17 @@ class ComputeClient:
         self._raise_for_status(r, "GET /healthz")
         return r.json()  # type: ignore[no-any-return]
 
+    def add_ledger(self, amount_0g: float) -> dict[str, Any]:
+        """Create the ledger sub-account if absent (addLedger) or top it up
+        (depositFund). Required once before any provider can be acknowledged
+        or paid. Broker's MIN_LOCKED_BALANCE = 1 0G."""
+        r = self._http.post(
+            f"{self._bridge_url}/admin/add-ledger",
+            json={"amount_0g": amount_0g},
+        )
+        self._raise_for_status(r, "POST /admin/add-ledger")
+        return r.json()  # type: ignore[no-any-return]
+
     def acknowledge(self, provider_address: Address) -> dict[str, Any]:
         r = self._http.post(
             f"{self._bridge_url}/admin/acknowledge",

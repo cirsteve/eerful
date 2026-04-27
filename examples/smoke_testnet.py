@@ -65,7 +65,15 @@ def main() -> int:
         h = client.healthz()
         print(f"  bridge wallet={h['wallet']} chain={h['chain_id']}")
 
-        # ---- Step 1: acknowledge (idempotent)
+        # ---- Step 1a: ensure ledger sub-account exists / top up
+        ledger_amount = float(os.environ.get("EERFUL_0G_LEDGER_DEPOSIT", "0.4"))
+        ledger = client.add_ledger(ledger_amount)
+        print(
+            f"  ledger: created={ledger['created']} "
+            f"balance={ledger['total_balance_0g']:.4f} 0G"
+        )
+
+        # ---- Step 1b: acknowledge (idempotent)
         ack = client.acknowledge(provider_address)
         print(
             f"  acknowledge: tee_signer={ack['tee_signer_address']} "

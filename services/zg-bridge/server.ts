@@ -79,6 +79,47 @@ app.get('/healthz', async (_req: Request, res: Response) => {
   }
 });
 
+// ---------------- /admin/add-ledger ----------------
+//
+// Creates the ledger sub-account if absent (addLedger), or tops it up
+// (depositFund) if present. Required ONCE before any provider can be
+// acknowledged or paid. Body: { amount_0g: number } in 0G units, e.g. 0.5.
+// The broker's MIN_LOCKED_BALANCE for inference is 1 0G; deposits below
+// that won't satisfy provider lock requirements at request time.
+
+app.post('/admin/add-ledger', async (req: Request, res: Response) => {
+  const { amount_0g } = req.body ?? {};
+  if (typeof amount_0g !== 'number' || amount_0g <= 0) {
+    res.status(400).json({ error: "missing or invalid 'amount_0g'" });
+    return;
+  }
+  try {
+    const b = await getBroker();
+    let existed = true;
+    try {
+      await b.ledger.getLedger();
+    } catch {
+      existed = false;
+    }
+    if (existed) {
+      await b.ledger.depositFund(amount_0g);
+    } else {
+      await b.ledger.addLedger(amount_0g);
+    }
+    const ledger = await b.ledger.getLedger();
+    res.json({
+      created: !existed,
+      total_balance_neuron: ledger.totalBalance.toString(),
+      available_balance_neuron: ledger.availableBalance.toString(),
+      total_balance_0g: Number(ledger.totalBalance) / 1e18,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
 // ---------------- /admin/acknowledge ----------------
 //
 // One-time per (wallet, provider). Idempotent — the SDK no-ops if the
