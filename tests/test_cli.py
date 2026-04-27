@@ -551,6 +551,42 @@ def test_verify_uses_report_override_with_bundle_from_storage(
     assert "compose-hash gating" in out
 
 
+def test_verify_no_bridge_path_also_hash_checks_report_override(
+    tmp_path: Path,
+) -> None:
+    """The fully-offline path (--bundle + --report, no bridge) must also
+    enforce Step 4's content check on the report file. Otherwise
+    `eerful verify --bundle X --report Y` could silently accept a
+    mismatched report. Regression: prior to the round-3 fix, the
+    no-bridge branch in `_cmd_verify` called `verify_receipt` directly
+    without the check."""
+    receipt, bundle_canonical, _ = _make_receipt_and_artifacts()
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(bundle_canonical)
+
+    # Different report bytes than the receipt commits to.
+    other_report, _ = _build_report_bytes("model=other")
+    other_path = tmp_path / "wrong-report.json"
+    other_path.write_bytes(other_report)
+
+    rc, _, err = _run_main(
+        [
+            "verify",
+            str(receipt_path),
+            "--bundle",
+            str(bundle_path),
+            "--report",
+            str(other_path),
+        ]
+    )
+    assert rc == 1
+    assert "verification step 4" in err
+    assert "content hash mismatch" in err
+
+
 def test_verify_report_override_mismatch_fails_at_step_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

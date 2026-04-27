@@ -219,6 +219,31 @@ def test_salt_store_rejects_invalid_receipt_id_on_put(tmp_path: Path) -> None:
         store.put("0xnothex", b"\x01" * 32)
 
 
+def test_salt_store_rejects_invalid_receipt_id_on_get(tmp_path: Path) -> None:
+    """get() should mirror put()'s validation: a malformed receipt_id
+    raises a clear `ValueError` mentioning the field, not a generic
+    `not a hex string` from `to_lower_hex` or a confusing `KeyError`
+    on a non-canonical-but-valid-hex query."""
+    store = SaltStore(tmp_path / "salts.json")
+    with pytest.raises(ValueError, match="receipt_id"):
+        store.get("0xnothex")
+    with pytest.raises(ValueError, match="receipt_id"):
+        store.get("0xab")  # valid hex, wrong length
+
+
+def test_salt_store_get_with_non_string_receipt_id_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    """A caller passing the wrong type entirely (None, int) should get
+    a ValueError with the receipt_id-specific message, not a TypeError
+    from `to_lower_hex`."""
+    store = SaltStore(tmp_path / "salts.json")
+    with pytest.raises(ValueError, match="receipt_id"):
+        store.get(None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="receipt_id"):
+        store.get(12345)  # type: ignore[arg-type]
+
+
 def test_salt_store_file_is_human_readable_json(tmp_path: Path) -> None:
     """Producers may inspect the salt store by hand. Confirm the file
     is sorted-key indented JSON, not pickled or otherwise opaque."""

@@ -149,12 +149,24 @@ class SaltStore:
     def get(self, receipt_id: Bytes32Hex) -> tuple[bytes, str | None]:
         """Return `(salt_bytes, input_path)` for `receipt_id`.
 
-        Raises `KeyError` if no entry exists for the given receipt_id.
-        Callers reconstructing a commitment after the fact rely on this
-        to surface "salt was never stored" loudly rather than silently
-        producing a wrong commitment.
+        Raises `KeyError` if no entry exists for the given receipt_id,
+        or `ValueError` if `receipt_id` itself is not a valid
+        Bytes32Hex string. Callers reconstructing a commitment after
+        the fact rely on the loud-failure path: silently returning
+        garbage bytes (e.g. via a generic `to_lower_hex` error or a
+        confusing `KeyError` on a non-canonical query) would let a
+        producer build a wrong commitment without noticing.
         """
-        canonical_id = to_lower_hex(receipt_id)
+        try:
+            canonical_id = to_lower_hex(receipt_id)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"receipt_id must be 0x-prefixed 64-char lowercase hex, got {receipt_id!r}"
+            ) from e
+        if not is_bytes32_hex(canonical_id):
+            raise ValueError(
+                f"receipt_id must be 0x-prefixed 64-char lowercase hex, got {receipt_id!r}"
+            )
         data = self._read_all()
         entry = data.get(canonical_id)
         if entry is None:

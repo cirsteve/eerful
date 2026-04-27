@@ -181,6 +181,16 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         except OSError as e:
             print(f"failed to load report at {report_path}: {e}", file=sys.stderr)
             return 2
+        # Step 4's content check applies to file-supplied bytes too —
+        # otherwise --report becomes a way to bypass report binding
+        # entirely. Doing it here at read time means BOTH the
+        # bridge-fetched-bundle-but-file-report path and the all-files
+        # no-bridge path are covered by the same check.
+        try:
+            _check_report_override_hash(receipt, report_from_file)
+        except VerificationError as e:
+            print(f"FAIL — verification step {e.step}: {e.reason}", file=sys.stderr)
+            return 1
 
     need_bridge = bundle_from_file is None or (
         report_from_file is None and not skip_step_5
@@ -207,7 +217,9 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                 )
         else:
             # Both artifacts (or bundle + skip-step-5) from local files —
-            # no bridge needed. Run the pure pipeline directly.
+            # no bridge needed. Run the pure pipeline directly. Report
+            # bytes were already hash-checked above, bundle bytes get
+            # the Step 2 hash check inside `verify_receipt`.
             assert bundle_from_file is not None  # narrowed by need_bridge
             result = verify_receipt(
                 receipt,
@@ -263,24 +275,38 @@ def _verify_with_overrides(
     if skip_step_5:
         report_bytes: bytes | None = None
     elif report_override is not None:
-        # File-supplied report skipped Step 4 by definition (no storage
-        # fetch). Re-hash and check against the receipt's claim before
-        # handing off to Step 5 — otherwise --report turns into a way
-        # to bypass the report-binding check entirely.
-        actual = "0x" + hashlib.sha256(report_override).hexdigest()
-        if actual != receipt.attestation_report_hash:
-            raise VerificationError(
-                step=4,
-                reason=(
-                    f"attestation report content hash mismatch: receipt names "
-                    f"{receipt.attestation_report_hash}, --report file hashes "
-                    f"to {actual}"
-                ),
-            )
+        # File-supplied report bytes are hash-checked at read time in
+        # `_cmd_verify` (so the no-bridge path is covered too), so we
+        # can pass them through here.
         report_bytes = report_override
     else:
         report_bytes = verify_step_4_attestation_report(receipt, storage)
     return verify_receipt(receipt, bundle_bytes, report_bytes)
+
+
+def _check_report_override_hash(
+    receipt: EnhancedReceipt, report_bytes: bytes
+) -> None:
+    """Raise VerificationError(step=4) if file-supplied report bytes
+    don't hash to receipt.attestation_report_hash.
+
+    Step 4 is "fetch report from storage and confirm content hash."
+    A file-supplied report skipped the fetch but the content check
+    still applies — without it `--report` would become a way to bypass
+    report binding entirely (Step 5 might parse and pass the allowlist
+    check on the wrong report). Centralized here so every CLI code path
+    that loads a report from disk goes through the same check.
+    """
+    actual = "0x" + hashlib.sha256(report_bytes).hexdigest()
+    if actual != receipt.attestation_report_hash:
+        raise VerificationError(
+            step=4,
+            reason=(
+                f"attestation report content hash mismatch: receipt names "
+                f"{receipt.attestation_report_hash}, --report file hashes "
+                f"to {actual}"
+            ),
+        )
 
 
 def _publish_evaluator(
