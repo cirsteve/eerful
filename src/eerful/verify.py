@@ -152,19 +152,25 @@ def verify_step_4_attestation_report(
     receipt: EnhancedReceipt,
     storage: StorageClient,
 ) -> bytes:
-    """Step 4: fetch the attestation report from storage by content hash.
+    """Step 4: fetch the attestation report from storage and confirm hash.
 
-    Returns the report bytes for Step 5 to parse. Storage adapters
-    already content-check the bytes they return (see
-    `BridgeStorageClient.download_blob` and `MockStorageClient`); we
-    re-wrap their exceptions as `VerificationError(step=4)` so the
-    spec-step attribution stays consistent. A `TrustViolation` from the
-    adapter — bytes returned that don't hash to the requested hash — is
-    also a Step 4 failure: it's the same condition spec §7.1 Step 4
-    fails on (storage returned the wrong report).
+    Returns the report bytes for Step 5 to parse. Two layers of
+    integrity check:
+
+    1. Storage adapters (`BridgeStorageClient`, `MockStorageClient`)
+       already content-check the bytes they return and raise
+       `TrustViolation` on mismatch. We re-wrap that as
+       `VerificationError(step=4)` for consistent spec-step attribution.
+    2. Step 4 *also* re-hashes the bytes here. Defense in depth: any
+       `StorageClient` Protocol implementation written outside this
+       package satisfies the type without necessarily satisfying the
+       integrity contract, and the spec's Step 4 ("Compute the report's
+       content hash; confirm it matches") puts that responsibility on
+       the verifier, not the storage adapter. The ~microsecond hash is
+       cheap insurance against an adapter that forgets.
     """
     try:
-        return storage.download_blob(receipt.attestation_report_hash)
+        data = storage.download_blob(receipt.attestation_report_hash)
     except TrustViolation as e:
         raise VerificationError(
             step=4,
@@ -175,6 +181,17 @@ def verify_step_4_attestation_report(
             step=4,
             reason=f"attestation report not retrievable: {e}",
         ) from e
+    actual = "0x" + hashlib.sha256(data).hexdigest()
+    if actual != receipt.attestation_report_hash:
+        raise VerificationError(
+            step=4,
+            reason=(
+                f"attestation report content hash mismatch: receipt names "
+                f"{receipt.attestation_report_hash}, storage returned bytes "
+                f"hashing to {actual}"
+            ),
+        )
+    return data
 
 
 def fetch_evaluator_bundle_bytes(

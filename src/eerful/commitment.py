@@ -25,7 +25,9 @@ the input actually was).
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import tempfile
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -115,10 +117,17 @@ class SaltStore:
     ) -> None:
         """Persist `salt` (and optional `input_path`) under `receipt_id`.
 
-        Overwrites any prior entry under the same receipt_id silently —
-        receipt_ids are sha256 outputs so collisions imply a tampered
-        chain, not a normal overwrite case. If you're seeing one,
-        something else is wrong; we don't guard the overwrite.
+        Overwrites any prior entry under the same receipt_id silently.
+        In normal use this is a producer rerun (same receipt_id, fresh
+        salt for a re-attempted upload) rather than a meaningful
+        collision — receipt_ids are sha256 outputs so a true collision
+        is astronomically unlikely. We don't guard the overwrite.
+
+        Writes are atomic: the new JSON is written to a sibling tempfile
+        and `os.replace`d into position. A crash mid-write leaves the
+        prior file intact rather than truncating it to a partial blob —
+        the producer's reveal capability is the worst thing to lose
+        here, since it's unrecoverable once gone (see module docstring).
         """
         try:
             canonical_id = to_lower_hex(receipt_id)
@@ -175,13 +184,40 @@ class SaltStore:
         return raw
 
     def _write_all(self, data: dict[str, dict[str, Any]]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: serialize to a sibling tempfile, fsync, then
+        # `os.replace` over the destination. Crash mid-`write_text`
+        # would leave a partial JSON blob and `_read_all` would refuse
+        # the file on the next call — losing every persisted salt, not
+        # just the in-flight one. The producer's reveal capability is
+        # the worst thing to lose since it's unrecoverable.
+        #
         # sort_keys keeps the file diffable across put() calls; an
         # accidentally-checked-in salt file (gitignored, but mistakes
         # happen) at least produces a clean diff for incident response.
-        self._path.write_text(
-            json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(data, sort_keys=True, indent=2) + "\n"
+        # delete=False so we own the rename; suffix marks orphans from a
+        # crash between mkstemp and replace as obviously transient.
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=self._path.name + ".",
+            suffix=".tmp",
+            dir=str(self._path.parent),
         )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._path)
+        except BaseException:
+            # Clean up the orphan tempfile on any failure (including
+            # KeyboardInterrupt) so a Ctrl-C between mkstemp and replace
+            # doesn't litter the directory.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 __all__ = [

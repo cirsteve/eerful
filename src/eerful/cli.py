@@ -23,6 +23,7 @@ The `evaluate` subcommand lands with the jig adapter.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import os
 import sys
@@ -105,13 +106,22 @@ def _category_blurb(category: str) -> str:
     return "§8 category — unknown (compose did not match A/B/C heuristics)."
 
 
-def _print_verification_result(result: VerificationResult) -> None:
+def _print_verification_result(
+    result: VerificationResult, *, skip_step_5: bool = False
+) -> None:
     print("OK — Steps 1–3 passed.")
     print(f"  evaluator: {result.bundle.version} ({result.bundle.model_identifier})")
 
     step5 = result.step5
     if step5 is None:
-        print("  Step 5: not run (no --report supplied; pass --report to enforce §6.5).")
+        if skip_step_5:
+            print("  Step 5: skipped (--skip-step-5).")
+        else:
+            # Library callers can pass `report_bytes=None` directly to
+            # `verify_receipt`; the CLI never lands here without
+            # --skip-step-5 (storage fetch is the default). Keep the
+            # generic message for the library-call shape.
+            print("  Step 5: not run (no attestation report supplied).")
         print(
             "  caveat: without Step 5, model-environment binding is unverified — "
             "the receipt is integrity-checked but the §8 category is unknown."
@@ -208,11 +218,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print(f"FAIL — verification step {e.step}: {e.reason}", file=sys.stderr)
         return 1
 
-    _print_verification_result(result)
-    if skip_step_5:
-        print(
-            "  note: --skip-step-5 set; Step 5 (compose-hash gate) was not run."
-        )
+    _print_verification_result(result, skip_step_5=skip_step_5)
     return 0
 
 
@@ -230,6 +236,14 @@ def _verify_with_overrides(
       - bundle_override given: use those bytes; else fetch from storage.
       - report_override given: use those bytes; else fetch from storage,
         unless `skip_step_5` is set, in which case Step 5 is skipped.
+
+    File-supplied bytes get the same Step-2/Step-4 content-hash check
+    that the storage path does — a producer mistake (or a malicious
+    file) that hands us a report whose hash doesn't match the receipt's
+    `attestation_report_hash` must surface as `VerificationError(step=4)`,
+    not as a silent pass through Step 5. Bundle override is similarly
+    checked at Step 2 (`verify_step_2_evaluator_bundle` does the hash +
+    parse on whatever bytes we hand it).
 
     When neither override is set, this collapses to
     `verify_receipt_with_storage` exactly. The override path lets a
@@ -249,6 +263,20 @@ def _verify_with_overrides(
     if skip_step_5:
         report_bytes: bytes | None = None
     elif report_override is not None:
+        # File-supplied report skipped Step 4 by definition (no storage
+        # fetch). Re-hash and check against the receipt's claim before
+        # handing off to Step 5 — otherwise --report turns into a way
+        # to bypass the report-binding check entirely.
+        actual = "0x" + hashlib.sha256(report_override).hexdigest()
+        if actual != receipt.attestation_report_hash:
+            raise VerificationError(
+                step=4,
+                reason=(
+                    f"attestation report content hash mismatch: receipt names "
+                    f"{receipt.attestation_report_hash}, --report file hashes "
+                    f"to {actual}"
+                ),
+            )
         report_bytes = report_override
     else:
         report_bytes = verify_step_4_attestation_report(receipt, storage)

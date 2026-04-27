@@ -451,10 +451,6 @@ def test_verify_receipt_short_circuits_at_step_2_before_step_5():
 # ---------------- Step 4 + storage-aware orchestrator ----------------
 
 
-def _report_hash(report_bytes: bytes) -> str:
-    return "0x" + hashlib.sha256(report_bytes).hexdigest()
-
-
 def test_step_4_returns_report_bytes_when_storage_has_them():
     """Step 4: storage holds bytes whose sha256 equals
     receipt.attestation_report_hash → fetch returns those bytes."""
@@ -475,6 +471,31 @@ def test_step_4_fails_when_storage_has_no_entry():
         verify_step_4_attestation_report(r, storage)
     assert exc.value.step == 4
     assert "not retrievable" in exc.value.reason
+
+
+def test_step_4_locally_rehashes_storage_bytes_defense_in_depth():
+    """Defense in depth: if a `StorageClient` impl forgoes its own
+    content check (legal under the Protocol — it's not a normative
+    obligation), Step 4 still catches a mismatch by re-hashing locally.
+    Spec §7.1 puts the hash check on the verifier."""
+
+    class _UncheckedStorage:
+        """A StorageClient that returns bytes hashing to a different
+        value than the one requested. Our adapters check this, but the
+        Protocol doesn't enforce it."""
+
+        def upload_blob(self, data: bytes) -> str:
+            raise NotImplementedError
+
+        def download_blob(self, content_hash: str) -> bytes:
+            return b"this hashes to something else entirely"
+
+    r = _receipt(_bundle(), attestation_report_hash="0x" + "e" * 64)
+    with pytest.raises(VerificationError) as exc:
+        verify_step_4_attestation_report(r, _UncheckedStorage())
+    assert exc.value.step == 4
+    assert "content hash mismatch" in exc.value.reason
+    assert "hashing to" in exc.value.reason
 
 
 def test_step_4_fails_when_storage_returns_wrong_bytes_as_trust_violation():

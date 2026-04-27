@@ -496,8 +496,9 @@ def test_verify_skip_step_5_does_not_fetch_report(
 
     rc, out, err = _run_main(["verify", str(receipt_path), "--skip-step-5"])
     assert rc == 0, err
-    assert "Step 5" in out  # appears in the "not run" message
-    assert "--skip-step-5 set" in out
+    # Single explanatory line, not a contradictory pair.
+    assert "Step 5: skipped (--skip-step-5)" in out
+    assert "Step 5: not run" not in out
 
 
 def test_verify_falls_back_to_bundle_override_without_bridge(tmp_path: Path) -> None:
@@ -548,6 +549,36 @@ def test_verify_uses_report_override_with_bundle_from_storage(
     )
     assert rc == 0, err
     assert "compose-hash gating" in out
+
+
+def test_verify_report_override_mismatch_fails_at_step_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `--report` file whose sha256 doesn't match
+    `receipt.attestation_report_hash` must fail at Step 4 — otherwise
+    the override turns into a way to bypass report binding entirely
+    (Step 5 might still parse and pass the allowlist check on the
+    wrong report)."""
+    receipt, bundle_canonical, _ = _make_receipt_and_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle_canonical)
+
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+    # Different report bytes than the one the receipt commits to.
+    other_report, _ = _build_report_bytes("model=other")
+    other_path = tmp_path / "wrong-report.json"
+    other_path.write_bytes(other_report)
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, _, err = _run_main(
+        ["verify", str(receipt_path), "--report", str(other_path)]
+    )
+    assert rc == 1
+    assert "verification step 4" in err
+    assert "content hash mismatch" in err
+    assert "--report file hashes" in err
 
 
 def test_verify_report_and_skip_step_5_are_mutually_exclusive(tmp_path: Path) -> None:

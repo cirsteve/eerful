@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -239,6 +240,54 @@ def test_salt_store_corrupt_file_raises_value_error(tmp_path: Path) -> None:
     path.write_text("not valid json")
     with pytest.raises(ValueError, match="not valid JSON"):
         SaltStore(path).get(_receipt_id("aa"))
+
+
+def test_salt_store_write_is_atomic_prior_file_survives_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash mid-write must NOT corrupt the prior file. Simulate by
+    monkeypatching `os.replace` to raise after the new bytes are
+    fsynced — the previous SaltStore contents should still be readable
+    and the orphan tempfile should be cleaned up.
+
+    Lost-salt is unrecoverable per the module docstring; truncating the
+    salt file on a SIGKILL would destroy every persisted reveal in one
+    shot, which is exactly the failure mode atomicity is for."""
+    path = tmp_path / "salts.json"
+    store = SaltStore(path)
+    store.put(_receipt_id("aa"), b"\x01" * 32, "v1.md")
+
+    import os as _os
+
+    real_replace = _os.replace
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise OSError("simulated crash mid-replace")
+
+    monkeypatch.setattr("eerful.commitment.os.replace", _boom)
+    with pytest.raises(OSError, match="simulated crash"):
+        store.put(_receipt_id("bb"), b"\x02" * 32, "v2.md")
+    monkeypatch.setattr("eerful.commitment.os.replace", real_replace)
+
+    # Prior entry intact: the put-bb attempt did not corrupt put-aa.
+    salt, ip = SaltStore(path).get(_receipt_id("aa"))
+    assert salt == b"\x01" * 32
+    assert ip == "v1.md"
+
+    # Tempfile was cleaned up on the failure — no `.salts.json.*.tmp`
+    # orphans linger (they would gradually fill the directory under
+    # repeated crashes).
+    leftovers = list(tmp_path.glob(".*.tmp")) + list(tmp_path.glob("*.tmp"))
+    assert leftovers == [], f"orphan tempfiles not cleaned: {leftovers}"
+
+
+def test_salt_store_normal_write_leaves_no_tempfile(tmp_path: Path) -> None:
+    """Successful write leaves only the destination — no `.tmp` siblings."""
+    path = tmp_path / "salts.json"
+    SaltStore(path).put(_receipt_id("aa"), b"\x01" * 32)
+    SaltStore(path).put(_receipt_id("bb"), b"\x02" * 32)
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert files == ["salts.json"], f"unexpected files: {files}"
 
 
 def test_salt_store_top_level_array_rejected(tmp_path: Path) -> None:
