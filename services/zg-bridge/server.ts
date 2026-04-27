@@ -24,6 +24,7 @@ import {
   createZGComputeNetworkBroker,
   ZGComputeNetworkBroker,
 } from '@0glabs/0g-serving-broker';
+import { Indexer, MemData } from '@0gfoundation/0g-ts-sdk';
 
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
@@ -37,6 +38,9 @@ if (!PRIVATE_KEY || PRIVATE_KEY === '0x_replace_with_real_key') {
 }
 
 const RPC_URL = process.env.EERFUL_0G_RPC ?? 'https://evmrpc-testnet.0g.ai';
+const INDEXER_URL =
+  process.env.EERFUL_0G_GALILEO_INDEXER ??
+  'https://indexer-storage-testnet-turbo.0g.ai';
 const PORT = Number(process.env.EERFUL_0G_BRIDGE_PORT ?? '7878');
 const BIND_HOST = process.env.EERFUL_0G_BRIDGE_BIND_HOST ?? '127.0.0.1';
 
@@ -75,6 +79,22 @@ if (!isLoopbackBindHost(BIND_HOST) && !ALLOW_NON_LOOPBACK_BIND) {
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+const indexer = new Indexer(INDEXER_URL);
+
+// sha256(content) -> 0G storage rootHash + tx metadata. The receipt format
+// is content-addressed by sha256 (evaluator_id, attestation_report_hash);
+// 0G's indexer keys by Merkle root. This index is the bridge between the
+// two. Resets on restart — bytes persist on 0G but the mapping doesn't, so
+// a publisher who restarts the bridge must re-upload to repopulate
+// (idempotent: getOrUpload short-circuits on cache hit, but the cache is
+// what's gone, so the upload will go through and rebuild the entry).
+type UploadIndexEntry = {
+  zgRoot: string;
+  txHash: string;
+  txSeq: number;
+  size: number;
+};
+const uploadIndex = new Map<string, UploadIndexEntry>();
 
 let broker: ZGComputeNetworkBroker | null = null;
 let brokerInit: Promise<ZGComputeNetworkBroker> | null = null;
@@ -381,6 +401,143 @@ app.get('/compute/attestation/:provider_address', async (req: Request, res: Resp
   } catch (err) {
     res.status(500).json({
       error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ---------------- storage helpers ----------------
+
+// Idempotent upload. If `contentHash` is already in `uploadIndex`,
+// returns the cached entry without re-paying. Otherwise uploads via the
+// SDK and caches the result. Same shape as lockstep's storage-ts.
+async function getOrUpload(
+  bytes: Buffer,
+  contentHash: string,
+): Promise<[UploadIndexEntry, null] | [null, Error]> {
+  const cached = uploadIndex.get(contentHash);
+  if (cached) {
+    return [cached, null];
+  }
+  const [tx, err] = await indexer.upload(new MemData(bytes), RPC_URL, wallet);
+  if (err !== null || !('rootHash' in tx)) {
+    return [null, err ?? new Error('unknown SDK upload failure')];
+  }
+  const entry: UploadIndexEntry = {
+    zgRoot: tx.rootHash,
+    txHash: tx.txHash,
+    txSeq: tx.txSeq,
+    size: bytes.length,
+  };
+  uploadIndex.set(contentHash, entry);
+  return [entry, null];
+}
+
+const CONTENT_HASH_RE = /^0x[0-9a-f]{64}$/;
+
+// ---------------- /storage/upload-blob ----------------
+//
+// Body: raw bytes (Content-Type: application/octet-stream).
+// Returns: { content_hash, storage_uri, root_hash, tx_hash, tx_seq, size_bytes }
+// content_hash is sha256 of the body and is what the Python adapter
+// passes back to /storage/download-blob.
+//
+// Idempotent: a retry on the same bytes hits the cache and does not re-pay.
+
+app.post(
+  '/storage/upload-blob',
+  express.raw({ type: '*/*', limit: '8mb' }),
+  async (req: Request, res: Response) => {
+    try {
+      const bytes = req.body as Buffer;
+      if (!Buffer.isBuffer(bytes) || bytes.length === 0) {
+        res.status(400).json({
+          error: 'empty_body',
+          detail: 'POST body required (Content-Type: application/octet-stream)',
+        });
+        return;
+      }
+      const contentHash = sha256Hex(bytes);
+      const [entry, err] = await getOrUpload(bytes, contentHash);
+      if (err !== null) {
+        res.status(502).json({
+          error: 'upload_failed',
+          detail: err.message ?? String(err),
+        });
+        return;
+      }
+      res.json({
+        content_hash: contentHash,
+        storage_uri: `zg://${entry.zgRoot}`,
+        root_hash: entry.zgRoot,
+        tx_hash: entry.txHash,
+        tx_seq: entry.txSeq,
+        size_bytes: entry.size,
+      });
+    } catch (e: unknown) {
+      res.status(500).json({
+        error: 'internal',
+        detail: e instanceof Error ? e.message : String(e),
+      });
+    }
+  },
+);
+
+// ---------------- /storage/download-blob ----------------
+//
+// Query: ?content_hash=0x<sha256>
+// Returns: raw bytes + X-Content-Hash header.
+//
+// 404 when the bridge has no upload record for the content hash (the
+// bytes may exist on 0G under their rootHash, but this process did not
+// upload them — see uploadIndex docstring). 422 if the downloaded bytes
+// don't re-hash to the requested content_hash (defense-in-depth against
+// indexer/SDK swaps).
+
+app.get('/storage/download-blob', async (req: Request, res: Response) => {
+  const contentHash = String(req.query.content_hash ?? '').toLowerCase();
+  if (!CONTENT_HASH_RE.test(contentHash)) {
+    res.status(400).json({
+      error: 'invalid_content_hash',
+      detail: 'content_hash must be 0x-prefixed lowercase 64-hex',
+    });
+    return;
+  }
+  const entry = uploadIndex.get(contentHash);
+  if (!entry) {
+    res.status(404).json({
+      error: 'not_in_index',
+      detail:
+        'content_hash has no upload record on this bridge ' +
+        '(different uploader, or bridge restarted since upload)',
+    });
+    return;
+  }
+  try {
+    const [blob, err] = await indexer.downloadToBlob(entry.zgRoot);
+    if (err !== null) {
+      res.status(502).json({
+        error: 'download_failed',
+        detail: err.message ?? String(err),
+      });
+      return;
+    }
+    const bytes = Buffer.from(await blob.arrayBuffer());
+    const actual = sha256Hex(bytes);
+    if (actual !== contentHash) {
+      res.status(422).json({
+        error: 'content_hash_mismatch',
+        detail: `downloaded bytes sha256 ${actual} != requested ${contentHash}`,
+      });
+      return;
+    }
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('X-Content-Hash', contentHash);
+    res.setHeader('X-Root-Hash', entry.zgRoot);
+    res.send(bytes);
+  } catch (e: unknown) {
+    res.status(500).json({
+      error: 'internal',
+      detail: e instanceof Error ? e.message : String(e),
     });
   }
 });
