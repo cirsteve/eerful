@@ -126,17 +126,21 @@ those modules for the request/response shapes and error contract.
 
 - `POST /storage/upload-blob` (body: raw bytes, `Content-Type:
   application/octet-stream`) → `{content_hash, storage_uri, root_hash,
-  tx_hash, tx_seq, size_bytes}`. `content_hash` is the sha256 the
-  Python adapter passes back to `/download-blob`; `root_hash` is the
-  0G storage Merkle root; `storage_uri` is the convenience
+  tx_hash, tx_seq, size_bytes}`. `content_hash` is the sha256 (receipt
+  field `evaluator_id` / `attestation_report_hash`); `root_hash` is the
+  0G storage Merkle root (receipt field `evaluator_storage_root` /
+  `attestation_storage_root`). Both flow into the receipt; the verifier
+  passes them to `/download-blob`. `storage_uri` is the convenience
   `zg://<root_hash>` form. Idempotent on `content_hash`. Coalesces
   concurrent uploads of identical bytes so two callers don't both pay
   the upload fee.
-- `GET /storage/download-blob?content_hash=0x...` → raw bytes.
-  Looks up `content_hash` in the in-memory `uploadIndex`; returns 404
-  with `error: "not_in_index"` if the bridge never uploaded those bytes
-  (see Limitations below). On hit, fetches by 0G rootHash, re-hashes
-  server-side, and refuses to serve bytes that don't match.
+- `GET /storage/download-blob?content_hash=0x...&root_hash=0x...` → raw
+  bytes. Both query params are required: `root_hash` is the indexer
+  lookup key, `content_hash` is the integrity check (sha256 of the
+  returned bytes must equal it). Cross-instance safe — any bridge can
+  serve any blob the indexer has, no producer-side state required.
+  Returns 422 if the indexer's bytes don't re-hash to the requested
+  `content_hash`; 502 if the indexer can't resolve `root_hash`.
 
 ## Error contract
 
@@ -146,13 +150,12 @@ exception mapping; change it and the storage adapter breaks.
 - 200: success.
 - 400: malformed request (programming bug on the caller's side).
   `BridgeStorageClient` raises `RuntimeError`.
-- 404: lookup miss (e.g., unknown content_hash, no acknowledged
-  provider). `BridgeStorageClient` raises `StorageError`.
 - 422: byzantine evidence — bytes returned don't re-hash to the
   requested content hash. `BridgeStorageClient` raises
   `TrustViolation`. Never retry.
-- 5xx: SDK / indexer / RPC failure. `BridgeStorageClient` raises
-  `StorageError`. Transient.
+- 5xx: SDK / indexer / RPC failure (including 502 when `root_hash`
+  doesn't resolve). `BridgeStorageClient` raises `StorageError`.
+  Transient.
 
 `ComputeClient` is simpler: any non-2xx response from the compute /
 admin endpoints raises `ComputeError(f"{op} failed ({status}): ...")`.
@@ -167,16 +170,13 @@ raw 500.
 
 - Single-tenant. The wallet is shared across all consumers of this
   bridge instance — multi-tenancy needs separate processes.
-- `uploadIndex` (sha256 → 0G rootHash) is in-memory; resets on
-  restart. Bytes persist on 0G under their rootHash, but the bridge
-  has no way to recover the rootHash from a sha256 alone. After
-  restart, downloads of previously-uploaded blobs return 404 with
-  `error: "not_in_index"` until something re-uploads the bytes (which
-  will hit the indexer's existing rootHash and short-circuit at the
-  storage layer, but does re-pay the SDK call). **The same limitation
-  bites cross-instance: a fresh bridge cannot fetch a blob another
-  bridge uploaded.** A fix is planned (see `specs/`); in the meantime,
-  verifiers and producers must share a bridge instance, or the
-  producer must persist the rootHash → contentHash mapping out of band.
+- `uploadIndex` (sha256 → 0G rootHash) is in-memory upload-side
+  dedup only. Resets on restart, which means a restarted bridge will
+  re-pay the SDK upload call the next time the same bytes are
+  uploaded (the indexer short-circuits on the already-stored
+  rootHash, but the bridge re-bills the call). Downloads are
+  unaffected: receipts carry both `content_hash` and `root_hash`, so
+  any bridge can fetch any receipt's bytes without producer-side
+  state.
 - No rate limiting. The loopback-only default is what protects against
   abuse; remote operators are responsible for their own budget caps.

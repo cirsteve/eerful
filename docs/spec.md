@@ -1,5 +1,5 @@
 # Enhanced Evaluation Receipts (EER)
-## Draft Specification (v0.4)
+## Draft Specification (v0.5)
 
 ---
 
@@ -120,36 +120,50 @@ A verifier may operate offline relative to the compute provider — all verifica
 ```
 EnhancedReceipt {
   # Identity (derived; not in canonical signing payload)
-  receipt_id              : Bytes32Hex   # sha256 of canonical_signing_payload(receipt)
+  receipt_id                : Bytes32Hex   # sha256 of canonical_signing_payload(receipt)
+
+  # Spec version (in canonical signing payload, see §10.2)
+  spec_version              : str          # "0.5"; verifiers refuse mismatching versions
 
   # Producer claims (in canonical signing payload)
-  created_at              : datetime     # UTC, validated tz-aware UTC at construction
-  evaluator_id            : Bytes32Hex   # content hash of evaluator bundle on Storage
-  evaluator_version       : str          # human-readable version, denormalized from bundle
-  input_commitment        : Bytes32Hex?  # producer-chosen hash of the private input; nullable
-  previous_receipt_id     : Bytes32Hex?  # links to predecessor receipt; nullable
+  created_at                : datetime     # UTC, validated tz-aware UTC at construction
+  evaluator_id              : Bytes32Hex   # content hash of evaluator bundle on Storage
+  evaluator_storage_root    : Bytes32Hex   # backend retrieval locator for the bundle bytes
+  evaluator_version         : str          # human-readable version, denormalized from bundle
+  input_commitment          : Bytes32Hex?  # producer-chosen hash of the private input; nullable
+  previous_receipt_id       : Bytes32Hex?  # links to predecessor receipt; nullable
 
   # Compute provider attribution (in canonical signing payload)
-  provider_address        : Address      # 0G Compute provider's wallet address
-  chat_id                 : str          # 0G's identifier for the inference call
-  response_content        : str          # the LLM output text
+  provider_address          : Address      # 0G Compute provider's wallet address
+  chat_id                   : str          # 0G's identifier for the inference call
+  response_content          : str          # the LLM output text
 
   # Structured evaluation (in canonical signing payload)
-  output_score_block      : dict?        # parsed from response_content per evaluator schema; nullable
+  output_score_block        : dict?        # parsed from response_content per evaluator schema; nullable
 
   # Attestation report identity (in canonical signing payload, see §6.3)
-  attestation_report_hash : Bytes32Hex   # content hash of provider's attestation report on Storage
+  attestation_report_hash   : Bytes32Hex   # content hash of provider's attestation report on Storage
+  attestation_storage_root  : Bytes32Hex   # backend retrieval locator for the report bytes
 
   # Attestation block (NOT in canonical signing payload — the signature cannot be over itself)
-  enclave_pubkey          : BytesHex     # provider's enclave-born public key, cached (see §6.4)
-  enclave_signature       : BytesHex     # signature over response_content, cached for offline verify (see §6.4)
+  enclave_pubkey            : BytesHex     # provider's enclave-born public key, cached (see §6.4)
+  enclave_signature         : BytesHex     # signature over response_content, cached for offline verify (see §6.4)
 
   # Extensions (in canonical signing payload, see §10.1)
-  extensions              : dict?        # namespaced extension fields; nullable
+  extensions                : dict?        # namespaced extension fields; nullable
 }
 ```
 
 `Bytes32Hex` is a 0x-prefixed 64-character lowercase hex string. `BytesHex` is a 0x-prefixed lowercase hex string of variable length, used for fields whose byte width depends on the underlying cryptographic primitive (e.g. `enclave_pubkey`, `enclave_signature`). `Address` is a 0x-prefixed 40-character hex string (EVM address). Optional fields use `?`. All hex-typed fields are encoded as lowercase per §6.4; the in-memory representation is implementation-defined, but the canonical wire and signing form is hex. Implementations MUST canonicalize to lowercase hex before any byte-comparison or hashing operation.
+
+**Storage-root pairs.** Each storage-resident artifact (the evaluator bundle, the attestation report) is referenced by a *pair* of fields:
+
+- An **integrity hash** (`evaluator_id`, `attestation_report_hash`) — sha256 of the canonical bytes. The verifier MUST re-hash the fetched bytes and confirm equality.
+- A **retrieval locator** (`evaluator_storage_root`, `attestation_storage_root`) — the backend's lookup key. For 0G Storage this is the Merkle rootHash; for an alternate backend it is whatever the backend's content-addressing scheme produces. Both fields are required (§7.1 Steps 2 and 4).
+
+The pair lets any verifier with any storage instance fetch any receipt's bytes without depending on producer-side state (e.g., a sha256→rootHash index that resets on bridge restart). The integrity hash is what binds the receipt to specific bytes; the retrieval locator is what makes the bytes findable. They are not redundant.
+
+`Bytes32Hex` is the v0.5 type for both retrieval locators because 0G Merkle roots, IPFS-with-sha256 CIDs, and Arweave TX IDs all fit. A backend whose locator exceeds 32 bytes would require widening to `BytesHex`; receipts under such a backend would carry that widening as an additional canonical-form change, version-coordinated.
 
 ### 6.2 Field semantics
 
@@ -181,16 +195,20 @@ EnhancedReceipt {
 
 The `enclave_signature` is over `response_content` only — this is what the 0G TeeML primitive natively signs.
 
-The `receipt_id` is over a broader canonical payload that includes the producer's claims, the compute provider's attribution, the attestation report identity, and any extension fields. The canonical signing payload for `receipt_id` derivation is the receipt with the following fields excluded:
+The `receipt_id` is over a broader canonical payload that includes the producer's claims, the compute provider's attribution, the attestation report identity, the storage-root locators, the spec version, and any extension fields. The canonical signing payload for `receipt_id` derivation is the receipt with the following fields excluded:
 
 - `receipt_id` itself (derived from this payload — chicken-and-egg).
 - `enclave_pubkey` and `enclave_signature` (the signature over `response_content`; cached separately and verified by its own algorithm at Step 6).
 
-What remains, encoded as canonical JSON (see §6.4): `created_at`, `evaluator_id`, `evaluator_version`, `input_commitment`, `previous_receipt_id`, `provider_address`, `chat_id`, `response_content`, `output_score_block`, `attestation_report_hash`, and `extensions` (when present; see §10.1).
+What remains, encoded as canonical JSON (see §6.4): `attestation_report_hash`, `attestation_storage_root`, `chat_id`, `created_at`, `evaluator_id`, `evaluator_storage_root`, `evaluator_version`, `extensions` (when present; see §10.1), `input_commitment`, `output_score_block`, `previous_receipt_id`, `provider_address`, `response_content`, and `spec_version`.
 
 `receipt_id = sha256(canonical_json(signing_payload))`.
 
 Including `attestation_report_hash` in the signing payload binds the receipt to a specific attestation report, not just to a pubkey. Without this binding, a producer could substitute a different valid report binding the same pubkey post-construction; the substitution would not change `receipt_id` or invalidate `enclave_signature`, but it would change which Step-5 evidence verifiers fetch. Including the report hash forecloses this same-key/different-report swap.
+
+Including the storage-root pair (`evaluator_storage_root`, `attestation_storage_root`) in the signing payload similarly forecloses post-construction substitution of a different rootHash that points at bytes which happen to hash to the same sha256. A producer who tried to swap in a separately-uploaded duplicate copy at a different rootHash would invalidate `receipt_id`. Note this binding is structural, not adversarial-trustworthy on its own: the producer can still freely choose any (matching) rootHash at construction time. What the binding buys is integrity *over time* — once the receipt is signed, the locator cannot drift without detection.
+
+Including `spec_version` in the signing payload makes a version downgrade detectable: a verifier under v0.5 evaluating a payload that claims v0.4 fails Step 1 (the v0.4 form would not include the new fields, so the digest cannot match). See §10.2 for the asymmetric-break semantics.
 
 ### 6.4 Canonical encoding
 
@@ -205,7 +223,7 @@ For deterministic hashing, fields are encoded as canonical JSON:
 
 Implementations MUST produce byte-identical output across runs and across implementations. This is normative.
 
-EIP-712 typed-data encoding is a candidate for a future version to enable native EVM contract verification. v0.4 uses canonical JSON for implementation simplicity.
+EIP-712 typed-data encoding is a candidate for a future v0.5 follow-on to enable native EVM contract verification, additive over the canonical-JSON form. v0.5 ships canonical JSON for implementation simplicity.
 
 ### 6.5 Evaluator bundle
 
@@ -281,16 +299,16 @@ Compute `expected_receipt_id = sha256(canonical_json(signing_payload(receipt)))`
 *Failure mode:* receipt was constructed with a non-canonical encoding, or has been tampered with, or `receipt_id` was set incorrectly.
 
 **Step 2: Fetch and verify evaluator bundle.**
-Fetch the evaluator bundle from content-addressed storage by `receipt.evaluator_id`. Compute the bundle's content hash; confirm it matches `receipt.evaluator_id`.
-*Failure mode:* bundle is unavailable, or storage returned the wrong bundle, or the producer asserted an `evaluator_id` that doesn't resolve.
+Fetch the evaluator bundle from content-addressed storage by `receipt.evaluator_storage_root` (the backend's retrieval locator). Compute the fetched bundle's sha256; confirm it matches `receipt.evaluator_id` (the integrity hash). Both fields are required: the locator is what the backend keys by, the hash is what binds the receipt to specific bytes.
+*Failure mode:* bundle is unavailable at the named locator, or storage returned bytes that don't hash to `receipt.evaluator_id`.
 
 **Step 3: Validate output schema (if applicable).**
 If the evaluator bundle declares an `output_schema` AND the receipt has an `output_score_block`, validate the score block against the schema.
 *Failure mode:* score block is malformed, missing required fields, or has the wrong types — the producer parsed the response incorrectly or the model produced output that doesn't fit the schema.
 
 **Step 4: Fetch and verify attestation report.**
-Fetch the attestation report from storage by `receipt.attestation_report_hash`. Compute the report's content hash; confirm it matches.
-*Failure mode:* report is unavailable, or storage returned the wrong report.
+Fetch the attestation report from storage by `receipt.attestation_storage_root` (the backend's retrieval locator). Compute the fetched report's sha256; confirm it matches `receipt.attestation_report_hash` (the integrity hash). Symmetric to Step 2's bundle fetch.
+*Failure mode:* report is unavailable at the named locator, or storage returned bytes that don't hash to `receipt.attestation_report_hash`.
 
 **Step 5: Verify the attestation chain.**
 Verify the report's CPU TDX quote against Intel's published root certificates. Verify the report's GPU attestation against NVIDIA's GPU Attestation API. Confirm the report binds a specific public key to the attested hardware. Confirm that bound key equals `receipt.enclave_pubkey`. Extract the report's `compose-hash` measurement (the value extended into RTMR3 by the dstack event log, equal to `sha256(app_compose)`); if the evaluator bundle declares `accepted_compose_hashes`, the report's compose-hash MUST be in that list.
@@ -425,7 +443,7 @@ A producer sets `created_at` to a time in the past.
 
 ### 9.3 Known gaps
 
-These are limitations of EER v0.4 that future versions MAY address:
+These are limitations of EER v0.5 that future versions MAY address:
 
 - **No model-weight attestation.** TEE attests the launched compose, not the loaded weights. The compose-hash allowlist (§6.5, §8.3) lets a publisher gate on a known-good launch configuration but does not bind the weight bytes that the model server actually loads at runtime. This is a vendor-protocol gap, not a receipt-format gap. See §8.
 - **No chain-completeness guarantee.** Receipt chains are producer-asserted. A producer can hide unfavorable receipts. Append-only public logs would address this; v0.4 leaves it to higher layers.
@@ -447,23 +465,31 @@ Implementations MAY add fields to `EnhancedReceipt` for protocol-specific extens
 
 ### 10.2 Versioning
 
-This document specifies EER v0.4. Future versions SHOULD include a `spec_version` field in the receipt. v0.4 receipts implicitly version "0.4" and SHOULD be treated as such by future verifiers.
+This document specifies EER v0.5. Receipts under v0.5 carry an explicit `spec_version` field set to `"0.5"` (§6.1). Verifiers MUST refuse receipts whose `spec_version` does not match the version they implement.
+
+**Breaks are asymmetric.** A v0.5 verifier rejects v0.4 receipts (the v0.4 signing payload omits `spec_version`, `evaluator_storage_root`, and `attestation_storage_root`, so the receipt_id digest cannot match under v0.5 rules). A v0.4 verifier presented with a v0.5 receipt would similarly fail Step 1 — it would not know about the new fields and would compute a different digest. The intent is loud incompatibility, not silent forward-compatibility: bumping `spec_version` is the protocol-level signal that older verifiers cannot validate.
+
+**Why the break in v0.5.** v0.4 carried only sha256 content hashes for storage-resident artifacts; verifiers needed an out-of-band sha256→backend-locator index to fetch them. In practice this index lived in producer-side process state, so a verifier with a different storage instance than the producer could not fetch any blob the producer uploaded. v0.5 closes this by adding `evaluator_storage_root` and `attestation_storage_root` to the receipt (§6.1), so any verifier with any backend instance can fetch any receipt's bytes. The break is required: making the new fields optional would let producers ship v0.5 receipts with the bug intact.
+
+**Receipt_ids are not comparable across versions.** v0.4 receipt_ids and v0.5 receipt_ids derived from "the same underlying inference" will differ — the signing payload changed shape. Tooling that indexes by receipt_id MUST treat the version as part of the identity.
+
+Future versions SHOULD continue this convention: `spec_version` is mandatory, in the signing payload, and verifiers refuse mismatching versions.
 
 ### 10.3 Substituting protocols
 
-EER's primitives — TEE-attested inference, content-addressed storage — are abstract. While v0.4 is specified against the 0G Compute Network and 0G Storage, equivalent protocols (other TEE inference networks, IPFS, Arweave) MAY be substituted at the implementation level provided they expose:
+EER's primitives — TEE-attested inference, content-addressed storage — are abstract. While v0.5 is specified against the 0G Compute Network and 0G Storage, equivalent protocols (other TEE inference networks, IPFS, Arweave) MAY be substituted at the implementation level provided they expose:
 
 - Per-call TEE-attested signatures with downloadable attestation reports.
-- Content-addressed storage with hash-based retrieval.
+- Content-addressed storage with hash-based retrieval. The storage backend's retrieval locator is what populates `evaluator_storage_root` and `attestation_storage_root` (§6.1); the field name is "storage_root" rather than "zg_root" precisely because the receipt is backend-portable. For 0G Storage the locator is the Merkle rootHash; for IPFS-with-sha256 it is the multihash CID; for Arweave it is the transaction ID.
 - A registry of provider identities for `provider_address` resolution.
 
-The receipt schema is unchanged across protocol substitutions.
+The receipt schema is unchanged across protocol substitutions, with the exception that backends whose retrieval locators exceed 32 bytes would require widening the storage_root fields from `Bytes32Hex` to `BytesHex` (§6.1). Such a widening is itself a protocol break and would require a corresponding `spec_version` bump.
 
 ---
 
 ## 11. Out of scope (deferred to future versions)
 
-The following are explicitly NOT specified in v0.4:
+The following are explicitly NOT specified in v0.5:
 
 - **Cross-receipt aggregation.** Computing reputation, ranking, or composite scores from a set of receipts.
 - **Append-only publication.** A canonical log of all receipts produced under a given evaluator or by a given producer.
