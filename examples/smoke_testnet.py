@@ -33,6 +33,7 @@ from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.verify import verify_through_step_3
 from eerful.zg.compute import ComputeClient
+from eerful.zg.storage import BridgeStorageClient
 
 
 def _load_dotenv(path: Path) -> None:
@@ -60,7 +61,9 @@ def main() -> int:
 
     print(f"== bridge {bridge_url}, provider {provider_address}")
 
-    with ComputeClient(bridge_url=bridge_url) as client:
+    with ComputeClient(bridge_url=bridge_url) as client, BridgeStorageClient(
+        bridge_url=bridge_url
+    ) as storage:
         # ---- Step 0: health
         h = client.healthz()
         print(f"  bridge wallet={h['wallet']} chain={h['chain_id']}")
@@ -92,6 +95,17 @@ def main() -> int:
         evaluator_id = bundle.evaluator_id()
         print(f"  evaluator_id={evaluator_id}")
 
+        # v0.5 (Tier 2): upload the bundle so the receipt can carry
+        # `evaluator_storage_root`. Idempotent — `getOrUpload`
+        # short-circuits on cache hit.
+        bundle_upload = storage.upload_blob(bundle.canonical_bytes())
+        if bundle_upload.content_hash != evaluator_id:
+            raise RuntimeError(
+                f"bundle upload returned content_hash {bundle_upload.content_hash}, "
+                f"expected {evaluator_id}"
+            )
+        print(f"  evaluator_storage_root={bundle_upload.storage_root}")
+
         # ---- Step 3: full TeeML call
         print("  calling infer_full ...")
         result = client.infer_full(
@@ -108,15 +122,26 @@ def main() -> int:
         print(f"  attestation_report_hash={result.attestation_report_hash}")
         print(f"  response_content (signed) = {result.response_content!r}")
 
+        # v0.5 (Tier 2): upload the attestation report bytes so the
+        # receipt can carry `attestation_storage_root`.
+        report_upload = storage.upload_blob(result.attestation_report_bytes)
+        if report_upload.content_hash != result.attestation_report_hash:
+            raise RuntimeError(
+                f"report upload returned content_hash {report_upload.content_hash}, "
+                f"expected {result.attestation_report_hash}"
+            )
+
     # ---- Step 4: build receipt
     receipt = EnhancedReceipt.build(
         created_at=datetime.now(timezone.utc),
         evaluator_id=evaluator_id,
+        evaluator_storage_root=bundle_upload.storage_root,
         evaluator_version=bundle.version,
         provider_address=provider_address,
         chat_id=result.chat_id,
         response_content=result.response_content,
         attestation_report_hash=result.attestation_report_hash,
+        attestation_storage_root=report_upload.storage_root,
         enclave_pubkey=result.enclave_pubkey,
         enclave_signature=result.enclave_signature,
     )
