@@ -106,7 +106,7 @@ def _run_score_test(
     results: dict[str, dict[str, Any]] = {}
     with ComputeClient(bridge_url=bridge_url) as compute:
         try:
-            status = bridge_init(compute, provider_address, bridge_url=bridge_url)
+            status = bridge_init(compute, provider_address)
         except ComputeError as e:
             print(f"  ✗ {e}", file=sys.stderr)
             return 2
@@ -123,8 +123,15 @@ def _run_score_test(
                 {"role": "system", "content": bundle.system_prompt},
                 {"role": "user", "content": strategy_text},
             ]
+            # Use `infer`, not `infer_full`. Score-test only needs the
+            # `response_content` for JSON parsing — the signature +
+            # attestation round-trips that `infer_full` adds are dead
+            # weight here (no receipt is being constructed). Saves 2
+            # network calls per strategy × 3 strategies = 6 calls per
+            # score-test run, which matters when the maintainer is
+            # iterating on the system prompt.
             try:
-                result = compute.infer_full(
+                response = compute.infer(
                     provider_address=provider_address,
                     messages=messages,
                     temperature=temperature,
@@ -137,12 +144,13 @@ def _run_score_test(
                 # try to recover state.
                 print(f"  ✗ {version}: inference failed: {e}", file=sys.stderr)
                 return 1
+            response_content = response.get("response_content", "")
             try:
-                parsed = json.loads(result.response_content)
+                parsed = json.loads(response_content)
             except json.JSONDecodeError as e:
                 print(
                     f"  ✗ {version}: critic response is not valid JSON: {e}\n"
-                    f"      raw response: {result.response_content!r}",
+                    f"      raw response: {response_content!r}",
                     file=sys.stderr,
                 )
                 return 1
@@ -150,7 +158,7 @@ def _run_score_test(
                 print(
                     f"  ✗ {version}: critic response parsed as "
                     f"{type(parsed).__name__}, not a dict.\n"
-                    f"      raw response: {result.response_content!r}",
+                    f"      raw response: {response_content!r}",
                     file=sys.stderr,
                 )
                 return 1

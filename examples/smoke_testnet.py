@@ -66,7 +66,7 @@ def main() -> int:
         bridge_url=bridge_url
     ) as storage:
         # ---- Steps 0-1b: cold-boot dance (healthz + add_ledger + acknowledge)
-        status = bridge_init(client, provider_address, bridge_url=bridge_url)
+        status = bridge_init(client, provider_address)
         print(f"  bridge wallet={status.wallet} chain={status.chain_id}")
         print(
             f"  ledger: created={status.ledger_created} "

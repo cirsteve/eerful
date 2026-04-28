@@ -381,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
         # immediately so we don't burn the broker acknowledge call
         # before realizing the bridge isn't up.
         try:
-            status = bridge_init(compute, provider_address, bridge_url=bridge_url)
+            status = bridge_init(compute, provider_address)
         except ComputeError as e:
             print(f"  ✗ {e}", file=sys.stderr)
             return 2

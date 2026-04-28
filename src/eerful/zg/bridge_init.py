@@ -17,8 +17,11 @@ one function, no I/O beyond what `ComputeClient` already does.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
+
+import httpx
 
 from eerful.canonical import Address
 from eerful.errors import ComputeError
@@ -49,7 +52,6 @@ def bridge_init(
     compute: ComputeClient,
     provider_address: Address,
     *,
-    bridge_url: str,
     ledger_amount: float | None = None,
 ) -> BridgeInitStatus:
     """Run the bridge cold-boot dance: healthz → add_ledger → acknowledge.
@@ -68,12 +70,22 @@ def bridge_init(
     typically catch `ComputeError` and exit non-zero with the message
     on stderr.
     """
+    # Read the bridge URL off the client itself rather than accepting a
+    # separate kwarg — keeps the error message and the actual call
+    # destination on the same single source of truth.
+    bridge_url = compute.bridge_url
+
     try:
         h = compute.healthz()
-    except ComputeError as e:
+    except (ComputeError, httpx.RequestError) as e:
         # Re-raise so callers see one consistent recovery hint instead
         # of each one duplicating the same "see services/zg-bridge/
-        # README.md and run `npm run dev`" string.
+        # README.md and run `npm run dev`" string. Catches both:
+        #   - ComputeError: the bridge responded with a non-2xx status
+        #     (process up but unhealthy, e.g., wallet not loaded).
+        #   - httpx.RequestError: transport-layer failure (the most
+        #     common case — the bridge process isn't running and the
+        #     port refuses connections).
         raise ComputeError(
             f"bridge not reachable at {bridge_url}: {e}; "
             f"see services/zg-bridge/README.md and run `npm run dev`"
@@ -81,9 +93,12 @@ def bridge_init(
 
     # Resolve the deposit amount with explicit validation at the helper
     # boundary. A malformed `EERFUL_0G_LEDGER_DEPOSIT` would otherwise
-    # raise a raw ValueError mid-init; a zero or negative value would
-    # be accepted here and surface much later as the broker's
-    # opaque "balance below minimum lock" message at first inference.
+    # raise a raw ValueError mid-init; a zero, negative, or non-finite
+    # value would be accepted here and surface much later as the
+    # broker's opaque "balance below minimum lock" message at first
+    # inference (or worse, send NaN/Infinity as JSON to the bridge —
+    # NaN <= 0 is False under IEEE 754 so the simple sign check
+    # doesn't catch it).
     raw_amount: float | str = (
         ledger_amount
         if ledger_amount is not None
@@ -97,6 +112,11 @@ def bridge_init(
             "number of 0G (set EERFUL_0G_LEDGER_DEPOSIT or pass "
             "ledger_amount=)"
         ) from e
+    if not math.isfinite(amount):
+        raise ComputeError(
+            f"invalid ledger amount {amount}: must be a finite positive "
+            "number (NaN and Infinity are rejected)"
+        )
     if amount <= 0:
         raise ComputeError(
             f"invalid ledger amount {amount}: must be > 0 0G "
