@@ -100,6 +100,12 @@ from jig.core.pipeline import PipelineConfig, Step, run_pipeline
 from jig.tracing.sqlite import SQLiteTracer
 
 
+async def my_step(ctx: dict) -> str:
+    """Whatever your pipeline step does. The grader scores the
+    `(ctx['input'], <return value>)` pair against the bundle's prompt."""
+    return ctx["input"]
+
+
 async def main():
     bundle = EvaluatorBundle.model_validate_json(open("bundle.json").read())
 

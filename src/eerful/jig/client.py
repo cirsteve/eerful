@@ -120,6 +120,19 @@ class EvaluationClient(LLMClient):
         commit_inputs: bool = False,
         previous_receipt_id: Bytes32Hex | None = None,
     ) -> None:
+        # Fail fast on a stale or wrong `evaluator_id`. A mismatched
+        # value would silently produce receipts whose Step 2 verification
+        # fails downstream — far from the construction site, with
+        # confusing attribution. Cheaper to refuse here. Caller still
+        # passes both `bundle` and `evaluator_id` (rather than us
+        # deriving from bundle) so the API matches the published Day 4
+        # plan; the validation just makes the redundancy load-bearing.
+        bundle_id = bundle.evaluator_id()
+        if evaluator_id != bundle_id:
+            raise EvaluationClientError(
+                f"evaluator_id {evaluator_id!r} does not match "
+                f"bundle.evaluator_id() {bundle_id!r}"
+            )
         self._compute = compute
         self._storage = storage
         self._bundle = bundle
@@ -128,6 +141,15 @@ class EvaluationClient(LLMClient):
         self._salt_store = salt_store
         self._commit_inputs_default = commit_inputs
         self._previous_receipt_id = previous_receipt_id
+        # Per-instance lock serializes `complete()` calls so the
+        # auto-chain pattern (`self._previous_receipt_id` read at start,
+        # write at end) is concurrency-safe. Without this, two
+        # `await asyncio.gather(client.complete(p1), client.complete(p2))`
+        # calls could both read the same predecessor and produce a
+        # branched chain. Producers wanting parallel independent
+        # receipts should use multiple client instances or pin
+        # `eerful.previous_receipt_id` per-call.
+        self._chain_lock = asyncio.Lock()
 
     @property
     def previous_receipt_id(self) -> Bytes32Hex | None:
@@ -142,67 +164,90 @@ class EvaluationClient(LLMClient):
 
         provider_params = params.provider_params or {}
         commit_inputs = self._resolve_commit_inputs(provider_params)
-        previous = self._resolve_previous_receipt_id(provider_params)
 
-        # TeeML inference. ComputeClient is sync; jig's contract is async.
-        # to_thread is the right hammer for v1 — chains are serial and
-        # 3-deep, so the cost of an extra event-loop hop is irrelevant.
-        # An `AsyncComputeClient` is the proper fix and a follow-on.
-        bundle_params = self._bundle.inference_params or {}
-        start = time.monotonic()
-        result: ComputeResult = await asyncio.to_thread(
-            self._compute.infer_full,
-            provider_address=self._provider_address,
-            messages=messages,
-            temperature=bundle_params.get("temperature"),
-            max_tokens=bundle_params.get("max_tokens"),
-        )
-        latency_ms = (time.monotonic() - start) * 1000.0
+        # The chain lock makes the read-of-predecessor / produce-receipt /
+        # write-successor sequence atomic. Without it, concurrent
+        # `complete()` calls on the same client could both read the
+        # same predecessor (branching the chain) or both write at the
+        # end (last-write-wins). The lock costs a per-instance
+        # serialization, which matches the chain pattern's natural
+        # shape (sequential v1 -> v2 -> v3); parallel-independent
+        # users should use multiple client instances.
+        async with self._chain_lock:
+            previous = self._resolve_previous_receipt_id(provider_params)
 
-        # Upload the attestation report. Verify the storage-side hash
-        # matches what TeeML reported — the bridge already content-checks
-        # but Step 4-style attribution belongs here too (this is the
-        # producer side; the verifier runs the symmetric check).
-        report_hash_storage = await asyncio.to_thread(
-            self._storage.upload_blob, result.attestation_report_bytes
-        )
-        if report_hash_storage != result.attestation_report_hash:
-            raise EvaluationClientError(
-                f"attestation report hash mismatch after upload: "
-                f"compute reported {result.attestation_report_hash}, "
-                f"storage returned {report_hash_storage}"
+            # Bundle's inference_params win when set, but caller-passed
+            # values flow through when the bundle leaves them unset.
+            # Spec §6.5 frames inference_params as informational, so a
+            # bundle that omits `temperature` is signalling "use whatever
+            # the caller wants." `_validate_params` already rejects
+            # bundle/caller conflicts; this resolves the caller-only case.
+            bundle_params = self._bundle.inference_params or {}
+            effective_temperature = bundle_params.get(
+                "temperature", params.temperature
+            )
+            effective_max_tokens = bundle_params.get(
+                "max_tokens", params.max_tokens
             )
 
-        input_commitment = self._compute_commitment_or_none(
-            params, commit_inputs, provider_params
-        )
-        score_block = self._parse_score_block(result.response_content)
+            # TeeML inference. ComputeClient is sync; jig's contract is async.
+            # to_thread is the right hammer for v1 — chains are serial and
+            # 3-deep, so the cost of an extra event-loop hop is irrelevant.
+            # An `AsyncComputeClient` is the proper fix and a follow-on.
+            start = time.monotonic()
+            result: ComputeResult = await asyncio.to_thread(
+                self._compute.infer_full,
+                provider_address=self._provider_address,
+                messages=messages,
+                temperature=effective_temperature,
+                max_tokens=effective_max_tokens,
+            )
+            latency_ms = (time.monotonic() - start) * 1000.0
 
-        receipt = EnhancedReceipt.build(
-            created_at=datetime.now(timezone.utc),
-            evaluator_id=self._evaluator_id,
-            evaluator_version=self._bundle.version,
-            provider_address=self._provider_address,
-            chat_id=result.chat_id,
-            response_content=result.response_content,
-            attestation_report_hash=result.attestation_report_hash,
-            enclave_pubkey=result.enclave_pubkey,
-            enclave_signature=result.enclave_signature,
-            input_commitment=input_commitment,
-            previous_receipt_id=previous,
-            output_score_block=score_block,
-        )
+            # Upload the attestation report. Verify the storage-side hash
+            # matches what TeeML reported — the bridge already content-checks
+            # but Step 4-style attribution belongs here too (this is the
+            # producer side; the verifier runs the symmetric check).
+            report_hash_storage = await asyncio.to_thread(
+                self._storage.upload_blob, result.attestation_report_bytes
+            )
+            if report_hash_storage != result.attestation_report_hash:
+                raise EvaluationClientError(
+                    f"attestation report hash mismatch after upload: "
+                    f"compute reported {result.attestation_report_hash}, "
+                    f"storage returned {report_hash_storage}"
+                )
 
-        # Persist the salt to the salt store (best effort, but raises if
-        # the store itself is broken — silent failure here would let a
-        # producer build commitments they can't reveal later, which is
-        # the worst-case failure mode for §6.7 / SaltStore).
-        if input_commitment is not None and self._salt_store is not None:
-            self._salt_store.put(receipt.receipt_id, self._last_salt_for_commit)
+            input_commitment = self._compute_commitment_or_none(
+                params, commit_inputs, provider_params
+            )
+            score_block = self._parse_score_block(result.response_content)
 
-        # Auto-chain: next call gets this receipt as its predecessor
-        # unless the caller overrides via provider_params.
-        self._previous_receipt_id = receipt.receipt_id
+            receipt = EnhancedReceipt.build(
+                created_at=datetime.now(timezone.utc),
+                evaluator_id=self._evaluator_id,
+                evaluator_version=self._bundle.version,
+                provider_address=self._provider_address,
+                chat_id=result.chat_id,
+                response_content=result.response_content,
+                attestation_report_hash=result.attestation_report_hash,
+                enclave_pubkey=result.enclave_pubkey,
+                enclave_signature=result.enclave_signature,
+                input_commitment=input_commitment,
+                previous_receipt_id=previous,
+                output_score_block=score_block,
+            )
+
+            # Persist the salt to the salt store (best effort, but raises if
+            # the store itself is broken — silent failure here would let a
+            # producer build commitments they can't reveal later, which is
+            # the worst-case failure mode for §6.7 / SaltStore).
+            if input_commitment is not None and self._salt_store is not None:
+                self._salt_store.put(receipt.receipt_id, self._last_salt_for_commit)
+
+            # Auto-chain: next call gets this receipt as its predecessor
+            # unless the caller overrides via provider_params.
+            self._previous_receipt_id = receipt.receipt_id
 
         return EerfulLLMResponse(
             content=result.response_content,
@@ -278,14 +323,22 @@ class EvaluationClient(LLMClient):
 
     def _resolve_salt(self, provider_params: dict[str, Any]) -> bytes | None:
         """Read `eerful.salt` from provider_params with strict type
-        validation: must be `bytes` if present, `None` (or absent) to
-        signal "generate a fresh one."
+        validation: must be `bytes` (non-empty) if present, `None` (or
+        absent) to signal "generate a fresh one."
 
         Silently regenerating on a wrong-type input would be a
         footgun: a producer who explicitly passed `eerful.salt="abc"`
         thinking they pinned a salt would instead get a random one
         per call, breaking the chain pattern's stable input commitment
         without any error. Loud failure is the right default.
+
+        Empty bytes (`b""`) are also rejected. An empty salt provides
+        zero entropy, defeating §6.7's brute-force-protection purpose
+        — same reasoning as `commitment.generate_salt(0)` raising
+        ValueError. A producer who genuinely wants no salt can call
+        `compute_input_commitment` directly with whatever bytes they
+        want; the EvaluationClient surface refuses to construct a
+        receipt under a known-broken commitment.
         """
         if "eerful.salt" not in provider_params:
             return None
@@ -296,6 +349,12 @@ class EvaluationClient(LLMClient):
             raise EvaluationClientError(
                 f"provider_params['eerful.salt'] must be bytes or None, "
                 f"got {type(value).__name__}={value!r}"
+            )
+        if len(value) == 0:
+            raise EvaluationClientError(
+                "provider_params['eerful.salt'] must be non-empty bytes; "
+                "an empty salt provides zero entropy and defeats §6.7's "
+                "brute-force-reversal protection"
             )
         return value
 
@@ -314,7 +373,11 @@ class EvaluationClient(LLMClient):
           win for receipt-comparability across producers. Conflicting
           caller values are a programming bug — refuse.
         """
-        if params.tools is not None:
+        # Truthy check (not `is not None`): `tools=[]` from a serializer
+        # that emits "no tools" as an empty list is semantically the
+        # same as `tools=None` — no tool calls would happen — so
+        # accept it. Only a non-empty list is the unsupported case.
+        if params.tools:
             raise EvaluationClientError(
                 "EvaluationClient does not support tool calls — TeeML signs "
                 "the response text and tools would alter what gets signed"
@@ -380,7 +443,13 @@ class EvaluationClient(LLMClient):
             m.content for m in params.messages if m.role == Role.USER
         )
         input_bytes = user_content.encode("utf-8")
-        salt = self._resolve_salt(provider_params) or generate_salt()
+        # `is None` rather than truthy: `_resolve_salt` already rejects
+        # empty bytes, so we'd never see `b""` here; the explicit check
+        # documents that None means "generate fresh" and any other
+        # value (always non-empty by construction) should be used as-is.
+        salt = self._resolve_salt(provider_params)
+        if salt is None:
+            salt = generate_salt()
         self._last_salt_for_commit = salt
         return compute_input_commitment(input_bytes, self._evaluator_id, salt)
 

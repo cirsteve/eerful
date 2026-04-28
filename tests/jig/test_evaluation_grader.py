@@ -331,6 +331,75 @@ async def test_grade_does_not_mask_complete_error_with_tracer_failure(
 
 
 @pytest.mark.asyncio
+async def test_grade_success_path_does_not_raise_when_tracer_end_span_fails(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """A failure in success-path `tracer.end_span` (disk full, sqlite
+    lock, schema mismatch) must NOT convert a successful evaluation
+    into a grading failure. compute + storage already succeeded; the
+    receipt is valid; the caller deserves their scores. Mirrors the
+    error-path's tracer-cleanup suppression for symmetry."""
+
+    class _SuccessFailingTracer(RecordingTracer):
+        def end_span(
+            self,
+            span_id: str,
+            output: Any = None,
+            error: str | None = None,
+            usage: Any = None,
+        ) -> None:
+            raise OSError("tracer-disk-full-on-success")
+
+    client = _make_client(trading_critic_bundle, fake_compute)
+    grader = EvaluationGrader(client=client)
+    tracer = _SuccessFailingTracer()
+    parent = tracer.start_trace("test", kind=SpanKind.PIPELINE_RUN)
+
+    # Should NOT raise — tracer.end_span throwing must be swallowed.
+    scores = await grader.grade(
+        input="x",
+        output="y",
+        context={"_tracer": tracer, "_span_id": parent.id},
+    )
+    # And we still get the scores, even though tracing didn't complete.
+    assert len(scores) == 2
+
+
+@pytest.mark.asyncio
+async def test_grade_success_path_tracer_failure_does_not_block_feedback(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Receipt persistence to FeedbackLoop runs AFTER the tracer block.
+    If tracer.end_span raises and we don't suppress, feedback never
+    runs and the receipt is lost. With suppression, feedback proceeds
+    normally."""
+
+    class _SuccessFailingTracer(RecordingTracer):
+        def end_span(
+            self,
+            span_id: str,
+            output: Any = None,
+            error: str | None = None,
+            usage: Any = None,
+        ) -> None:
+            raise OSError("tracer-disk-full")
+
+    feedback = RecordingFeedback()
+    client = _make_client(trading_critic_bundle, fake_compute)
+    grader = EvaluationGrader(client=client, feedback=feedback)
+    tracer = _SuccessFailingTracer()
+    parent = tracer.start_trace("test", kind=SpanKind.PIPELINE_RUN)
+
+    await grader.grade(
+        input="x",
+        output="y",
+        context={"_tracer": tracer, "_span_id": parent.id},
+    )
+    # Feedback got the receipt despite tracer failure.
+    assert len(feedback.stored) == 1
+
+
+@pytest.mark.asyncio
 async def test_grade_llm_call_span_input_recorded_at_open_time(
     trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
 ) -> None:

@@ -18,6 +18,7 @@ Tests cover the load-bearing properties of the EER produce path:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -530,3 +531,170 @@ async def test_complete_strips_caller_system_messages_and_prepends_bundle_prompt
     assert all(m["content"] != "ignored caller system" for m in sent)
     # And the user message survives.
     assert {"role": "user", "content": "hello"} in sent
+
+
+# ---------------- evaluator_id consistency check ----------------
+
+
+def test_constructor_rejects_mismatched_evaluator_id(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """A stale or wrong `evaluator_id` (e.g., from a previous bundle
+    version) would silently produce receipts that fail verification
+    later. The constructor refuses to build a client whose
+    `evaluator_id` doesn't match the bundle's content hash, so the
+    error surfaces at construction time with a clear message."""
+    wrong_id = "0x" + "00" * 32
+    with pytest.raises(EvaluationClientError, match="does not match"):
+        EvaluationClient(
+            compute=fake_compute,
+            storage=MockStorageClient(),
+            bundle=trading_critic_bundle,
+            evaluator_id=wrong_id,
+            provider_address="0x" + "b" * 40,
+        )
+
+
+def test_constructor_accepts_matching_evaluator_id(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Sanity: passing the bundle's actual evaluator_id constructs cleanly."""
+    EvaluationClient(
+        compute=fake_compute,
+        storage=MockStorageClient(),
+        bundle=trading_critic_bundle,
+        evaluator_id=trading_critic_bundle.evaluator_id(),
+        provider_address="0x" + "b" * 40,
+    )
+
+
+# ---------------- caller inference params ----------------
+
+
+@pytest.mark.asyncio
+async def test_caller_temperature_forwarded_when_bundle_does_not_pin(
+    fake_compute: FakeComputeClient,
+) -> None:
+    """Bundle with no inference_params: caller-supplied `temperature`
+    flows through to ComputeClient.infer_full. Spec §6.5 frames
+    inference_params as informational, so a bundle that omits
+    `temperature` is signalling 'use whatever the caller wants.'"""
+    bundle = EvaluatorBundle(
+        version="bundle-without-params@1.0",
+        model_identifier="zai-org/GLM-5-FP8",
+        system_prompt="rate it",
+        # inference_params intentionally omitted
+    )
+    client = EvaluationClient(
+        compute=fake_compute,
+        storage=MockStorageClient(),
+        bundle=bundle,
+        evaluator_id=bundle.evaluator_id(),
+        provider_address="0x" + "b" * 40,
+    )
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        temperature=0.7,
+        max_tokens=2048,
+    )
+    await client.complete(params)
+    call = fake_compute.calls[-1]
+    assert call["temperature"] == 0.7
+    assert call["max_tokens"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_caller_inference_params_silently_dropped_when_bundle_pins(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Bundle pins temperature=0.0, max_tokens=500. Caller passing
+    nothing → bundle values flow through. (Caller passing matching
+    values is also fine, exercised in
+    `test_complete_uses_bundle_inference_params_over_call_params`.)"""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        temperature=None,
+        max_tokens=None,
+    )
+    await client.complete(params)
+    call = fake_compute.calls[-1]
+    assert call["temperature"] == 0.0
+    assert call["max_tokens"] == 500
+
+
+# ---------------- tools=[] compat ----------------
+
+
+@pytest.mark.asyncio
+async def test_complete_accepts_empty_tools_list(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Some serializers emit `tools: []` for 'no tools' — that's
+    semantically the same as `None` and we shouldn't break callers
+    on it. Only a non-empty list is the unsupported case."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        tools=[],
+    )
+    response = await client.complete(params)
+    assert isinstance(response, EerfulLLMResponse)
+
+
+# ---------------- empty salt rejected ----------------
+
+
+@pytest.mark.asyncio
+async def test_empty_salt_rejected_explicitly(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """An empty-bytes salt (`b\"\"`) provides zero entropy and defeats
+    §6.7's brute-force-protection purpose. We reject it loudly rather
+    than silently regenerating (would be a footgun: producer thinks
+    they pinned a salt, gets a random one) or accepting it (would
+    silently produce a known-broken commitment)."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        provider_params={
+            "eerful.commit_inputs": True,
+            "eerful.salt": b"",
+        },
+    )
+    with pytest.raises(EvaluationClientError, match="empty"):
+        await client.complete(params)
+
+
+# ---------------- concurrent complete() chain safety ----------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_complete_calls_serialize_chain_state(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Two `complete()` calls dispatched via `asyncio.gather` on the
+    same client must produce a properly chained pair: one's
+    `previous_receipt_id` must equal the other's `receipt_id`. Without
+    the per-instance lock, both calls could read the same predecessor
+    (None) and produce a branched chain instead of a linked one.
+
+    The receipts arrive in arbitrary order (gather doesn't guarantee
+    completion order matches submission order under to_thread), so
+    we check the linkage symmetrically: one of the two receipts must
+    be the predecessor of the other."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    r1, r2 = await asyncio.gather(
+        client.complete(_user_only_params("a")),
+        client.complete(_user_only_params("b")),
+    )
+    chain = sorted(
+        [r1.eer, r2.eer],
+        key=lambda r: r.previous_receipt_id is None,
+        reverse=True,  # the one with None predecessor first
+    )
+    first, second = chain
+    assert first.previous_receipt_id is None
+    assert second.previous_receipt_id == first.receipt_id
+
+

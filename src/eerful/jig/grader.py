@@ -125,12 +125,22 @@ class EvaluationGrader(Grader[Any]):
         scores = self._extract_scores(receipt.output_score_block)
 
         if llm_span is not None and isinstance(tracer, TracingLogger):
-            attach_receipt_to_span(llm_span, receipt)
-            tracer.end_span(
-                llm_span.id,
-                output=receipt.output_score_block,
-                usage=response.usage,
-            )
+            # Best-effort tracing on the success path: a failure in
+            # `attach_receipt_to_span` or `tracer.end_span` (disk full,
+            # sqlite lock, schema mismatch in a custom tracer) must NOT
+            # convert a successful evaluation into a grading failure
+            # — compute and storage already succeeded, the receipt is
+            # valid, and the caller deserves their scores. Mirrors the
+            # error-path's tracer-cleanup suppression for symmetry.
+            try:
+                attach_receipt_to_span(llm_span, receipt)
+                tracer.end_span(
+                    llm_span.id,
+                    output=receipt.output_score_block,
+                    usage=response.usage,
+                )
+            except Exception:
+                pass
 
         # Feedback persistence: write the receipt as a stored result
         # so downstream consumers can pull it back by tag. Skipped
