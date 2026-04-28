@@ -32,8 +32,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from eerful.canonical import Bytes32Hex
-from eerful.errors import StorageError, TrustViolation, VerificationError
+from eerful.errors import PolicyError, StorageError, TrustViolation, VerificationError
 from eerful.evaluator import EvaluatorBundle
+from eerful.executor import GateOutcome, GateResult, evaluate_gate
+from eerful.policy import PrincipalPolicy
 from eerful.receipt import EnhancedReceipt
 from eerful.verify import (
     VerificationResult,
@@ -465,6 +467,91 @@ def _print_publish_summary(
         print(f"  side-file: {side_file}")
 
 
+def _print_gate_result(result: GateResult) -> None:
+    """Surface the executor's outcome + detail for the operator + any
+    downstream watcher pattern-matching on stdout. Outcome prints as the
+    enum's string value (`pass`, `refuse_score`, etc.) so a tail-and-grep
+    workflow stays sensible."""
+    if result.outcome == GateOutcome.PASS:
+        print(f"PASS — {result.detail}")
+        if result.canonical_set_hash is not None:
+            print(f"  canonical_set_hash: {result.canonical_set_hash}")
+    else:
+        print(f"REFUSE ({result.outcome.value}) — {result.detail}", file=sys.stderr)
+    print(
+        f"  receipts: {result.receipts_supplied} supplied / "
+        f"{result.receipts_required} required",
+        file=sys.stdout if result.outcome == GateOutcome.PASS else sys.stderr,
+    )
+
+
+def _cmd_gate(args: argparse.Namespace) -> int:
+    """Run `evaluate_gate` against a policy + tier + bundle_name + receipts.
+
+    Exit codes:
+      0 — PASS
+      1 — REFUSE (any outcome)
+      2 — wiring or input error (file load, PolicyError, network)
+
+    The split keeps PASS/REFUSE distinct from "I couldn't even evaluate"
+    so a CI integration can branch on `rc == 0` vs `rc == 1` without
+    swallowing genuine programming bugs.
+    """
+    policy_path: Path = args.policy
+    receipt_paths: list[Path] = list(args.receipt)
+
+    try:
+        policy = PrincipalPolicy.model_validate_json(policy_path.read_bytes())
+    except OSError as e:
+        print(f"failed to load policy at {policy_path}: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"policy does not validate: {e}", file=sys.stderr)
+        return 2
+
+    receipts: list[EnhancedReceipt] = []
+    for rp in receipt_paths:
+        try:
+            receipts.append(EnhancedReceipt.model_validate_json(rp.read_bytes()))
+        except OSError as e:
+            print(f"failed to load receipt at {rp}: {e}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print(f"receipt at {rp} does not validate: {e}", file=sys.stderr)
+            return 2
+
+    bridge_url = args.bridge_url
+    if not _is_loopback_bridge_url(bridge_url) and not args.allow_remote_bridge:
+        print(
+            f"refusing to query non-loopback bridge {bridge_url!r}. "
+            "Re-run with --allow-remote-bridge if this is intentional and you "
+            "trust the network path.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        with BridgeStorageClient(bridge_url=bridge_url) as storage:
+            result = evaluate_gate(
+                policy=policy,
+                tier=args.tier,
+                bundle_name=args.bundle,
+                receipts=receipts,
+                storage=storage,
+            )
+    except PolicyError as e:
+        # Wiring bug: tier or bundle_name not in policy. Not a refusal.
+        print(f"policy wiring error: {e}", file=sys.stderr)
+        return 2
+    except (StorageError, TrustViolation) as e:
+        # Network / byzantine evidence — neither is a gate refusal.
+        print(f"gate evaluation failed (storage): {e}", file=sys.stderr)
+        return 2
+
+    _print_gate_result(result)
+    return 0 if result.outcome == GateOutcome.PASS else 1
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eerful")
     sub = p.add_subparsers(dest="command", required=True)
@@ -569,6 +656,62 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     pub.set_defaults(func=_cmd_publish_evaluator)
+
+    g = sub.add_parser(
+        "gate",
+        help=(
+            "evaluate a multi-attestation gate: load a PrincipalPolicy and "
+            "one or more receipts, run the executor's six-check sequence, "
+            "and exit 0 on PASS / 1 on REFUSE / 2 on wiring error"
+        ),
+    )
+    g.add_argument(
+        "--policy",
+        type=Path,
+        required=True,
+        help="path to PrincipalPolicy JSON",
+    )
+    g.add_argument(
+        "--tier",
+        type=str,
+        required=True,
+        help="tier name from policy.tiers (e.g. low_consequence, high_consequence)",
+    )
+    g.add_argument(
+        "--bundle",
+        type=str,
+        required=True,
+        help="bundle name from policy.bundles (e.g. proposal_grade)",
+    )
+    g.add_argument(
+        "--receipt",
+        type=Path,
+        action="append",
+        required=True,
+        help=(
+            "path to a receipt JSON. Repeat the flag for N>1 attestations: "
+            "--receipt r1.json --receipt r2.json"
+        ),
+    )
+    g.add_argument(
+        "--bridge-url",
+        type=str,
+        default=os.environ.get("EERFUL_0G_BRIDGE_URL", _DEFAULT_BRIDGE_URL),
+        help=(
+            "URL of the zg-bridge (default: $EERFUL_0G_BRIDGE_URL or "
+            f"{_DEFAULT_BRIDGE_URL}). Non-loopback URLs are refused unless "
+            "--allow-remote-bridge is passed."
+        ),
+    )
+    g.add_argument(
+        "--allow-remote-bridge",
+        action="store_true",
+        help=(
+            "opt out of the loopback-only bridge guard. Required to fetch "
+            "from a bridge running off-host."
+        ),
+    )
+    g.set_defaults(func=_cmd_gate)
 
     return p
 

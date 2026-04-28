@@ -41,3 +41,10 @@ class ComputeError(EerError):
 class EvaluationClientError(EerError):
     """Caller passed parameters to EvaluationClient that conflict with the bound
     evaluator bundle's criteria (e.g. overriding system prompt or temperature)."""
+
+
+class PolicyError(EerError):
+    """Caller invoked the executor with a tier or bundle_name not registered
+    in the supplied PrincipalPolicy. This is a programming bug, not a gate
+    refusal — `evaluate_gate` raises rather than returning a REFUSE outcome
+    so the caller's wiring can be fixed."""
