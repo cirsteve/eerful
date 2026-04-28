@@ -104,6 +104,20 @@ def test_compose_hash_entry_rejects_invalid_category():
         )
 
 
+def test_compose_hash_entry_rejects_unknown_category():
+    """`unknown` is reserved for the heuristic `categorize_compose` output
+    surfaced by `Step5Result.category`. A publisher classifying their own
+    compose at publish time has full knowledge and must commit to A/B/C —
+    allowing 'unknown' here would let them quietly bypass the executor's
+    `required_categories` enforcement (PR 2)."""
+    with pytest.raises(ValidationError):
+        ComposeHashEntry(
+            hash=_HASH_A,
+            category="unknown",  # type: ignore[arg-type]
+            provider_address=_PROVIDER,
+        )
+
+
 # ---------------- EvaluatorBundle ----------------
 
 

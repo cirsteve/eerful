@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from eerful.canonical import Address, Bytes32Hex, canonical_json_bytes, is_address, is_bytes32_hex
-from eerful.zg.attestation import ComposeCategory
+from eerful.zg.attestation import DeclaredComposeCategory
 
 
 class ComposeHashEntry(BaseModel):
@@ -37,9 +37,12 @@ class ComposeHashEntry(BaseModel):
     """Lowercase 0x-prefixed sha256(app_compose) — the attested
     compose-hash that Step 5 looks up for gating."""
 
-    category: ComposeCategory
+    category: DeclaredComposeCategory
     """Publisher's §8.2 classification. The PrincipalPolicy's
-    `required_categories` filters on this field at gate time."""
+    `required_categories` filters on this field at gate time. Narrower
+    than `Step5Result.category` (which is the diagnostic from
+    `categorize_compose` and may be 'unknown'); a publisher knows their
+    own compose and must commit to A/B/C."""
 
     provider_address: Address
     """0G compute provider hosting this compose. Informational on the

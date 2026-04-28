@@ -28,7 +28,7 @@ from eerful.verify import (
     verify_step_6_enclave_signature,
     verify_through_step_3,
 )
-from eerful.zg.attestation import ComposeCategory
+from eerful.zg.attestation import DeclaredComposeCategory
 from eerful.zg.storage import MockStorageClient
 
 
@@ -121,7 +121,7 @@ _ENTRY_PROVIDER = "0x" + "d" * 40
 def _entry(
     hash: str,
     *,
-    category: ComposeCategory = "A",
+    category: DeclaredComposeCategory = "A",
     provider: str = _ENTRY_PROVIDER,
 ) -> ComposeHashEntry:
     """Compact ComposeHashEntry constructor for fixtures. Default category is
