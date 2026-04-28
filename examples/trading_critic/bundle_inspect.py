@@ -111,7 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"bundle does not validate: {e}", file=sys.stderr)
         return 1
 
-    declared = bundle.accepted_compose_hashes or []
+    # Keep `None` distinct from a populated list. Per spec §6.5 / the
+    # bundle validator, `None` means "no allowlist, gating skipped by
+    # design"; a populated list means "gate Step 5 on these hashes".
+    # Empty lists are structurally impossible (bundle validator rejects).
+    declared = bundle.accepted_compose_hashes
 
     with ComputeClient(bridge_url=args.bridge_url) as client:
         report_bytes, report_hash = client.fetch_attestation(args.provider)
@@ -124,7 +128,16 @@ def main(argv: list[str] | None = None) -> int:
         print(live_hash)
         return 0
 
-    matches = live_hash in declared
+    # Tri-state gating: distinguishes "no allowlist by design" (skipped,
+    # success) from "allowlist exists, live hash isn't in it" (mismatch,
+    # failure). Keeps the human and JSON paths' exit codes in lockstep.
+    if declared is None:
+        gating = "skipped"
+    elif live_hash in declared:
+        gating = "enforced"
+    else:
+        gating = "mismatch"
+
     if args.json:
         print(
             json.dumps(
@@ -133,28 +146,30 @@ def main(argv: list[str] | None = None) -> int:
                     "provider": args.provider,
                     "model_identifier": bundle.model_identifier,
                     "live_compose_hash": live_hash,
-                    "declared_compose_hashes": list(declared),
-                    "matches": matches,
+                    "declared_compose_hashes": declared,
+                    "gating": gating,
                     "category": category,
                     "report_hash": report_hash,
                 },
                 indent=2,
             )
         )
-        return 0 if matches else 1
+        return 1 if gating == "mismatch" else 0
 
     print(f"  bundle: {bundle.version} ({bundle.model_identifier})")
     print(f"  provider: {args.provider}")
     print(f"  live compose-hash: {live_hash}")
     print(f"  §8.2 category: {category}")
-    if not declared:
+    if gating == "skipped":
         print("  declared accepted_compose_hashes: none")
         print("  → bundle has no allowlist; Step 5 gating would be skipped")
         return 0
-    if matches:
+    assert declared is not None  # narrowed by gating != "skipped"
+    if gating == "enforced":
         print(f"  declared accepted_compose_hashes: {len(declared)} entries (LIVE HASH IS PINNED)")
         print("  → bundle is current; receipts will pass Step 5 gating")
         return 0
+    # gating == "mismatch"
     print(f"  declared accepted_compose_hashes ({len(declared)} entries):")
     for h in declared:
         print(f"    - {h}")
