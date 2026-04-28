@@ -112,10 +112,16 @@ class EvaluatorBundle(BaseModel):
 
     @model_validator(mode="after")
     def _validate_accepted_compose_hashes(self) -> EvaluatorBundle:
-        """Enforce the §6.5 list-level invariant the type alias can't express:
-        the list is non-empty when present (canonical-form rule above).
-        Per-entry hash and address shape is enforced by `ComposeHashEntry`
-        itself.
+        """Enforce the §6.5 list-level invariants the type alias can't express:
+
+        - The list is non-empty when present (canonical-form rule above).
+        - Each `hash` is unique across entries. Step 5 selects the first
+          matching entry (`verify.py`'s `next(...)` lookup); duplicates
+          would make category/provider resolution order-dependent and let
+          a publisher silently reclassify the same compose by re-listing
+          it with different metadata.
+
+        Per-entry hash and address shape is enforced by `ComposeHashEntry`.
         """
         items = self.accepted_compose_hashes
         if items is None:
@@ -125,6 +131,14 @@ class EvaluatorBundle(BaseModel):
                 "accepted_compose_hashes must be omitted (None) rather than empty; "
                 "an empty list has no canonical form (see §6.5 docstring)."
             )
+        seen: set[str] = set()
+        for entry in items:
+            if entry.hash in seen:
+                raise ValueError(
+                    f"accepted_compose_hashes contains duplicate hash {entry.hash}; "
+                    "each compose-hash must map to exactly one entry."
+                )
+            seen.add(entry.hash)
         return self
 
     def canonical_bytes(self) -> bytes:

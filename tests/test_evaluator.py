@@ -190,6 +190,38 @@ def test_evaluator_id_changes_when_entry_category_changes():
     assert a != b
 
 
+def test_accepted_compose_hashes_rejects_duplicate_hashes():
+    """Step 5 picks the first matching entry; duplicates would make
+    category/provider resolution order-dependent and let a publisher
+    silently reclassify the same compose by re-listing it. Bundle
+    construction must reject this at validation time."""
+    other_provider = "0x" + "e" * 40
+    with pytest.raises(ValidationError) as exc:
+        _bundle(
+            accepted_compose_hashes=[
+                _entry(hash=_HASH_A, category="A"),
+                _entry(hash=_HASH_A, category="B", provider_address=other_provider),
+            ]
+        )
+    assert "duplicate" in str(exc.value).lower()
+    assert _HASH_A in str(exc.value)
+
+
+def test_accepted_compose_hashes_rejects_duplicate_after_case_normalization():
+    """Two entries that differ only in hash casing are duplicates after
+    BeforeValidator lowercasing — uniqueness must hold over the canonical
+    form, not the input form, otherwise the rule is bypassed by a
+    publisher feeding mixed-case duplicates."""
+    with pytest.raises(ValidationError) as exc:
+        _bundle(
+            accepted_compose_hashes=[
+                _entry(hash=_HASH_A),
+                _entry(hash=_HASH_A.upper()),
+            ]
+        )
+    assert "duplicate" in str(exc.value).lower()
+
+
 def test_entry_field_keys_sorted_in_canonical_form():
     """Every level of the canonical JSON must be key-sorted (spec §6.4).
     This is what makes evaluator_id cross-implementation-stable when

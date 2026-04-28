@@ -10,12 +10,13 @@ from typing import Any
 import pytest
 from eth_keys import keys
 from eth_utils import keccak
+from pydantic import ValidationError
 
 from eerful.errors import StorageError, TrustViolation, VerificationError
 from eerful.evaluator import ComposeHashEntry, EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
-from eerful.zg.attestation import ComposeCategory
 from eerful.verify import (
+    Step5Result,
     fetch_evaluator_bundle_bytes,
     verify_receipt,
     verify_receipt_with_storage,
@@ -27,6 +28,7 @@ from eerful.verify import (
     verify_step_6_enclave_signature,
     verify_through_step_3,
 )
+from eerful.zg.attestation import ComposeCategory
 from eerful.zg.storage import MockStorageClient
 
 
@@ -352,6 +354,60 @@ def test_step_5_propagates_parse_errors():
         verify_step_5_compose_hash_gating(b, json.dumps(envelope).encode())
     assert exc.value.step == 5
     assert "compose-hash mismatch" in exc.value.reason
+
+
+# ---------------- Step5Result (gating, declared_entry) invariant ----------------
+
+
+def test_step5_result_enforced_requires_declared_entry():
+    """`gating='enforced'` without a `declared_entry` is a contract bug —
+    the executor (PR 2) reads `declared_entry.category` and
+    `declared_entry.provider_address` after observing
+    `gating=='enforced'`. The model must refuse construction."""
+    with pytest.raises(ValidationError):
+        Step5Result(
+            compose_hash="0x" + "a" * 64,
+            gating="enforced",
+            category="A",
+            declared_entry=None,
+        )
+
+
+def test_step5_result_skipped_requires_no_declared_entry():
+    """`gating='skipped'` with a `declared_entry` is also a contract bug;
+    skipped is only ever produced when the bundle has no allowlist, so
+    surfacing an entry is incoherent."""
+    with pytest.raises(ValidationError):
+        Step5Result(
+            compose_hash="0x" + "a" * 64,
+            gating="skipped",
+            category="A",
+            declared_entry=_entry("0x" + "a" * 64),
+        )
+
+
+def test_step5_result_enforced_with_entry_constructs():
+    """Belt-and-suspenders: a coherent `enforced + declared_entry` pair
+    constructs without error, locking in the validator's positive path."""
+    h = "0x" + "a" * 64
+    r = Step5Result(
+        compose_hash=h,
+        gating="enforced",
+        category="A",
+        declared_entry=_entry(h),
+    )
+    assert r.declared_entry is not None
+
+
+def test_step5_result_skipped_without_entry_constructs():
+    """Coherent `skipped + None` pair constructs."""
+    r = Step5Result(
+        compose_hash="0x" + "a" * 64,
+        gating="skipped",
+        category="A",
+        declared_entry=None,
+    )
+    assert r.declared_entry is None
 
 
 # ---------------- end-to-end orchestrator ----------------

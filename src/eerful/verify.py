@@ -37,7 +37,7 @@ from typing import Literal
 
 import jsonschema
 from eth_keys.exceptions import BadSignature, ValidationError as EthKeysValidationError
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from eerful.canonical import Bytes32Hex
 from eerful.errors import StorageError, TrustViolation, VerificationError
@@ -82,6 +82,25 @@ class Step5Result(BaseModel):
     gating: ComposeHashGating
     category: ComposeCategory
     declared_entry: ComposeHashEntry | None = None
+
+    @model_validator(mode="after")
+    def _validate_gating_declared_entry_invariant(self) -> Step5Result:
+        """Pin the (gating, declared_entry) cross-field invariant the type
+        alone can't express. `enforced` means the bundle's allowlist matched
+        the attested compose-hash → an entry was selected. `skipped` means
+        no allowlist was declared → no entry to surface. Without this,
+        downstream consumers (executor's `required_categories` /
+        `distinct_compose_hashes` rules) would have to defensively re-check
+        what construction already established."""
+        if self.gating == "enforced" and self.declared_entry is None:
+            raise ValueError(
+                "Step5Result invariant: gating='enforced' requires declared_entry"
+            )
+        if self.gating == "skipped" and self.declared_entry is not None:
+            raise ValueError(
+                "Step5Result invariant: gating='skipped' requires declared_entry=None"
+            )
+        return self
 
 
 class VerificationResult(BaseModel):
