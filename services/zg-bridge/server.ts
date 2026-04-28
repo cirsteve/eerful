@@ -81,13 +81,14 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 const indexer = new Indexer(INDEXER_URL);
 
-// sha256(content) -> 0G storage rootHash + tx metadata. The receipt format
-// is content-addressed by sha256 (evaluator_id, attestation_report_hash);
-// 0G's indexer keys by Merkle root. This index is the bridge between the
-// two. Resets on restart — bytes persist on 0G but the mapping doesn't, so
-// a publisher who restarts the bridge must re-upload to repopulate
-// (idempotent: getOrUpload short-circuits on cache hit, but the cache is
-// what's gone, so the upload will go through and rebuild the entry).
+// Upload-side perf cache: sha256(content) -> 0G storage rootHash + tx
+// metadata. Used only by /storage/upload-blob to dedup repeat uploads
+// of the same bytes within a single bridge process. NOT load-bearing
+// for correctness: receipts now carry the rootHash directly (spec v0.5
+// `evaluator_storage_root` / `attestation_storage_root`), so
+// /storage/download-blob looks up by the receipt's rootHash and never
+// touches this cache. Restarts only cost a re-upload-bill on the next
+// upload of those bytes; downloads from any other process keep working.
 type UploadIndexEntry = {
   zgRoot: string;
   txHash: string;
@@ -534,17 +535,23 @@ app.post(
 
 // ---------------- /storage/download-blob ----------------
 //
-// Query: ?content_hash=0x<sha256>
-// Returns: raw bytes + X-Content-Hash header.
+// Query: ?content_hash=0x<sha256>&root_hash=0x<merkle root>
+// Returns: raw bytes + X-Content-Hash + X-Root-Hash headers.
 //
-// 404 when the bridge has no upload record for the content hash (the
-// bytes may exist on 0G under their rootHash, but this process did not
-// upload them — see uploadIndex docstring). 422 if the downloaded bytes
-// don't re-hash to the requested content_hash (defense-in-depth against
-// indexer/SDK swaps).
+// Both query params are required. `root_hash` is the indexer key (0G
+// Merkle root); `content_hash` is the integrity check (sha256 of the
+// returned bytes must equal it). The receipt's
+// `evaluator_storage_root` / `attestation_storage_root` carry the
+// root_hash so cross-instance verification works without a producer-
+// side sha256→root index.
+//
+// 422 if the downloaded bytes don't re-hash to the requested
+// content_hash (defense-in-depth against indexer/SDK swaps).
+// 502 if the indexer can't resolve the root_hash.
 
 app.get('/storage/download-blob', async (req: Request, res: Response) => {
   const contentHash = String(req.query.content_hash ?? '').toLowerCase();
+  const rootHash = String(req.query.root_hash ?? '').toLowerCase();
   if (!CONTENT_HASH_RE.test(contentHash)) {
     res.status(400).json({
       error: 'invalid_content_hash',
@@ -552,18 +559,15 @@ app.get('/storage/download-blob', async (req: Request, res: Response) => {
     });
     return;
   }
-  const entry = uploadIndex.get(contentHash);
-  if (!entry) {
-    res.status(404).json({
-      error: 'not_in_index',
-      detail:
-        'content_hash has no upload record on this bridge ' +
-        '(different uploader, or bridge restarted since upload)',
+  if (!CONTENT_HASH_RE.test(rootHash)) {
+    res.status(400).json({
+      error: 'invalid_root_hash',
+      detail: 'root_hash must be 0x-prefixed lowercase 64-hex',
     });
     return;
   }
   try {
-    const [blob, err] = await indexer.downloadToBlob(entry.zgRoot);
+    const [blob, err] = await indexer.downloadToBlob(rootHash);
     if (err !== null) {
       res.status(502).json({
         error: 'download_failed',
@@ -582,7 +586,7 @@ app.get('/storage/download-blob', async (req: Request, res: Response) => {
     }
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('X-Content-Hash', contentHash);
-    res.setHeader('X-Root-Hash', entry.zgRoot);
+    res.setHeader('X-Root-Hash', rootHash);
     res.send(bytes);
   } catch (e: unknown) {
     res.status(500).json({
