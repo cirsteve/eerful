@@ -110,7 +110,10 @@ async def test_complete_uploads_attestation_report_to_storage(
     receipt.attestation_report_hash."""
     client, storage = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
     response = await client.complete(_user_only_params("hi"))
-    fetched = storage.download_blob(response.eer.attestation_report_hash)
+    fetched = storage.download_blob(
+        response.eer.attestation_report_hash,
+        response.eer.attestation_storage_root,
+    )
     # Round-trip: storage content matches what the receipt commits to.
     assert hashlib.sha256(fetched).hexdigest() == response.eer.attestation_report_hash[2:]
 
@@ -485,15 +488,22 @@ async def test_attestation_hash_mismatch_after_upload_raises(
     trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
 ) -> None:
     """If the storage adapter returns a different content hash than
-    what compute reported, that's byzantine — refuse to build the
-    receipt rather than silently produce one that won't verify at
-    Step 4."""
+    what compute reported for the attestation report upload, that's
+    byzantine — refuse to build the receipt rather than silently
+    produce one that won't verify at Step 4.
+
+    Pass `evaluator_storage_root` explicitly so the constructor's
+    bundle upload doesn't run; the lying behavior is scoped to the
+    attestation report upload that happens inside `.complete()`.
+    """
+    from eerful.zg.storage import UploadResult
 
     class _LyingStorage:
-        def upload_blob(self, data: bytes) -> str:
-            return "0x" + "0" * 64  # always lies
+        def upload_blob(self, data: bytes) -> UploadResult:
+            bogus = "0x" + "0" * 64
+            return UploadResult(content_hash=bogus, storage_root=bogus)
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise NotImplementedError
 
     client = EvaluationClient(
@@ -501,6 +511,7 @@ async def test_attestation_hash_mismatch_after_upload_raises(
         storage=_LyingStorage(),
         bundle=trading_critic_bundle,
         evaluator_id=trading_critic_bundle.evaluator_id(),
+        evaluator_storage_root="0x" + "1" * 64,
         provider_address="0x" + "b" * 40,
     )
     with pytest.raises(EvaluationClientError, match="attestation report hash mismatch"):

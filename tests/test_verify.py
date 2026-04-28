@@ -116,17 +116,27 @@ def _receipt(bundle: EvaluatorBundle, **overrides: Any) -> EnhancedReceipt:
     """Build a receipt whose enclave signature is genuinely valid for
     `response_content` (so Step 6 passes by default). Tests exercising
     Step 6 failure modes override `enclave_signature` or `enclave_pubkey`
-    explicitly."""
+    explicitly.
+
+    Storage roots default to the matching content hash because
+    `MockStorageClient` keys both by sha256 (so the producer-side
+    upload returns `storage_root == content_hash`); tests that need
+    distinct roots — e.g., the cross-instance property test — pass
+    them as overrides."""
     response_content = overrides.get("response_content", "hello")
     pubkey, sig = _sign_personal(response_content)
+    eval_id = overrides.get("evaluator_id", bundle.evaluator_id())
+    report_hash = overrides.get("attestation_report_hash", "0x" + "e" * 64)
     fields: dict[str, Any] = dict(
         created_at=CREATED,
-        evaluator_id=bundle.evaluator_id(),
+        evaluator_id=eval_id,
+        evaluator_storage_root=eval_id,
         evaluator_version=bundle.version,
         provider_address="0x" + "b" * 40,
         chat_id="chat-123",
         response_content=response_content,
-        attestation_report_hash="0x" + "e" * 64,
+        attestation_report_hash=report_hash,
+        attestation_storage_root=report_hash,
         enclave_pubkey=pubkey,
         enclave_signature=sig,
     )
@@ -456,8 +466,8 @@ def test_step_4_returns_report_bytes_when_storage_has_them():
     receipt.attestation_report_hash → fetch returns those bytes."""
     storage = MockStorageClient()
     report_bytes, _ = _build_report()
-    rh = storage.upload_blob(report_bytes)
-    r = _receipt(_bundle(), attestation_report_hash=rh)
+    upload = storage.upload_blob(report_bytes)
+    r = _receipt(_bundle(), attestation_report_hash=upload.content_hash)
     out = verify_step_4_attestation_report(r, storage)
     assert out == report_bytes
 
@@ -484,10 +494,10 @@ def test_step_4_locally_rehashes_storage_bytes_defense_in_depth():
         value than the one requested. Our adapters check this, but the
         Protocol doesn't enforce it."""
 
-        def upload_blob(self, data: bytes) -> str:
+        def upload_blob(self, data: bytes) -> Any:
             raise NotImplementedError
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             return b"this hashes to something else entirely"
 
     r = _receipt(_bundle(), attestation_report_hash="0x" + "e" * 64)
@@ -503,10 +513,10 @@ def test_step_4_fails_when_storage_returns_wrong_bytes_as_trust_violation():
     requested hash) → adapter raises TrustViolation, Step 4 attributes it."""
 
     class _LyingStorage:
-        def upload_blob(self, data: bytes) -> str:
+        def upload_blob(self, data: bytes) -> Any:
             raise NotImplementedError
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise TrustViolation(
                 f"download-blob hash mismatch: requested {content_hash}, "
                 "received bytes hash to 0x" + "0" * 64
@@ -538,10 +548,10 @@ def test_fetch_evaluator_bundle_bytes_attributes_storage_miss_to_step_2():
 
 def test_fetch_evaluator_bundle_bytes_attributes_trust_violation_to_step_2():
     class _LyingStorage:
-        def upload_blob(self, data: bytes) -> str:
+        def upload_blob(self, data: bytes) -> Any:
             raise NotImplementedError
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise TrustViolation("byzantine")
 
     r = _receipt(_bundle())
@@ -558,8 +568,8 @@ def test_verify_receipt_with_storage_passes_full_chain():
     report_bytes, hash_hex = _build_report()
     b = _bundle(accepted_compose_hashes=[hash_hex])
     storage.upload_blob(b.canonical_bytes())
-    rh = storage.upload_blob(report_bytes)
-    r = _receipt(b, attestation_report_hash=rh)
+    upload = storage.upload_blob(report_bytes)
+    r = _receipt(b, attestation_report_hash=upload.content_hash)
 
     result = verify_receipt_with_storage(r, storage)
     assert result.bundle.evaluator_id() == b.evaluator_id()
@@ -611,8 +621,8 @@ def test_verify_receipt_with_storage_propagates_step_5_failure():
     report_bytes, _ = _build_report()
     b = _bundle(accepted_compose_hashes=["0x" + "f" * 64])  # not the attested hash
     storage.upload_blob(b.canonical_bytes())
-    rh = storage.upload_blob(report_bytes)
-    r = _receipt(b, attestation_report_hash=rh)
+    upload = storage.upload_blob(report_bytes)
+    r = _receipt(b, attestation_report_hash=upload.content_hash)
     with pytest.raises(VerificationError) as exc:
         verify_receipt_with_storage(r, storage)
     assert exc.value.step == 5
@@ -630,9 +640,9 @@ def test_verify_receipt_with_storage_step_4_fetches_attestation_report_hash_not_
     # evaluator_id would return the bundle bytes, fail to parse as a
     # report at Step 5, and be misattributed.
     report_bytes, _ = _build_report()
-    rh = storage.upload_blob(report_bytes)
-    assert rh != b.evaluator_id()
-    r = _receipt(b, attestation_report_hash=rh)
+    upload = storage.upload_blob(report_bytes)
+    assert upload.content_hash != b.evaluator_id()
+    r = _receipt(b, attestation_report_hash=upload.content_hash)
     out = verify_step_4_attestation_report(r, storage)
     assert out == report_bytes
 
@@ -644,10 +654,10 @@ def test_verify_receipt_with_storage_storage_error_at_step_4_uses_storage_subtyp
     above."""
 
     class _FlakyStorage:
-        def upload_blob(self, data: bytes) -> str:
+        def upload_blob(self, data: bytes) -> Any:
             raise NotImplementedError
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise StorageError("bridge offline")
 
     r = _receipt(_bundle(), attestation_report_hash="0x" + "e" * 64)
@@ -655,6 +665,47 @@ def test_verify_receipt_with_storage_storage_error_at_step_4_uses_storage_subtyp
         verify_step_4_attestation_report(r, _FlakyStorage())
     assert exc.value.step == 4
     assert "bridge offline" in exc.value.reason
+
+
+def test_verifier_can_fetch_via_separate_storage_instance():
+    """Tier 2's load-bearing property: a verifier with a *different*
+    storage instance than the producer can fetch the bundle and report
+    using only the receipt's `(content_hash, storage_root)` pairs.
+    Before Tier 2, the bridge held a per-process sha256→rootHash index;
+    cross-instance fetches 404'd. After Tier 2, the receipt itself
+    carries the rootHash.
+
+    The mock keys by sha256 so storage_root == content_hash here, but
+    the test still proves the property: producer-side state plays no
+    role in the verifier's fetch — only the receipt's fields do.
+    """
+    producer_storage = MockStorageClient()
+    verifier_storage = MockStorageClient()
+
+    report_bytes, hash_hex = _build_report()
+    b = _bundle(accepted_compose_hashes=[hash_hex])
+
+    # Producer uploads to its own storage, captures both fields,
+    # then builds a receipt carrying both.
+    bundle_upload = producer_storage.upload_blob(b.canonical_bytes())
+    report_upload = producer_storage.upload_blob(report_bytes)
+    r = _receipt(
+        b,
+        evaluator_id=bundle_upload.content_hash,
+        evaluator_storage_root=bundle_upload.storage_root,
+        attestation_report_hash=report_upload.content_hash,
+        attestation_storage_root=report_upload.storage_root,
+    )
+
+    # Pre-load the verifier's storage independently — the producer's
+    # `producer_storage` is intentionally unused below to assert that
+    # the verifier path doesn't depend on it.
+    verifier_storage.upload_blob(b.canonical_bytes())
+    verifier_storage.upload_blob(report_bytes)
+
+    result = verify_receipt_with_storage(r, verifier_storage)
+    assert result.step5 is not None
+    assert result.step5.gating == "enforced"
 
 
 def test_verify_receipt_runs_step_5_before_step_6():

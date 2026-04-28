@@ -17,11 +17,13 @@ CREATED = datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc)
 BASE: dict[str, Any] = dict(
     created_at=CREATED,
     evaluator_id="0x" + "a" * 64,
+    evaluator_storage_root="0x" + "1" * 64,
     evaluator_version="trading-critic@1.0.0",
     provider_address="0x" + "b" * 40,
     chat_id="chat-123",
     response_content="hello",
     attestation_report_hash="0x" + "e" * 64,
+    attestation_storage_root="0x" + "2" * 64,
     enclave_pubkey="0x" + "c" * 64,
     enclave_signature="0x" + "d" * 128,
 )
@@ -132,9 +134,11 @@ def test_signing_payload_includes_all_canonical_fields():
     payload = r.signing_payload()
     expected = {
         "attestation_report_hash",
+        "attestation_storage_root",
         "chat_id",
         "created_at",
         "evaluator_id",
+        "evaluator_storage_root",
         "evaluator_version",
         "extensions",
         "input_commitment",
@@ -142,6 +146,7 @@ def test_signing_payload_includes_all_canonical_fields():
         "previous_receipt_id",
         "provider_address",
         "response_content",
+        "spec_version",
     }
     assert set(payload.keys()) == expected
 
@@ -152,8 +157,10 @@ def test_uppercase_hex_normalized_on_construction():
     upper = {
         **BASE,
         "evaluator_id": "0x" + "A" * 64,
+        "evaluator_storage_root": "0x" + "1" * 64,
         "provider_address": "0x" + "B" * 40,
         "attestation_report_hash": "0x" + "E" * 64,
+        "attestation_storage_root": "0x" + "2" * 64,
         "enclave_pubkey": "0x" + "C" * 64,
         "enclave_signature": "0x" + "D" * 128,
     }
@@ -168,3 +175,69 @@ def test_uppercase_hex_normalized_on_construction():
 def test_created_at_serialized_as_rfc3339_z():
     r = EnhancedReceipt.build(**BASE)
     assert r.signing_payload()["created_at"] == "2026-04-26T12:00:00Z"
+
+
+def test_storage_roots_required_for_construction():
+    """v0.5 makes both storage_root fields required. Receipt construction
+    without them must raise (pydantic ValidationError) — the asymmetric
+    break is what removes the cross-instance-fetch bug entirely."""
+    incomplete = {k: v for k, v in BASE.items() if k != "evaluator_storage_root"}
+    with pytest.raises(TypeError):
+        EnhancedReceipt.build(**incomplete)
+
+
+def test_evaluator_storage_root_in_signing_payload():
+    """A change to `evaluator_storage_root` must change `receipt_id` —
+    the signing payload binds the rootHash so a post-construction swap
+    to a different storage backend pointing at colliding bytes can't
+    rotate without invalidating the receipt."""
+    a = EnhancedReceipt.build(**BASE)
+    b = EnhancedReceipt.build(**{**BASE, "evaluator_storage_root": "0x" + "5" * 64})
+    assert a.receipt_id != b.receipt_id
+
+
+def test_attestation_storage_root_in_signing_payload():
+    a = EnhancedReceipt.build(**BASE)
+    b = EnhancedReceipt.build(**{**BASE, "attestation_storage_root": "0x" + "5" * 64})
+    assert a.receipt_id != b.receipt_id
+
+
+def test_spec_version_in_signing_payload():
+    """A receipt under a different `spec_version` should derive a
+    different receipt_id even when the rest of the payload is identical
+    — guards against silent forward-compatibility surprises."""
+    r = EnhancedReceipt.build(**BASE)
+    assert r.spec_version == "0.5"
+    payload = r.signing_payload()
+    assert payload["spec_version"] == "0.5"
+
+
+def test_spec_version_mismatch_rejected():
+    """A receipt declaring a non-current spec_version must fail
+    construction. Asymmetric break per §10.2: this verifier can only
+    speak its own version."""
+    r = EnhancedReceipt.build(**BASE)
+    with pytest.raises(VerificationError) as exc:
+        EnhancedReceipt(**{**r.model_dump(), "spec_version": "0.4"})
+    assert "spec_version" in exc.value.reason
+
+
+def test_storage_roots_lowercase_normalized_in_signing_payload():
+    """Both storage_root fields must canonicalize to lowercase in the
+    signing payload (spec §6.4). A receipt built with uppercase input
+    must produce the same receipt_id as the lowercase form."""
+    upper = {
+        **BASE,
+        "evaluator_storage_root": "0x" + "1" * 64,  # already lowercase
+        "attestation_storage_root": "0x" + "2" * 64,
+    }
+    upper_input = {
+        **BASE,
+        "evaluator_storage_root": "0x" + "1" * 64,
+        "attestation_storage_root": "0x" + "2" * 64,
+    }
+    upper_input["evaluator_storage_root"] = upper_input["evaluator_storage_root"].upper().replace("0X", "0x")
+    upper_input["attestation_storage_root"] = upper_input["attestation_storage_root"].upper().replace("0X", "0x")
+    r_upper = EnhancedReceipt.build(**upper_input)
+    r_lower = EnhancedReceipt.build(**upper)
+    assert r_upper.receipt_id == r_lower.receipt_id

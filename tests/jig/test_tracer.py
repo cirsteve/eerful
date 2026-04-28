@@ -26,11 +26,13 @@ def _make_receipt() -> EnhancedReceipt:
     return EnhancedReceipt.build(
         created_at=datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
         evaluator_id="0x" + "ab" * 32,
+        evaluator_storage_root="0x" + "33" * 32,
         evaluator_version="v1",
         provider_address="0x" + "b" * 40,
         chat_id="chat-1",
         response_content="hi",
         attestation_report_hash="0x" + "cd" * 32,
+        attestation_storage_root="0x" + "44" * 32,
         # Pubkey/sig don't need to be valid here; we're not running Step 6
         # — just exercising metadata write-through.
         enclave_pubkey="0x" + "11" * 64,

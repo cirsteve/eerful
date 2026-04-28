@@ -49,6 +49,7 @@ def test_both_clients_satisfy_protocol():
 def test_upload_blob_returns_local_hash():
     payload = b"hello eerful"
     expected = _sha256_hex(payload)
+    root = "0x" + "ab" * 32
 
     def handle(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
@@ -59,8 +60,8 @@ def test_upload_blob_returns_local_hash():
             200,
             json={
                 "content_hash": expected,
-                "storage_uri": "zg://0xabc",
-                "root_hash": "0xabc",
+                "storage_uri": f"zg://{root}",
+                "root_hash": root,
                 "tx_hash": "0xtx",
                 "tx_seq": 7,
                 "size_bytes": len(payload),
@@ -69,7 +70,8 @@ def test_upload_blob_returns_local_hash():
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
         out = c.upload_blob(payload)
-    assert out == expected
+    assert out.content_hash == expected
+    assert out.storage_root == root
 
 
 def test_upload_blob_rejects_empty():
@@ -84,14 +86,15 @@ def test_upload_blob_detects_bridge_hash_lie():
     trusted to map back to our bytes."""
     payload = b"truthy bytes"
     bogus = "0x" + "0" * 64
+    root = "0x" + "de" * 32
 
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
                 "content_hash": bogus,
-                "storage_uri": "zg://0xdef",
-                "root_hash": "0xdef",
+                "storage_uri": f"zg://{root}",
+                "root_hash": root,
                 "tx_hash": "0xtx",
                 "tx_seq": 1,
                 "size_bytes": len(payload),
@@ -109,14 +112,15 @@ def test_upload_blob_normalizes_uppercase_bridge_hash():
     payload = b"case test"
     expected = _sha256_hex(payload)
     upper = "0x" + expected[2:].upper()
+    root = "0x" + "cd" * 32
 
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
                 "content_hash": upper,
-                "storage_uri": "zg://0xabc",
-                "root_hash": "0xabc",
+                "storage_uri": f"zg://{root}",
+                "root_hash": root.upper(),
                 "tx_hash": "0xtx",
                 "tx_seq": 3,
                 "size_bytes": len(payload),
@@ -125,7 +129,9 @@ def test_upload_blob_normalizes_uppercase_bridge_hash():
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
         out = c.upload_blob(payload)
-    assert out == expected
+    assert out.content_hash == expected
+    # storage_root canonicalized to lowercase even if bridge regresses.
+    assert out.storage_root == root
 
 
 def test_upload_blob_wraps_non_hex_bridge_response_as_storage_error():
@@ -138,7 +144,7 @@ def test_upload_blob_wraps_non_hex_bridge_response_as_storage_error():
             json={
                 "content_hash": "not-a-hex-string",
                 "storage_uri": "zg://0xabc",
-                "root_hash": "0xabc",
+                "root_hash": "0x" + "ab" * 32,
                 "tx_hash": "0xtx",
                 "tx_seq": 1,
                 "size_bytes": 4,
@@ -159,7 +165,7 @@ def test_upload_blob_rejects_short_bridge_hash_as_storage_error():
             json={
                 "content_hash": "0xdead",  # well-formed hex but too short
                 "storage_uri": "zg://0xabc",
-                "root_hash": "0xabc",
+                "root_hash": "0x" + "ab" * 32,
                 "tx_hash": "0xtx",
                 "tx_seq": 1,
                 "size_bytes": 4,
@@ -169,6 +175,56 @@ def test_upload_blob_rejects_short_bridge_hash_as_storage_error():
     with _make_bridge(httpx.MockTransport(handle)) as c:
         with pytest.raises(StorageError, match="non-bytes32 content_hash"):
             c.upload_blob(b"abcd")
+
+
+def test_upload_blob_rejects_short_bridge_root_as_storage_error():
+    """Symmetric to content_hash: a wrong-length root_hash is a bridge
+    bug. Receipts carry storage_root in their canonical signing payload,
+    so a malformed value would silently break receipt_id derivation."""
+    payload = b"short root"
+    expected = _sha256_hex(payload)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "content_hash": expected,
+                "storage_uri": "zg://0xdead",
+                "root_hash": "0xdead",  # well-formed but too short
+                "tx_hash": "0xtx",
+                "tx_seq": 1,
+                "size_bytes": len(payload),
+            },
+        )
+
+    with _make_bridge(httpx.MockTransport(handle)) as c:
+        with pytest.raises(StorageError, match="non-bytes32 root_hash"):
+            c.upload_blob(payload)
+
+
+def test_upload_blob_missing_root_hash_field_raises_storage_error():
+    """Bridge regression that drops `root_hash` from the response: the
+    adapter has nothing to put in `evaluator_storage_root` /
+    `attestation_storage_root`, and silently returning a bogus value
+    would corrupt downstream receipts. Loud StorageError instead."""
+    payload = b"no root"
+    expected = _sha256_hex(payload)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "content_hash": expected,
+                "storage_uri": "zg://0xdead",
+                "tx_hash": "0xtx",
+                "tx_seq": 1,
+                "size_bytes": len(payload),
+            },
+        )
+
+    with _make_bridge(httpx.MockTransport(handle)) as c:
+        with pytest.raises(StorageError, match="root_hash"):
+            c.upload_blob(payload)
 
 
 def test_upload_blob_5xx_raises_storage_error():
@@ -207,18 +263,24 @@ def test_upload_blob_transport_error_wrapped():
 def test_download_blob_round_trip():
     payload = b"download payload"
     h = _sha256_hex(payload)
+    root = "0x" + "11" * 32
 
     def handle(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/storage/download-blob"
         assert request.url.params["content_hash"] == h
+        assert request.url.params["root_hash"] == root
         return httpx.Response(
             200,
             content=payload,
-            headers={"X-Content-Hash": h, "Content-Type": "application/octet-stream"},
+            headers={
+                "X-Content-Hash": h,
+                "X-Root-Hash": root,
+                "Content-Type": "application/octet-stream",
+            },
         )
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
-        out = c.download_blob(h)
+        out = c.download_blob(h, root)
     assert out == payload
 
 
@@ -233,9 +295,24 @@ def test_download_blob_rejects_malformed_content_hash():
         return httpx.Response(200, content=b"x")
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
-        with pytest.raises(ValueError, match="64-char lowercase hex"):
-            c.download_blob("0xdead")  # too short
+        with pytest.raises(ValueError, match="content_hash.*64-char lowercase hex"):
+            c.download_blob("0xdead", "0x" + "0" * 64)  # content_hash too short
     assert sent == []  # request never went out
+
+
+def test_download_blob_rejects_malformed_storage_root():
+    """Symmetric to content_hash: a malformed storage_root is caller-
+    side, raise ValueError before hitting the wire."""
+    sent: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, content=b"x")
+
+    with _make_bridge(httpx.MockTransport(handle)) as c:
+        with pytest.raises(ValueError, match="storage_root.*64-char lowercase hex"):
+            c.download_blob("0x" + "0" * 64, "0xdead")
+    assert sent == []
 
 
 def test_download_blob_5xx_raises_storage_error_when_body_is_list():
@@ -246,19 +323,22 @@ def test_download_blob_5xx_raises_storage_error_when_body_is_list():
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
         with pytest.raises(StorageError):
-            c.download_blob("0x" + "0" * 64)
+            c.download_blob("0x" + "0" * 64, "0x" + "1" * 64)
 
 
-def test_download_blob_404_raises_storage_error():
+def test_download_blob_502_root_unresolved_raises_storage_error():
+    """Bridge can't resolve the rootHash through the indexer (e.g., the
+    bytes were never persisted, or the indexer is wedged). Adapter
+    surfaces as StorageError — transient, retry-eligible."""
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            404,
-            json={"error": "not_in_index", "detail": "different uploader"},
+            502,
+            json={"error": "download_failed", "detail": "indexer cannot resolve root"},
         )
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
-        with pytest.raises(StorageError, match="not_in_index"):
-            c.download_blob("0x" + "0" * 64)
+        with pytest.raises(StorageError, match="indexer cannot resolve"):
+            c.download_blob("0x" + "0" * 64, "0x" + "1" * 64)
 
 
 def test_download_blob_422_from_bridge_raises_trust_violation():
@@ -272,25 +352,26 @@ def test_download_blob_422_from_bridge_raises_trust_violation():
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
         with pytest.raises(TrustViolation, match="content_hash_mismatch"):
-            c.download_blob("0x" + "1" * 64)
+            c.download_blob("0x" + "1" * 64, "0x" + "2" * 64)
 
 
 def test_download_blob_local_hash_check_catches_lying_bridge():
     """Defense in depth: even if the bridge claims success, the adapter
     re-hashes the body and rejects mismatches as TrustViolation."""
     requested = "0x" + "ab" * 32
+    root = "0x" + "cd" * 32
     actual_payload = b"different bytes"
 
     def handle(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             content=actual_payload,
-            headers={"X-Content-Hash": requested},
+            headers={"X-Content-Hash": requested, "X-Root-Hash": root},
         )
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
         with pytest.raises(TrustViolation, match="hash mismatch"):
-            c.download_blob(requested)
+            c.download_blob(requested, root)
 
 
 def test_download_blob_normalizes_input_hash():
@@ -300,16 +381,23 @@ def test_download_blob_normalizes_input_hash():
     payload = b"normalize me"
     canonical = _sha256_hex(payload)
     upper = "0X" + canonical[2:].upper()
-    seen: list[str] = []
+    root = "0x" + "11" * 32
+    upper_root = "0X" + root[2:].upper()
+    seen: list[tuple[str, str]] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
-        seen.append(request.url.params["content_hash"])
+        seen.append(
+            (
+                request.url.params["content_hash"],
+                request.url.params["root_hash"],
+            )
+        )
         return httpx.Response(200, content=payload)
 
     with _make_bridge(httpx.MockTransport(handle)) as c:
-        out = c.download_blob(upper)
+        out = c.download_blob(upper, upper_root)
     assert out == payload
-    assert seen == [canonical]
+    assert seen == [(canonical, root)]
 
 
 def test_bridge_client_does_not_close_borrowed_http():
@@ -344,31 +432,35 @@ def test_bridge_client_closes_owned_http():
 def test_mock_round_trip():
     m = MockStorageClient()
     payload = b"mock payload"
-    h = m.upload_blob(payload)
-    assert m.download_blob(h) == payload
+    upload = m.upload_blob(payload)
+    # Mock invariant: storage_root == content_hash.
+    assert upload.storage_root == upload.content_hash
+    assert m.download_blob(upload.content_hash, upload.storage_root) == payload
 
 
 def test_mock_upload_is_idempotent():
     m = MockStorageClient()
     payload = b"upload twice"
-    h1 = m.upload_blob(payload)
-    h2 = m.upload_blob(payload)
-    assert h1 == h2
-    assert m.download_blob(h1) == payload
+    u1 = m.upload_blob(payload)
+    u2 = m.upload_blob(payload)
+    assert u1 == u2
+    assert m.download_blob(u1.content_hash, u1.storage_root) == payload
 
 
 def test_mock_download_miss_raises_storage_error():
     m = MockStorageClient()
+    h = "0x" + "0" * 64
     with pytest.raises(StorageError, match="unknown content_hash"):
-        m.download_blob("0x" + "0" * 64)
+        m.download_blob(h, h)
 
 
 def test_mock_download_normalizes_input():
     m = MockStorageClient()
     payload = b"case mock"
-    h = m.upload_blob(payload)
-    upper = "0X" + h[2:].upper()
-    assert m.download_blob(upper) == payload
+    upload = m.upload_blob(payload)
+    upper_hash = "0X" + upload.content_hash[2:].upper()
+    upper_root = "0X" + upload.storage_root[2:].upper()
+    assert m.download_blob(upper_hash, upper_root) == payload
 
 
 def test_mock_detects_in_process_tampering():
@@ -377,13 +469,26 @@ def test_mock_detects_in_process_tampering():
     bugs that would otherwise let bad bytes propagate to verify()."""
     m = MockStorageClient()
     payload = b"original"
-    h = m.upload_blob(payload)
-    m._store[h] = b"tampered"
+    upload = m.upload_blob(payload)
+    m._store[upload.content_hash] = b"tampered"
     with pytest.raises(TrustViolation, match="tampered"):
-        m.download_blob(h)
+        m.download_blob(upload.content_hash, upload.storage_root)
 
 
 def test_mock_rejects_empty_upload():
     m = MockStorageClient()
     with pytest.raises(ValueError, match="non-empty"):
         m.upload_blob(b"")
+
+
+def test_mock_rejects_mismatched_root_and_hash():
+    """The mock IS its own backend (content_hash == storage_root). A
+    test passing distinct values is asserting something the mock can't
+    model — surface as StorageError so the test fails loudly instead
+    of silently passing the integrity check."""
+    m = MockStorageClient()
+    payload = b"distinct values"
+    upload = m.upload_blob(payload)
+    other_root = "0x" + "f" * 64
+    with pytest.raises(StorageError, match="storage_root == content_hash"):
+        m.download_blob(upload.content_hash, other_root)
