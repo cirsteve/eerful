@@ -69,13 +69,3 @@ implicit_reexport = true
 # can drop this override and the import resolves directly.
 module = ["jig", "jig.*"]
 follow_untyped_imports = true
-
-[[tool.mypy.overrides]]
-# `examples/trading_critic/demo.py` is a script, not a packaged module.
-# `tests/test_examples_trading_critic.py` imports it via a `sys.path`
-# insert at module load time. mypy's static analysis can't follow that
-# runtime path mutation; this override tells it to treat the dynamic
-# `demo` import as `Any` rather than fail to resolve. The test still
-# runs `from demo import run_demo` at runtime against the real file.
-module = ["demo"]
-ignore_missing_imports = true

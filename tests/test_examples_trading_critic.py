@@ -7,17 +7,19 @@ in-process fakes:
   signature so Step 6 verifies)
 - `MockStorageClient` from `eerful.zg.storage`
 
-The bundle used here intentionally has NO `accepted_compose_hashes`
-so Step 5 reports `gating="skipped"` rather than failing — the fake
-report bytes wouldn't match a real testnet allowlist anyway. The
-real-testnet recording lives in the maintainer's manual run of
-`demo.py` against Provider 1 before submission (gitignored receipts).
+The bundle used here intentionally has NO `accepted_compose_hashes`,
+but this suite does not exercise Step 5 either: it verifies receipts
+with `report_bytes=None`, which skips Step 5 entirely. That avoids
+asserting compose-hash gating against `FakeComputeClient`'s
+non-parseable synthesized report. Real Step 5 coverage is provided
+by the maintainer's manual testnet run of `demo.py` against Provider
+1 before submission (gitignored receipts).
 
 What this test pins:
 
 - `run_demo` produces exactly three receipts.
-- Each receipt round-trips through `verify_receipt` (Steps 1-3 + 6,
-  plus Step 5 compose-hash subset against the no-allowlist bundle).
+- Each receipt round-trips through `verify_receipt` for the steps
+  exercised by this suite (Steps 1-3 + 6; Step 5 is skipped).
 - Chain linkage: None → v1 → v2 → v3.
 - All three share one non-None `input_commitment` (the §6.7
   chain-pattern invariant the demo is built around).
@@ -30,25 +32,42 @@ What this test pins:
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
-import sys
 from pathlib import Path
-from typing import Any
+from typing import Callable
 
 import pytest
 
-# Make `examples/trading_critic/demo.py` importable without packaging it.
-_EXAMPLES = Path(__file__).resolve().parent.parent / "examples" / "trading_critic"
-sys.path.insert(0, str(_EXAMPLES))
-
-from demo import run_demo  # noqa: E402
+# Load `examples/trading_critic/demo.py` without mutating `sys.path` —
+# the previous `sys.path.insert` shape leaked into the rest of the
+# pytest session (potentially shadowing other modules) and tripped
+# mypy's static import resolution. importlib.util is the typed,
+# isolated alternative.
+_DEMO_PATH = (
+    Path(__file__).resolve().parent.parent / "examples" / "trading_critic" / "demo.py"
+)
+_DEMO_SPEC = importlib.util.spec_from_file_location(
+    "examples.trading_critic.demo", _DEMO_PATH
+)
+assert _DEMO_SPEC is not None and _DEMO_SPEC.loader is not None
+_DEMO_MODULE = importlib.util.module_from_spec(_DEMO_SPEC)
+_DEMO_SPEC.loader.exec_module(_DEMO_MODULE)
 
 from eerful.commitment import SaltStore  # noqa: E402
 from eerful.evaluator import EvaluatorBundle  # noqa: E402
+from eerful.receipt import EnhancedReceipt  # noqa: E402
 from eerful.verify import verify_receipt  # noqa: E402
+from eerful.zg.compute import ComputeResult  # noqa: E402
 from eerful.zg.storage import MockStorageClient  # noqa: E402
 
 from tests.jig.conftest import FakeComputeClient  # noqa: E402
+
+# Re-export `run_demo` as a typed callable. The dynamic importlib
+# loader returns `Any`-shaped attributes; pinning the return type
+# here keeps attribute access on receipts statically checked.
+run_demo: Callable[..., list[EnhancedReceipt]] = _DEMO_MODULE.run_demo
 
 
 _PROVIDER = "0x" + "b" * 40
@@ -100,19 +119,35 @@ class _ScriptedComputeClient(FakeComputeClient):
         self._scripted = [_CRITIC_RESPONSE_V1, _CRITIC_RESPONSE_V2, _CRITIC_RESPONSE_V3]
         self._call_idx = 0
 
-    def infer_full(self, **kwargs: Any) -> Any:
+    def infer_full(
+        self,
+        *,
+        provider_address: str,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ComputeResult:
+        # Explicit signature mirroring the parent's: `**kwargs: Any`
+        # would silently mask any future shape drift on
+        # `FakeComputeClient.infer_full`, which is exactly what this
+        # override is meant to be a thin wrapper over.
         if self._call_idx < len(self._scripted):
             self._response_content = self._scripted[self._call_idx]
             self._call_idx += 1
-        return super().infer_full(**kwargs)
+        return super().infer_full(
+            provider_address=provider_address,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
 
 @pytest.fixture
 def demo_bundle() -> EvaluatorBundle:
-    """Bundle without `accepted_compose_hashes` — the FakeComputeClient's
-    synthesized report bytes won't match a real testnet allowlist, so
-    we let Step 5 land in `gating="skipped"` and the demo's chain
-    properties remain testable."""
+    """Bundle without `accepted_compose_hashes`. This suite never
+    exercises Step 5 (it calls `verify_receipt(..., report_bytes=None)`),
+    so the absence of an allowlist isn't a test concern — it just
+    keeps the bundle minimal."""
     return EvaluatorBundle(
         version="trading-critic@0.1.0-test",
         model_identifier="zai-org/GLM-5-FP8",
@@ -194,9 +229,13 @@ def test_run_demo_receipts_pass_offline_verification(
     tmp_path: Path, demo_bundle: EvaluatorBundle
 ) -> None:
     """Each produced receipt must round-trip through `verify_receipt`
-    (Steps 1-3 + 5 compose-hash subset + 6) on the bytes the demo
-    uploaded. Catches regressions where the demo writes receipts that
-    look right structurally but don't actually verify."""
+    (Steps 1-3 + 6) on the bytes the demo uploaded.
+
+    Step 5 is intentionally skipped — `report_bytes=None` — because
+    `FakeComputeClient`'s synthesized attestation report isn't
+    parseable by the Step 5 parser. Catches regressions where the
+    demo writes receipts that look right structurally but don't
+    actually verify."""
     strategies_dir = tmp_path / "strategies"
     receipts_dir = tmp_path / "receipts"
     salt_path = tmp_path / ".salt"
@@ -308,9 +347,14 @@ def test_run_demo_uploads_bundle_and_reports(
     assert fetched_bundle == demo_bundle.canonical_bytes()
 
     # Each receipt's report is fetchable at its
-    # attestation_report_hash / attestation_storage_root pair
+    # attestation_report_hash / attestation_storage_root pair, and the
+    # fetched bytes hash to the receipt's content_hash. The storage
+    # adapter already content-checks on download, but asserting it
+    # here makes the test's intent explicit (and would catch a future
+    # adapter that forgets the integrity check).
     for receipt in receipts:
         report = storage.download_blob(
             receipt.attestation_report_hash, receipt.attestation_storage_root
         )
         assert len(report) > 0
+        assert receipt.attestation_report_hash == "0x" + hashlib.sha256(report).hexdigest()

@@ -21,8 +21,8 @@ Refuses to overwrite an existing file unless `--force` is given. v2
 and v3 are gitignored, so re-running this script is a local-only
 operation and does not affect committed history.
 
-Requires `ANTHROPIC_API_KEY` in the environment (or in
-`eerful/.env`). The `anthropic` SDK is available transitively via the
+Requires `ANTHROPIC_API_KEY` in the environment (or in the repo-root
+`.env`). The `anthropic` SDK is available transitively via the
 `jig[anthropic]` dep already in `pyproject.toml`.
 
 NOT a runtime dependency for `demo.py` or `verify_chain.py`. The demo
@@ -168,7 +168,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # Extract the text content. The SDK returns a list of content blocks;
     # for our prompt shape (no tools, plain text) there is one TextBlock.
+    # An empty list means the model returned only non-text blocks (a
+    # refusal, a stop-on-max-tokens with no output, a future content
+    # type we don't recognize) — silently writing the resulting "\n"
+    # would clobber an existing v2/v3 file with a blank draft and
+    # masquerade as success. Fail loudly with the stop_reason instead.
     parts = [block.text for block in message.content if block.type == "text"]
+    if not parts:
+        raise RuntimeError(
+            f"authoring model returned no text blocks for {args.to} "
+            f"(stop_reason={message.stop_reason!r}); "
+            f"target file {target_path} not written"
+        )
     body = "\n\n".join(parts).strip() + "\n"
 
     target_path.write_text(body)

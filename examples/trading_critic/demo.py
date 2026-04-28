@@ -115,15 +115,24 @@ def _resolve_or_generate_salt(salt_store: SaltStore) -> bytes:
         return salt
 
 
-def _existing_chain_consistent(receipts_dir: Path) -> bool:
-    """Idempotency check: do all three receipts already exist on disk
-    and link forward consistently? If yes, demo can exit cleanly without
-    re-billing the broker.
+def _existing_chain_consistent(
+    receipts_dir: Path, *, evaluator_id: Bytes32Hex
+) -> bool:
+    """Idempotency check: do all three receipts already exist on disk,
+    link forward consistently, AND match the current evaluator_id? If
+    yes, demo can exit cleanly without re-billing the broker.
 
     A partial state (one or two receipts present) returns False — the
     chain has to be re-run from v1 because each receipt's id depends on
     its predecessor's id, and broker calls are not idempotent at the
     wallet layer.
+
+    The `evaluator_id` check matters when the maintainer reruns
+    `bundle_inspect.py` and repins `accepted_compose_hashes`: the new
+    bundle has a new evaluator_id, so the on-disk receipts (produced
+    against the old bundle) no longer verify under the current bundle.
+    Without this check, demo would short-circuit to exit 0 and leave
+    an unverifiable chain in `receipts/`.
     """
     paths = [receipts_dir / f"{v}.json" for v in _VERSIONS]
     if not all(p.exists() for p in paths):
@@ -133,6 +142,8 @@ def _existing_chain_consistent(receipts_dir: Path) -> bool:
             EnhancedReceipt.model_validate_json(p.read_bytes()) for p in paths
         ]
     except Exception:
+        return False
+    if any(r.evaluator_id != evaluator_id for r in receipts):
         return False
     if receipts[0].previous_receipt_id is not None:
         return False
@@ -147,6 +158,14 @@ def _existing_chain_consistent(receipts_dir: Path) -> bool:
     if len(commitments) != 1 or None in commitments:
         return False
     return True
+
+
+_PLACEHOLDER_COMPOSE_HASH: Bytes32Hex = "0x" + ("0" * 64)
+"""Sentinel value `bundle.json` ships with — the maintainer's
+`bundle_inspect.py --confirm-compose-hash` flow swaps in the live
+hash before publishing. Demo refuses to run while the placeholder is
+in place to avoid producing receipts that fail Step 5 against any
+real provider."""
 
 
 def _parse_score_block(response_content: str, version: str) -> dict[str, object]:
@@ -306,16 +325,50 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"== bridge {bridge_url}, provider {provider_address}")
 
-    if _existing_chain_consistent(_RECEIPTS_DIR):
-        print(
-            "  receipts/{v1,v2,v3}.json already exist and link consistently "
-            "— exiting cleanly. Delete the receipts/ directory to rerun."
-        )
-        return 0
-
     bundle = EvaluatorBundle.model_validate_json(_BUNDLE_PATH.read_bytes())
     print(f"  evaluator: {bundle.version} ({bundle.model_identifier})")
     print(f"  evaluator_id: {bundle.evaluator_id()}")
+
+    if _existing_chain_consistent(_RECEIPTS_DIR, evaluator_id=bundle.evaluator_id()):
+        print(
+            "  receipts/{v1,v2,v3}.json already exist, link consistently, "
+            "and match the current evaluator_id — exiting cleanly. "
+            "Delete the receipts/ directory to rerun."
+        )
+        return 0
+
+    # Preflight local inputs BEFORE any broker call burns gas. A
+    # missing v2.md / v3.md is a common setup miss (they're gitignored
+    # and require `author_strategies.py` to draft); a still-placeholder
+    # `accepted_compose_hashes` would produce receipts that fail Step
+    # 5 against Provider 1. Both cost nothing to detect and would
+    # otherwise cost a v1 inference + ledger top-up before failing.
+    if bundle.accepted_compose_hashes == [_PLACEHOLDER_COMPOSE_HASH]:
+        print(
+            "  ✗ bundle.json still pins the all-zero placeholder compose-hash.\n"
+            "      Run `python examples/trading_critic/bundle_inspect.py "
+            "--confirm-compose-hash`,\n"
+            "      paste the printed value into bundle.json's "
+            "accepted_compose_hashes,\n"
+            "      then `eerful publish-evaluator --bundle "
+            "examples/trading_critic/bundle.json`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    missing = [
+        str(_STRATEGIES_DIR / f"{v}.md")
+        for v in _VERSIONS
+        if not (_STRATEGIES_DIR / f"{v}.md").exists()
+    ]
+    if missing:
+        print(
+            "  ✗ missing strategy files (v2/v3 are gitignored — draft them "
+            "with author_strategies.py):\n      "
+            + "\n      ".join(missing),
+            file=sys.stderr,
+        )
+        return 2
 
     salt_store = SaltStore(_SALT_STORE_PATH)
 

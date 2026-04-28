@@ -52,6 +52,15 @@ def _load_dotenv(path: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Load .env BEFORE constructing the parser. argparse's `default=`
+    # values are evaluated at `add_argument` time, so reading
+    # `os.environ.get(...)` after `parse_args` would pick up a stale
+    # process environment and ignore values set in the repo .env —
+    # the publish workflow could then inspect the wrong provider and
+    # pin the wrong compose-hash into bundle.json.
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    _load_dotenv(repo_root / ".env")
+
     parser = argparse.ArgumentParser(prog="bundle_inspect")
     parser.add_argument(
         "--bundle",
@@ -92,9 +101,6 @@ def main(argv: list[str] | None = None) -> int:
         help="emit machine-readable JSON instead of human-formatted output",
     )
     args = parser.parse_args(argv)
-
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    _load_dotenv(repo_root / ".env")
 
     try:
         bundle = EvaluatorBundle.model_validate_json(args.bundle.read_bytes())
