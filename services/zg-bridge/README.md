@@ -41,7 +41,7 @@ npm install
 Create `eerful/.env` (one level above `services/zg-bridge/`) with at
 minimum:
 
-```
+```bash
 EERFUL_0G_PRIVATE_KEY=0x<your-galileo-testnet-key>
 ```
 
@@ -121,9 +121,13 @@ those modules for the request/response shapes and error contract.
 ### Storage
 
 - `POST /storage/upload-blob` (body: raw bytes, `Content-Type:
-  application/octet-stream`) → `{content_hash, zg_root, tx_hash}`.
-  Idempotent on `content_hash` (sha256). Coalesces concurrent uploads
-  of identical bytes so two callers don't both pay the upload fee.
+  application/octet-stream`) → `{content_hash, storage_uri, root_hash,
+  tx_hash, tx_seq, size_bytes}`. `content_hash` is the sha256 the
+  Python adapter passes back to `/download-blob`; `root_hash` is the
+  0G storage Merkle root; `storage_uri` is the convenience
+  `zg://<root_hash>` form. Idempotent on `content_hash`. Coalesces
+  concurrent uploads of identical bytes so two callers don't both pay
+  the upload fee.
 - `GET /storage/download-blob?content_hash=0x...` → raw bytes.
   Re-hashes server-side and refuses to serve bytes that don't match
   (defense in depth; the Python client also re-hashes).
