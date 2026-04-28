@@ -24,12 +24,12 @@ non-loopback host. To bind elsewhere you must set
 with your own auth + network protection. **Don't expose this port to a
 network without doing both.**
 
-The Python clients (`BridgeStorageClient`, `ComputeClient`) honor a
-matching loopback-only guard at the call site and require
-`--allow-remote-bridge` (CLI) or explicit operator opt-in to query a
-non-loopback bridge URL. Symmetric defense — the bridge protects itself
-from where it listens; the clients protect themselves from where they
-connect.
+The `eerful` CLI (`src/eerful/cli.py`) refuses non-loopback bridge URLs
+by default and requires `--allow-remote-bridge` to opt out. The Python
+*library* clients (`BridgeStorageClient`, `ComputeClient`) accept any
+URL — the loopback guard is only enforced at the CLI layer. Library
+callers running their own pipelines are responsible for choosing safe
+URLs themselves.
 
 ## Setup
 
@@ -74,9 +74,9 @@ npm run typecheck
 ```
 
 On startup the bridge logs `zg-bridge listening on 127.0.0.1:7878`.
-`/healthz` returns broker initialization state and the operator-visible
-ledger balance — use it to confirm the wallet is reachable before
-running `eerful publish-evaluator` or producing a receipt.
+`/healthz` confirms the wallet is reachable and the broker initialized
+successfully — use it to verify the bridge is ready before running
+`eerful publish-evaluator` or producing a receipt.
 
 ## Endpoints
 
@@ -86,9 +86,11 @@ those modules for the request/response shapes and error contract.
 
 ### Health
 
-- `GET /healthz` — broker init state + wallet balance + nonce. Returns
-  even if the broker is mid-initialization; check `broker_initialized`
-  before driving compute calls.
+- `GET /healthz` → `{status, wallet, chain_id, rpc, broker_initialized}`.
+  Blocks until the broker finishes initializing on the first call after
+  startup (subsequent calls hit the cached singleton). A 200 response
+  implies `broker_initialized: true`; broker init failure surfaces as
+  500 with `{status: "error", error: ...}`.
 
 ### Admin (one-time setup per wallet)
 
@@ -115,8 +117,10 @@ those modules for the request/response shapes and error contract.
 - `GET /compute/attestation/:provider_address`
   → raw bytes + `X-Report-Hash: 0x<sha256>` header,
   `Content-Type: application/octet-stream`. Provider's current
-  attestation report. Cached internally per provider so back-to-back
-  receipts don't refetch.
+  attestation report. Fetched fresh on every request via the broker
+  SDK's `getQuote(provider_address)`; not cached locally. Producers
+  generating a chain of receipts back-to-back will hit the provider
+  per round; consider caching at the call site if that matters.
 
 ### Storage
 
@@ -129,35 +133,50 @@ those modules for the request/response shapes and error contract.
   concurrent uploads of identical bytes so two callers don't both pay
   the upload fee.
 - `GET /storage/download-blob?content_hash=0x...` → raw bytes.
-  Re-hashes server-side and refuses to serve bytes that don't match
-  (defense in depth; the Python client also re-hashes).
+  Looks up `content_hash` in the in-memory `uploadIndex`; returns 404
+  with `error: "not_in_index"` if the bridge never uploaded those bytes
+  (see Limitations below). On hit, fetches by 0G rootHash, re-hashes
+  server-side, and refuses to serve bytes that don't match.
 
 ## Error contract
 
-The Python clients depend on this shape — change it and the adapters
-break.
+`BridgeStorageClient` (the storage adapter) depends on this status →
+exception mapping; change it and the storage adapter breaks.
 
 - 200: success.
 - 400: malformed request (programming bug on the caller's side).
-  Python clients raise `RuntimeError`.
+  `BridgeStorageClient` raises `RuntimeError`.
 - 404: lookup miss (e.g., unknown content_hash, no acknowledged
-  provider). Python clients raise `StorageError`.
+  provider). `BridgeStorageClient` raises `StorageError`.
 - 422: byzantine evidence — bytes returned don't re-hash to the
-  requested content hash. Python clients raise `TrustViolation`. Never
-  retry.
-- 5xx: SDK / indexer / RPC failure. Python clients raise
+  requested content hash. `BridgeStorageClient` raises
+  `TrustViolation`. Never retry.
+- 5xx: SDK / indexer / RPC failure. `BridgeStorageClient` raises
   `StorageError`. Transient.
 
-Error responses are JSON `{error: string, detail?: any}` so the Python
-clients can surface a useful message rather than the raw 500.
+`ComputeClient` is simpler: any non-2xx response from the compute /
+admin endpoints raises `ComputeError(f"{op} failed ({status}): ...")`.
+There is no per-status mapping on the compute side; callers handle
+or propagate `ComputeError` uniformly.
+
+Error responses are JSON `{error: string, detail?: any}` regardless of
+which client consumes them, so the message surfaces rather than the
+raw 500.
 
 ## Limitations
 
 - Single-tenant. The wallet is shared across all consumers of this
   bridge instance — multi-tenancy needs separate processes.
 - `uploadIndex` (sha256 → 0G rootHash) is in-memory; resets on
-  restart. Bytes persist on 0G but the index doesn't, so the first
-  download after restart re-uploads (idempotent: `getOrUpload` is the
-  pattern; size unchanged, fee duplicated).
+  restart. Bytes persist on 0G under their rootHash, but the bridge
+  has no way to recover the rootHash from a sha256 alone. After
+  restart, downloads of previously-uploaded blobs return 404 with
+  `error: "not_in_index"` until something re-uploads the bytes (which
+  will hit the indexer's existing rootHash and short-circuit at the
+  storage layer, but does re-pay the SDK call). **The same limitation
+  bites cross-instance: a fresh bridge cannot fetch a blob another
+  bridge uploaded.** A fix is planned (see `specs/`); in the meantime,
+  verifiers and producers must share a bridge instance, or the
+  producer must persist the rootHash → contentHash mapping out of band.
 - No rate limiting. The loopback-only default is what protects against
   abuse; remote operators are responsible for their own budget caps.

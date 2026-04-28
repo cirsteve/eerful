@@ -38,11 +38,16 @@ uv sync
 Requires Python 3.12 and a 0G Galileo testnet wallet with faucet funds for
 real TeeML calls and Storage uploads.
 
-For producing receipts (not just verifying), also start the bridge —
-see [`services/zg-bridge/README.md`](services/zg-bridge/README.md) for
-`npm install` + env vars. The bridge listens on `127.0.0.1:7878` by
-default; the Python adapters refuse non-loopback URLs unless you opt
-in with `--allow-remote-bridge`.
+For producing receipts AND for the default verify path (which fetches
+artifacts from 0G Storage), also start the bridge — see
+[`services/zg-bridge/README.md`](services/zg-bridge/README.md) for
+`npm install` + env vars. Fully-offline verification with `--bundle`,
+`--report`, and `--skip-step-5` flags can avoid the bridge entirely.
+
+The bridge listens on `127.0.0.1:7878` by default; the `eerful` CLI
+refuses non-loopback bridge URLs unless you pass `--allow-remote-bridge`.
+Library callers using `BridgeStorageClient` / `ComputeClient` directly
+accept any URL — the loopback guard is CLI-only.
 
 ## Quick verify
 
@@ -58,9 +63,19 @@ block. Step 7 (provider crosscheck) is deferred; full Step 5 (TDX/NVIDIA
 chain to vendor roots) requires the dstack-verifier integration that's
 out of scope for v0.4.
 
+**Known limitation (cross-instance fetch):** the bridge can only fetch
+content_hashes its own `uploadIndex` has seen — it can't recover the
+0G rootHash from a sha256 alone. So a verifier on a fresh bridge
+instance can't fetch a bundle that was uploaded by a different bridge
+process. Workarounds today: (a) producer + verifier share a bridge,
+(b) re-upload the bytes through the verifier's bridge to repopulate
+the index, or (c) use `--bundle` / `--report` with local files. A
+fix is planned (see `services/zg-bridge/README.md` Limitations).
+
 `--bundle <path>` and `--report <path>` override individual artifacts
-with local files (offline verification, cached blobs); `--skip-step-5`
-skips the report fetch entirely.
+with local files (offline verification, cached blobs, or working around
+the cross-instance limitation above); `--skip-step-5` skips the report
+fetch entirely.
 
 ## What an EER proves (and doesn't)
 
