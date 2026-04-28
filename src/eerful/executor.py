@@ -111,10 +111,11 @@ def tee_signer_address_from_pubkey(pubkey_hex: BytesHex) -> Address:
 def canonical_set_hash(receipts: Sequence[EnhancedReceipt]) -> Bytes32Hex:
     """Content-addressed hash of an N-receipt set.
 
-    Sort by `receipt_id`, newline-join, sha256. Order-independent so two
-    callers passing the same receipts in different orders agree. Used as
-    `previous_receipt_id` when a downstream action chains off a
-    multi-attestation gate.
+    Dedupe by `receipt_id`, sort, newline-join, sha256. True set
+    semantics — two callers passing the same receipts in different
+    orders, or one caller passing a duplicate by accident, all agree on
+    the same hash. Used as `previous_receipt_id` when a downstream
+    action chains off a multi-attestation gate.
 
     Spec note: `specs/executor-and-rails-design.md` §5.4 calls this
     `canonical_set_hash` and uses a `sha256:` prefix for human
@@ -122,7 +123,7 @@ def canonical_set_hash(receipts: Sequence[EnhancedReceipt]) -> Bytes32Hex:
     the value can flow into `previous_receipt_id` (which is typed as
     `Bytes32Hex`) without a format adapter.
     """
-    leaves = sorted(r.receipt_id for r in receipts)
+    leaves = sorted({r.receipt_id for r in receipts})
     digest = hashlib.sha256("\n".join(leaves).encode("utf-8")).hexdigest()
     return "0x" + digest
 
@@ -178,16 +179,32 @@ def evaluate_gate(
     expected_evaluator_id = policy.bundles[bundle_name]
     n_required = tier_policy.n_attestations
     n_supplied = len(receipts)
+    distinct_ids = {r.receipt_id for r in receipts}
+    n_distinct = len(distinct_ids)
 
-    # Check 1: receipt count.
-    if n_supplied < n_required:
+    # Check 1: distinct receipt count. Counts unique `receipt_id`s, not raw
+    # input length — without this, a caller can satisfy an N-attestation
+    # tier by passing the same receipt N times when diversity rules are
+    # off. The diversity rules (signers / compose-hashes) are about
+    # provider-level distinctness; receipt-level distinctness is the more
+    # fundamental floor.
+    if n_distinct < n_required:
+        if n_supplied != n_distinct:
+            detail = (
+                f"received {n_supplied} receipt(s) but only {n_distinct} distinct "
+                f"by receipt_id; tier {tier!r} requires {n_required}"
+            )
+        else:
+            detail = (
+                f"received {n_supplied} receipt(s), tier {tier!r} requires {n_required}"
+            )
         return _refuse(
             outcome=GateOutcome.REFUSE_INSUFFICIENT_RECEIPTS,
             tier=tier,
             bundle_name=bundle_name,
             receipts_supplied=n_supplied,
             receipts_required=n_required,
-            detail=f"received {n_supplied} receipt(s), tier {tier!r} requires {n_required}",
+            detail=detail,
         )
 
     # Check 2: every receipt names the policy-pinned evaluator_id.
@@ -287,6 +304,14 @@ def evaluate_gate(
         compose_hashes: list[str] = []
         for r, result in zip(receipts, verification_results, strict=True):
             if result.step5 is None:
+                # Defensive: `verify_receipt_with_storage` defaults to
+                # fetch_report=True so step5 is always populated when
+                # `evaluate_gate` calls it (gating="skipped" still
+                # surfaces a Step5Result with a populated compose_hash).
+                # This branch only fires if a future caller wires the
+                # executor against a verifier path that suppresses
+                # Step 5 entirely — kept as a fail-closed guard rather
+                # than an `assert`.
                 return _refuse(
                     outcome=GateOutcome.REFUSE_DIVERSITY,
                     tier=tier,
@@ -295,7 +320,7 @@ def evaluate_gate(
                     receipts_required=n_required,
                     detail=(
                         f"distinct_compose_hashes required but receipt {r.receipt_id} "
-                        f"has no Step 5 result (bundle declared no allowlist)"
+                        f"has no Step 5 result (report fetch was suppressed)"
                     ),
                 )
             compose_hashes.append(result.step5.compose_hash)
@@ -364,6 +389,9 @@ def evaluate_gate(
                 )
 
     # All six checks passed — anchor the receipt set.
+    # `detail` is outcome-neutral; the CLI prefixes with the human label
+    # (`PASS — ...`) based on `outcome`. Avoids the double-prefix the
+    # CLI's `_print_gate_result` would otherwise produce.
     return GateResult(
         outcome=GateOutcome.PASS,
         tier=tier,
@@ -371,7 +399,7 @@ def evaluate_gate(
         receipts_supplied=n_supplied,
         receipts_required=n_required,
         detail=(
-            f"PASS: {n_supplied} receipt(s) under bundle {bundle_name!r}, "
+            f"{n_supplied} receipt(s) under bundle {bundle_name!r}, "
             f"tier {tier!r}"
         ),
         canonical_set_hash=canonical_set_hash(receipts),

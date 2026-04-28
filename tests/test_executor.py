@@ -199,12 +199,45 @@ def test_canonical_set_hash_is_deterministic_and_hex():
     assert h == canonical_set_hash([r])
 
 
+def _make_distinct_receipts() -> tuple[EnhancedReceipt, EnhancedReceipt]:
+    """Two receipts with distinct receipt_ids — distinct chat_ids feed
+    different signing payloads, so the derived receipt_ids differ.
+    Different signing keys alone wouldn't suffice: enclave_pubkey and
+    enclave_signature aren't in `SIGNING_PAYLOAD_FIELDS`, so two
+    receipts identical except for signature share the same receipt_id."""
+    bundle = EvaluatorBundle(
+        version="trading-critic@1.0.0",
+        model_identifier="zai-org/GLM-5-FP8",
+        system_prompt="rate it",
+    )
+    storage = MockStorageClient()
+    bundle_upload = storage.upload_blob(bundle.canonical_bytes())
+    report_bytes, _ = _build_report()
+    report_upload = storage.upload_blob(report_bytes)
+    pubkey, sig = _sign_personal("ok")
+    common: dict[str, Any] = dict(
+        created_at=CREATED,
+        evaluator_id=bundle.evaluator_id(),
+        evaluator_storage_root=bundle_upload.storage_root,
+        evaluator_version=bundle.version,
+        provider_address=_PROVIDER,
+        response_content="ok",
+        attestation_report_hash=report_upload.content_hash,
+        attestation_storage_root=report_upload.storage_root,
+        enclave_pubkey=pubkey,
+        enclave_signature=sig,
+        output_score_block={"overall": 0.8},
+    )
+    r1 = EnhancedReceipt.build(chat_id="chat-1", **common)
+    r2 = EnhancedReceipt.build(chat_id="chat-2", **common)
+    return r1, r2
+
+
 def test_canonical_set_hash_order_independent():
     """Set semantics: same receipts in any order yield the same hash.
     Without sort, two callers passing the same set in different orders
     would chain differently downstream."""
-    r1, _, _ = _make_receipt_and_storage(privkey=_PRIVKEY_A)
-    r2, _, _ = _make_receipt_and_storage(privkey=_PRIVKEY_B)
+    r1, r2 = _make_distinct_receipts()
     assert canonical_set_hash([r1, r2]) == canonical_set_hash([r2, r1])
 
 
@@ -217,9 +250,18 @@ def test_canonical_set_hash_n1_differs_from_receipt_id():
 
 
 def test_canonical_set_hash_changes_when_set_changes():
-    r1, _, _ = _make_receipt_and_storage(privkey=_PRIVKEY_A)
-    r2, _, _ = _make_receipt_and_storage(privkey=_PRIVKEY_B)
+    r1, r2 = _make_distinct_receipts()
     assert canonical_set_hash([r1]) != canonical_set_hash([r1, r2])
+
+
+def test_canonical_set_hash_dedupes_duplicates():
+    """Set semantics: passing the same receipt twice must yield the
+    same hash as passing it once. Without dedup, an accidental duplicate
+    in the input list would shift the downstream chain anchor for what
+    is semantically the same set."""
+    r, _, _ = _make_receipt_and_storage()
+    assert canonical_set_hash([r, r]) == canonical_set_hash([r])
+    assert canonical_set_hash([r, r, r]) == canonical_set_hash([r])
 
 
 # ---------------- tee_signer_address_from_pubkey ----------------
@@ -375,6 +417,26 @@ def test_evaluate_gate_refuses_zero_receipts():
         storage=storage,
     )
     assert result.outcome == GateOutcome.REFUSE_INSUFFICIENT_RECEIPTS
+
+
+def test_evaluate_gate_refuses_when_duplicate_receipts_pad_count():
+    """Passing the same receipt N times must NOT satisfy an N=2
+    attestation tier when diversity rules are off — the count check
+    measures distinct receipt_ids, not raw input length. This is the
+    receipt-level distinctness floor that sits below the diversity
+    rules' provider-level distinctness."""
+    r, bundle, storage = _make_receipt_and_storage()
+    p = _policy(bundle_id=bundle.evaluator_id(), n_attestations=2)
+    result = evaluate_gate(
+        policy=p,
+        tier="low_consequence",
+        bundle_name="proposal_grade",
+        receipts=[r, r],
+        storage=storage,
+    )
+    assert result.outcome == GateOutcome.REFUSE_INSUFFICIENT_RECEIPTS
+    assert "1 distinct" in result.detail
+    assert "2 receipt" in result.detail
 
 
 # ---------------- evaluate_gate: REFUSE_BUNDLE_MISMATCH ----------------
@@ -632,12 +694,15 @@ def test_evaluate_gate_passes_n2_when_signers_distinct():
     assert result.outcome == GateOutcome.PASS
 
 
-def test_evaluate_gate_refuses_distinct_compose_when_bundle_has_no_allowlist():
-    """distinct_compose_hashes requires Step 5 to have run; if the bundle
-    declared no allowlist, gating='skipped' and there's no compose-hash
-    on Step5Result.declared_entry — the diversity check can't run, refuse."""
+def test_evaluate_gate_refuses_distinct_compose_when_compose_hashes_collide():
+    """Two receipts both attesting the same compose-hash + tier requires
+    distinct_compose_hashes → REFUSE_DIVERSITY on duplicate.
+
+    The bundle has no allowlist here, but Step 5 still runs (with
+    `gating="skipped"`) and `Step5Result.compose_hash` is populated —
+    so the executor can compare compose-hashes across the receipt set
+    even without an allowlist, and catches the collision."""
     r1, r2, bundle, storage = _make_two_receipts_same_signer()
-    # Bundle in the helper has no allowlist; that's exactly the case here.
     p = _policy(
         bundle_id=bundle.evaluator_id(),
         n_attestations=2,
@@ -650,15 +715,9 @@ def test_evaluate_gate_refuses_distinct_compose_when_bundle_has_no_allowlist():
         receipts=[r1, r2],
         storage=storage,
     )
-    # Gating is skipped → Step5Result still surfaces with declared_entry=None,
-    # but compose_hash IS on Step5Result. Re-check expectations:
-    # The executor reads result.step5.compose_hash unconditionally when the
-    # rule is set. Only when step5 is None (meaning the report wasn't
-    # fetched) does the rule fail. Here Step5 ran (gating skipped), so the
-    # compose hash IS available, and both receipts share it (same compose
-    # in both reports). So this fails on duplicate, not on missing.
     assert result.outcome == GateOutcome.REFUSE_DIVERSITY
     assert "distinct_compose_hashes" in result.detail
+    assert "duplicate" in result.detail
 
 
 # ---------------- evaluate_gate: REFUSE_SCORE ----------------
