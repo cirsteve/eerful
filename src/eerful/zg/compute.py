@@ -240,13 +240,24 @@ class ComputeClient:
         # Bridge returns `usage` as either `{"input_tokens": int,
         # "output_tokens": int}` or null. Coerce to ints when present;
         # leave as None when the upstream provider didn't report usage.
+        # `bool` is a subclass of `int`, so a malformed payload like
+        # `{input_tokens: true}` would otherwise be silently treated as
+        # 1 token — explicit `not isinstance(_, bool)` guard prevents
+        # that. Negatives are also rejected; token counts are natural.
         usage_raw = inference.get("usage")
         input_tokens: int | None = None
         output_tokens: int | None = None
         if isinstance(usage_raw, dict):
             it = usage_raw.get("input_tokens")
             ot = usage_raw.get("output_tokens")
-            if isinstance(it, int) and isinstance(ot, int):
+            if (
+                isinstance(it, int)
+                and not isinstance(it, bool)
+                and it >= 0
+                and isinstance(ot, int)
+                and not isinstance(ot, bool)
+                and ot >= 0
+            ):
                 input_tokens = it
                 output_tokens = ot
 

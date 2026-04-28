@@ -45,9 +45,15 @@ from eerful.zg.compute import ComputeResult
 
 def _sign_personal(text: str, privkey_bytes: bytes = b"\x42" * 32) -> tuple[str, str, str]:
     """EIP-191 personal_sign over `text`. Returns (pubkey_hex,
-    signature_hex, address_hex). Mirrors the helper in
-    test_zg_compute.py — tests in this directory need the same
-    primitive without importing from the sibling test module."""
+    signature_hex, address_hex).
+
+    NOT a re-export of `tests.test_zg_compute._sign_personal` — that
+    helper returns `(signature_hex, pubkey_bytes, checksum_address)`
+    in EVM-v=27/28 form for the compute-tests' verifier work. This
+    one returns hex pubkey first (the order `FakeComputeClient` needs
+    for `ComputeResult` construction) and uses raw v=0/1 form. Two
+    helpers, two purposes — keep them separate so neither has to
+    twist for the other's caller."""
     text_bytes = text.encode("utf-8")
     msg_hash = keccak(
         b"\x19Ethereum Signed Message:\n" + str(len(text_bytes)).encode() + text_bytes

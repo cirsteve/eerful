@@ -13,6 +13,7 @@ Tests cover:
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 from jig.core.types import ScoreSource, SpanKind
@@ -234,6 +235,123 @@ async def test_grade_partial_context_still_skips_tracer(
     # Only _tracer, no _span_id.
     await grader.grade(input="x", output="y", context={"_tracer": tracer})
     assert tracer.spans == {}
+
+
+# ---------------- span lifecycle ----------------
+
+
+class _RaisingCompute:
+    """A compute fake that raises on `infer_full`. Used to assert the
+    LLM_CALL span gets closed with an error when the call fails,
+    rather than dangling open or being absent entirely."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def infer_full(self, **kwargs: Any) -> Any:
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_grade_closes_llm_call_span_with_error_when_complete_raises(
+    trading_critic_bundle: EvaluatorBundle,
+) -> None:
+    """If the underlying compute call raises, the LLM_CALL span exists
+    in the trace and is closed with `error=...`. Without this, a
+    failed call would either leave a dangling open span (debugging
+    nightmare) or no span at all (looks like the call never happened)."""
+    fake_raising = _RaisingCompute(RuntimeError("upstream-bridge-down"))
+    client = EvaluationClient(
+        compute=fake_raising,
+        storage=MockStorageClient(),
+        bundle=trading_critic_bundle,
+        evaluator_id=trading_critic_bundle.evaluator_id(),
+        provider_address="0x" + "b" * 40,
+    )
+    grader = EvaluationGrader(client=client)
+    tracer = RecordingTracer()
+    parent = tracer.start_trace("test", kind=SpanKind.PIPELINE_RUN)
+
+    with pytest.raises(RuntimeError, match="upstream-bridge-down"):
+        await grader.grade(
+            input="x",
+            output="y",
+            context={"_tracer": tracer, "_span_id": parent.id},
+        )
+
+    llm_spans = [s for s in tracer.spans.values() if s.kind == SpanKind.LLM_CALL]
+    assert len(llm_spans) == 1
+    span = llm_spans[0]
+    assert span.error is not None
+    assert "upstream-bridge-down" in span.error
+    # No metadata: we never got a receipt to attach.
+    assert span.metadata is None or "eerful.receipt_id" not in span.metadata
+
+
+@pytest.mark.asyncio
+async def test_grade_does_not_mask_complete_error_with_tracer_failure(
+    trading_critic_bundle: EvaluatorBundle,
+) -> None:
+    """If `tracer.end_span` itself raises during error cleanup, the
+    grader must still surface the ORIGINAL `complete()` exception, not
+    the tracer's. Cleanup-must-not-hide-the-real-error: a broken
+    tracer (disk full, sqlite lock, etc.) shouldn't mask the actual
+    call failure that the user needs to debug."""
+
+    class _FailingTracer(RecordingTracer):
+        def end_span(
+            self,
+            span_id: str,
+            output: Any = None,
+            error: str | None = None,
+            usage: Any = None,
+        ) -> None:
+            raise OSError("tracer-disk-full")
+
+    fake_raising = _RaisingCompute(RuntimeError("call-failed"))
+    client = EvaluationClient(
+        compute=fake_raising,
+        storage=MockStorageClient(),
+        bundle=trading_critic_bundle,
+        evaluator_id=trading_critic_bundle.evaluator_id(),
+        provider_address="0x" + "b" * 40,
+    )
+    grader = EvaluationGrader(client=client)
+    tracer = _FailingTracer()
+    parent = tracer.start_trace("test", kind=SpanKind.PIPELINE_RUN)
+
+    with pytest.raises(RuntimeError, match="call-failed") as exc_info:
+        await grader.grade(
+            input="x",
+            output="y",
+            context={"_tracer": tracer, "_span_id": parent.id},
+        )
+    # Make sure it's the call's exception, not the tracer's.
+    assert "tracer-disk-full" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_grade_llm_call_span_input_recorded_at_open_time(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """The LLM_CALL span's `input` field is set when we open the span
+    (before complete runs), so it's available even if the call later
+    fails. Asserts the round-1 fix: span open is BEFORE the await,
+    not after (the previous code opened it after, missing the input
+    in the dangling-failure case)."""
+    client = _make_client(trading_critic_bundle, fake_compute)
+    grader = EvaluationGrader(client=client)
+    tracer = RecordingTracer()
+    parent = tracer.start_trace("test", kind=SpanKind.PIPELINE_RUN)
+    await grader.grade(
+        input="strategy-input",
+        output="some-output",
+        context={"_tracer": tracer, "_span_id": parent.id},
+    )
+    llm_span = next(
+        s for s in tracer.spans.values() if s.kind == SpanKind.LLM_CALL
+    )
+    assert llm_span.input == "strategy-input"
 
 
 # ---------------- input formatting ----------------

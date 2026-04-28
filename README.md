@@ -90,6 +90,8 @@ graded by an `EvaluationGrader` produces a verifying receipt as a side
 effect.
 
 ```python
+import asyncio
+
 from eerful.jig import EvaluationClient, EvaluationGrader
 from eerful.evaluator import EvaluatorBundle
 from eerful.zg.compute import ComputeClient
@@ -97,27 +99,32 @@ from eerful.zg.storage import BridgeStorageClient
 from jig.core.pipeline import PipelineConfig, Step, run_pipeline
 from jig.tracing.sqlite import SQLiteTracer
 
-bundle = EvaluatorBundle.model_validate_json(open("bundle.json").read())
 
-with (
-    ComputeClient(bridge_url="http://127.0.0.1:7878") as compute,
-    BridgeStorageClient(bridge_url="http://127.0.0.1:7878") as storage,
-):
-    client = EvaluationClient(
-        compute=compute,
-        storage=storage,
-        bundle=bundle,
-        evaluator_id=bundle.evaluator_id(),
-        provider_address="0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C",
-    )
-    grader = EvaluationGrader(client=client)
+async def main():
+    bundle = EvaluatorBundle.model_validate_json(open("bundle.json").read())
 
-    config = PipelineConfig(
-        name="trading-critic",
-        steps=[Step(name="critic", fn=my_step, grader=grader)],
-        tracer=SQLiteTracer("traces.db"),
-    )
-    result = await run_pipeline(config, input="market-neutral-v1")
+    with (
+        ComputeClient(bridge_url="http://127.0.0.1:7878") as compute,
+        BridgeStorageClient(bridge_url="http://127.0.0.1:7878") as storage,
+    ):
+        client = EvaluationClient(
+            compute=compute,
+            storage=storage,
+            bundle=bundle,
+            evaluator_id=bundle.evaluator_id(),
+            provider_address="0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C",
+        )
+        grader = EvaluationGrader(client=client)
+
+        config = PipelineConfig(
+            name="trading-critic",
+            steps=[Step(name="critic", fn=my_step, grader=grader)],
+            tracer=SQLiteTracer("traces.db"),
+        )
+        result = await run_pipeline(config, input="market-neutral-v1")
+
+
+asyncio.run(main())
 
 # Each grader call produced an EER. The receipt is on the LLM_CALL span's
 # metadata under `eerful.receipt_id`, and persisted to FeedbackLoop (when

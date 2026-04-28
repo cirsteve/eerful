@@ -43,7 +43,7 @@ from jig.core.types import (
     Usage,
 )
 
-from eerful.canonical import Address, Bytes32Hex
+from eerful.canonical import Address, Bytes32Hex, is_bytes32_hex, to_lower_hex
 from eerful.commitment import SaltStore, compute_input_commitment, generate_salt
 from eerful.errors import EvaluationClientError
 from eerful.evaluator import EvaluatorBundle
@@ -141,12 +141,8 @@ class EvaluationClient(LLMClient):
         messages = self._convert_messages(params)
 
         provider_params = params.provider_params or {}
-        commit_inputs = bool(
-            provider_params.get("eerful.commit_inputs", self._commit_inputs_default)
-        )
-        previous = provider_params.get(
-            "eerful.previous_receipt_id", self._previous_receipt_id
-        )
+        commit_inputs = self._resolve_commit_inputs(provider_params)
+        previous = self._resolve_previous_receipt_id(provider_params)
 
         # TeeML inference. ComputeClient is sync; jig's contract is async.
         # to_thread is the right hammer for v1 — chains are serial and
@@ -226,6 +222,83 @@ class EvaluationClient(LLMClient):
 
     # ---------------- internals ----------------
 
+    def _resolve_commit_inputs(self, provider_params: dict[str, Any]) -> bool:
+        """Read `eerful.commit_inputs` from provider_params with strict
+        type validation. Rejects truthy-coerced values (e.g. the strings
+        `"false"` / `"0"`, the integer `1`) — silently flipping a
+        commitment on or off based on a YAML-loaded string would be a
+        nasty surprise for the producer."""
+        if "eerful.commit_inputs" not in provider_params:
+            return self._commit_inputs_default
+        value = provider_params["eerful.commit_inputs"]
+        if not isinstance(value, bool):
+            raise EvaluationClientError(
+                f"provider_params['eerful.commit_inputs'] must be bool, "
+                f"got {type(value).__name__}={value!r}"
+            )
+        return value
+
+    def _resolve_previous_receipt_id(
+        self, provider_params: dict[str, Any]
+    ) -> Bytes32Hex | None:
+        """Read `eerful.previous_receipt_id` from provider_params with
+        strict shape validation: must be `None` or a Bytes32Hex string
+        (`0x` + 64 lowercase hex chars).
+
+        The shape check matters here, not just at receipt construction
+        time. `EnhancedReceipt.build` will reject a malformed value via
+        pydantic, but the error surfaces deep in the receipt module
+        with no breadcrumbs back to `provider_params`. Catching it at
+        the call boundary tells the caller exactly what they passed
+        wrong, where, and why.
+        """
+        if "eerful.previous_receipt_id" not in provider_params:
+            return self._previous_receipt_id
+        value = provider_params["eerful.previous_receipt_id"]
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise EvaluationClientError(
+                f"provider_params['eerful.previous_receipt_id'] must be a "
+                f"Bytes32Hex string or None, got {type(value).__name__}={value!r}"
+            )
+        try:
+            canonical = to_lower_hex(value)
+        except (TypeError, ValueError) as exc:
+            raise EvaluationClientError(
+                f"provider_params['eerful.previous_receipt_id'] is not a "
+                f"valid hex string: {value!r}"
+            ) from exc
+        if not is_bytes32_hex(canonical):
+            raise EvaluationClientError(
+                f"provider_params['eerful.previous_receipt_id'] must be "
+                f"0x-prefixed 64-char hex (32 bytes), got {value!r}"
+            )
+        return canonical
+
+    def _resolve_salt(self, provider_params: dict[str, Any]) -> bytes | None:
+        """Read `eerful.salt` from provider_params with strict type
+        validation: must be `bytes` if present, `None` (or absent) to
+        signal "generate a fresh one."
+
+        Silently regenerating on a wrong-type input would be a
+        footgun: a producer who explicitly passed `eerful.salt="abc"`
+        thinking they pinned a salt would instead get a random one
+        per call, breaking the chain pattern's stable input commitment
+        without any error. Loud failure is the right default.
+        """
+        if "eerful.salt" not in provider_params:
+            return None
+        value = provider_params["eerful.salt"]
+        if value is None:
+            return None
+        if not isinstance(value, bytes):
+            raise EvaluationClientError(
+                f"provider_params['eerful.salt'] must be bytes or None, "
+                f"got {type(value).__name__}={value!r}"
+            )
+        return value
+
     def _validate_params(self, params: CompletionParams) -> None:
         """Refuse anything that would let the caller change what the bundle
         attests to.
@@ -294,9 +367,9 @@ class EvaluationClient(LLMClient):
         """When `commit_inputs` is True, derive the input bytes from the
         user-role messages and produce a §6.7 commitment.
 
-        The salt is taken from `provider_params["eerful.salt"]` if
-        present (lets a chain pin the same salt across rounds without
-        plumbing a `SaltStore` everywhere); otherwise generated fresh.
+        Salt resolution: `_resolve_salt` returns the caller-pinned salt
+        (lets a chain pin one across rounds without plumbing a
+        `SaltStore` everywhere) or None to signal generate-fresh.
         Stashes the salt on `self._last_salt_for_commit` so the
         post-receipt SaltStore.put can persist it under the receipt_id.
         """
@@ -307,11 +380,7 @@ class EvaluationClient(LLMClient):
             m.content for m in params.messages if m.role == Role.USER
         )
         input_bytes = user_content.encode("utf-8")
-        salt_override = provider_params.get("eerful.salt")
-        if isinstance(salt_override, bytes):
-            salt = salt_override
-        else:
-            salt = generate_salt()
+        salt = self._resolve_salt(provider_params) or generate_salt()
         self._last_salt_for_commit = salt
         return compute_input_commitment(input_bytes, self._evaluator_id, salt)
 

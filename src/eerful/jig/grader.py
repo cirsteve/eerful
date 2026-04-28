@@ -84,24 +84,47 @@ class EvaluationGrader(Grader[Any]):
         context: dict[str, Any] | None = None,
     ) -> list[Score]:
         params = self._build_params(input, output)
-        response = await self._client.complete(params)
-        receipt = response.eer
-        scores = self._extract_scores(receipt.output_score_block)
 
         # Tracer integration: if jig's pipeline runner put a tracer +
-        # parent span_id in context, open an LLM_CALL child and attach
-        # the receipt's identifiers. The LLM_CALL span is a sibling of
-        # the runner-managed GRADING span (jig's pipeline doesn't
+        # parent span_id in context, open an LLM_CALL child *before*
+        # the model call so the span covers actual latency and a
+        # call-time error gets recorded. The LLM_CALL span is a sibling
+        # of the runner-managed GRADING span (jig's pipeline doesn't
         # update `_span_id` mid-flight, so children open under the
         # PIPELINE_RUN root). Acceptable for v1; both spans are
         # visible in the trace so downstream queries can find either.
         ctx = context or {}
         tracer = ctx.get("_tracer")
         span_id = ctx.get("_span_id")
+        llm_span = None
         if isinstance(tracer, TracingLogger) and isinstance(span_id, str):
             llm_span = tracer.start_span(
                 span_id, SpanKind.LLM_CALL, "eerful.evaluate", input=input
             )
+
+        try:
+            response = await self._client.complete(params)
+        except Exception as exc:
+            # Span captures the failure so the trace shows a closed
+            # LLM_CALL with an error rather than dangling open. Re-raise
+            # so the pipeline runner's error handling still sees it.
+            #
+            # Suppress any exception from tracer.end_span itself: a
+            # broken tracer (disk full, sqlite lock, etc.) must not
+            # mask the actual call failure. The user's `complete()`
+            # exception is the load-bearing signal — losing it because
+            # cleanup also failed would make the real bug invisible.
+            if llm_span is not None and isinstance(tracer, TracingLogger):
+                try:
+                    tracer.end_span(llm_span.id, error=str(exc))
+                except Exception:
+                    pass
+            raise
+
+        receipt = response.eer
+        scores = self._extract_scores(receipt.output_score_block)
+
+        if llm_span is not None and isinstance(tracer, TracingLogger):
             attach_receipt_to_span(llm_span, receipt)
             tracer.end_span(
                 llm_span.id,

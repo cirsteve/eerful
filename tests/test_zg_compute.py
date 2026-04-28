@@ -378,6 +378,67 @@ def test_infer_full_handles_malformed_usage_as_none():
     assert result.output_tokens is None
 
 
+@pytest.mark.parametrize(
+    "usage_value,case_name",
+    [
+        ({"input_tokens": True, "output_tokens": 5}, "bool_input_tokens"),
+        ({"input_tokens": 5, "output_tokens": False}, "bool_output_tokens"),
+        ({"input_tokens": -1, "output_tokens": 5}, "negative_input_tokens"),
+        ({"input_tokens": 5, "output_tokens": -1}, "negative_output_tokens"),
+        ({"input_tokens": 1.5, "output_tokens": 5}, "float_input_tokens"),
+        ({"input_tokens": 5, "output_tokens": 1.5}, "float_output_tokens"),
+    ],
+)
+def test_infer_full_rejects_malformed_token_counts(
+    usage_value: dict[str, object], case_name: str
+) -> None:
+    """Token counts that aren't natural non-negative ints surface as
+    None, never silently coerced.
+
+    `bool` is the load-bearing case — `isinstance(True, int)` is True
+    in Python, so `{input_tokens: True}` would silently become 1 token
+    without the explicit `not isinstance(_, bool)` guard. The bridge
+    also rejects these via `Number.isInteger + >= 0`, but defense in
+    depth at the Python boundary catches anyone who connects to a
+    bridge that lies."""
+    text = "x"
+    sig_hex, _, _ = _sign_personal(text, b"\x55" * 32)
+    raw_report = b"r"
+    expected_hash = "0x" + hashlib.sha256(raw_report).hexdigest()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/compute/inference":
+            return httpx.Response(
+                200,
+                json={
+                    "chat_id": f"chat-{case_name}",
+                    "response_content": "ignored",
+                    "model_served": "m",
+                    "provider_endpoint": "https://p",
+                    "usage": usage_value,
+                },
+            )
+        if path.startswith("/compute/signature/"):
+            return httpx.Response(200, json={"signature_hex": sig_hex, "message_text": text})
+        if path.startswith("/compute/attestation/"):
+            return httpx.Response(200, content=raw_report, headers={"X-Report-Hash": expected_hash})
+        return httpx.Response(404)
+
+    with _make_client(httpx.MockTransport(handle)) as c:
+        result = c.infer_full(
+            provider_address="0x" + "a" * 40,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    assert result.input_tokens is None, (
+        f"{case_name}: bool/negative/float input_tokens silently accepted"
+    )
+    assert result.output_tokens is None, (
+        f"{case_name}: bool/negative/float output_tokens silently accepted"
+    )
+
+
 def test_compute_result_is_immutable():
     result = ComputeResult(
         chat_id="x",

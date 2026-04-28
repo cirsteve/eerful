@@ -45,14 +45,17 @@ def _client_and_storage(
 
 
 @pytest.mark.asyncio
-async def test_pipeline_with_evaluation_grader_produces_verifying_receipt(
+async def test_pipeline_grader_persists_receipt_metadata_through_feedback_and_trace(
     trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
 ) -> None:
-    """A one-step pipeline whose grader is an EvaluationGrader: the
-    receipt is captured via the feedback loop, and re-running it
-    through `verify_receipt` against MockStorage round-trips Steps
-    1, 2, 3 (and Step 6 — Step 6 is intrinsic to the receipt, no
-    storage needed)."""
+    """A one-step pipeline whose grader is an EvaluationGrader produces:
+    (a) one stored result in feedback carrying the receipt's three
+    identifiers, (b) an LLM_CALL span whose metadata mirrors them,
+    (c) the attestation report bytes in storage at
+    `attestation_report_hash`. End-to-end `verify_receipt` is asserted
+    in `test_pipeline_receipt_is_offline_verifiable` below — separate
+    test because it needs a capturing-grader subclass to peel the
+    receipt object out of the response."""
     client, storage = _client_and_storage(trading_critic_bundle, fake_compute)
     feedback = RecordingFeedback()
     grader = EvaluationGrader(client=client, feedback=feedback)
@@ -71,40 +74,22 @@ async def test_pipeline_with_evaluation_grader_produces_verifying_receipt(
     # Pipeline emitted scores per step.
     assert "echo" in result.step_scores
     assert len(result.step_scores["echo"]) == 2  # risk, novelty
-    # Feedback got the receipt.
+    # Feedback got the receipt's three identifiers in metadata.
     assert len(feedback.stored) == 1
-    receipt_id = feedback.stored[0]["metadata"]["eer_receipt_id"]
-    # Pull receipt from feedback metadata; reconstruct via the response.
-    # The grader doesn't return the receipt directly, but the LLM_CALL
-    # span carries the same ids — verify the trace shape.
+    md = feedback.stored[0]["metadata"]
+    assert "eer_receipt_id" in md
+    assert "eer_evaluator_id" in md
+    assert "eer_attestation_report_hash" in md
+    # LLM_CALL span carries the same receipt_id (grader path → tracer).
     llm_span = next(
         s for s in tracer.spans.values() if s.name == "eerful.evaluate"
     )
     assert llm_span.metadata is not None
-    assert llm_span.metadata["eerful.receipt_id"] == receipt_id
-
-    # And the receipt verifies end-to-end. We fetch it back via the
-    # client's last-call metadata: the producer side stashes the
-    # report in storage during `complete()`, so a fresh
-    # `verify_receipt` against the same storage with the receipt's
-    # bundle bytes succeeds at Steps 1+2+3+6.
-    bundle_bytes = trading_critic_bundle.canonical_bytes()
-    # The receipt is reachable via the client's chain pointer (last
-    # call updates `client._previous_receipt_id`) — pull the bytes
-    # from the EvaluationClient's last response by re-running grader
-    # with the same fixture. Simpler: assert the trace metadata is
-    # consistent with the feedback metadata (we already did) and that
-    # the report bytes are in storage.
-    report_hash = feedback.stored[0]["metadata"]["eer_attestation_report_hash"]
-    fetched = storage.download_blob(report_hash)
+    assert llm_span.metadata["eerful.receipt_id"] == md["eer_receipt_id"]
+    # Attestation report bytes are in storage at the receipt's hash;
+    # the report fetch + re-hash is what offline verify needs at Step 4.
+    fetched = storage.download_blob(md["eer_attestation_report_hash"])
     assert len(fetched) > 0
-    # End-to-end verify: pull the actual receipt object out of the
-    # client by replaying one more grade call to assert it builds
-    # consistently.
-    # (Simplified: the grader's persistence path is the contract; the
-    # "receipt verifies" property is exercised exhaustively in
-    # test_evaluation_client.py against verify_receipt directly.)
-    _ = bundle_bytes
 
 
 @pytest.mark.asyncio

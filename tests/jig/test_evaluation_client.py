@@ -193,6 +193,137 @@ async def test_complete_rejects_conflicting_temperature(
         await client.complete(params)
 
 
+# ---------------- provider_params strict validation ----------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_value",
+    ["true", "false", "0", "1", 1, 0, [], {}, "yes"],
+)
+async def test_commit_inputs_non_bool_value_raises(
+    trading_critic_bundle: EvaluatorBundle,
+    fake_compute: FakeComputeClient,
+    bad_value: Any,
+) -> None:
+    """`provider_params['eerful.commit_inputs']` must be a real bool.
+    Truthy-coercing strings (`'false'`, `'0'`) or ints would silently
+    flip a commitment on or off based on YAML/JSON ambiguity. Refuse
+    loudly so the producer knows their config didn't take effect."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        provider_params={"eerful.commit_inputs": bad_value},
+    )
+    with pytest.raises(EvaluationClientError, match="commit_inputs"):
+        await client.complete(params)
+
+
+@pytest.mark.asyncio
+async def test_commit_inputs_real_bool_accepted(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Sanity: actual `True` / `False` flow through unchanged."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        provider_params={"eerful.commit_inputs": True},
+    )
+    response = await client.complete(params)
+    assert response.eer.input_commitment is not None
+
+
+@pytest.mark.asyncio
+async def test_previous_receipt_id_invalid_hex_raises(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """A non-hex string value would otherwise reach
+    `EnhancedReceipt.build` and fail with a confusing pydantic error
+    deep in the receipt module. Catching it at the call boundary
+    surfaces a clear `EvaluationClientError` mentioning
+    `previous_receipt_id`."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        provider_params={"eerful.previous_receipt_id": "definitely-not-hex"},
+    )
+    with pytest.raises(EvaluationClientError, match="previous_receipt_id"):
+        await client.complete(params)
+
+
+@pytest.mark.asyncio
+async def test_previous_receipt_id_wrong_length_raises(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """A valid hex string of the wrong length is also rejected."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        # Valid hex but too short for Bytes32Hex.
+        provider_params={"eerful.previous_receipt_id": "0xab"},
+    )
+    with pytest.raises(EvaluationClientError, match="previous_receipt_id"):
+        await client.complete(params)
+
+
+@pytest.mark.asyncio
+async def test_previous_receipt_id_non_string_raises(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        provider_params={"eerful.previous_receipt_id": 12345},
+    )
+    with pytest.raises(EvaluationClientError, match="previous_receipt_id"):
+        await client.complete(params)
+
+
+@pytest.mark.asyncio
+async def test_salt_non_bytes_raises(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Silently regenerating on a wrong-type salt would defeat the
+    chain pattern's stable input commitment without any error. Refuse."""
+    client, _ = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        provider_params={
+            "eerful.commit_inputs": True,
+            "eerful.salt": "0xab" * 16,  # caller probably meant to pass bytes
+        },
+    )
+    with pytest.raises(EvaluationClientError, match="salt"):
+        await client.complete(params)
+
+
+@pytest.mark.asyncio
+async def test_salt_bytes_accepted_and_used(
+    trading_critic_bundle: EvaluatorBundle,
+    fake_compute: FakeComputeClient,
+    tmp_path: Path,
+) -> None:
+    """Sanity: passing actual bytes for `eerful.salt` pins it across
+    the call. The persisted salt in SaltStore equals what we passed."""
+    salt_store = SaltStore(tmp_path / "salts.json")
+    client, _ = _client(
+        bundle=trading_critic_bundle,
+        fake_compute=fake_compute,
+        salt_store=salt_store,
+    )
+    pinned_salt = b"\xaa" * 32
+    params = CompletionParams(
+        messages=[Message(role=Role.USER, content="x")],
+        provider_params={
+            "eerful.commit_inputs": True,
+            "eerful.salt": pinned_salt,
+        },
+    )
+    response = await client.complete(params)
+    salt_back, _ = salt_store.get(response.eer.receipt_id)
+    assert salt_back == pinned_salt
+
+
 # ---------------- chain pattern ----------------
 
 

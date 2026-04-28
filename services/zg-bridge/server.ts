@@ -327,9 +327,19 @@ app.post('/compute/inference', async (req: Request, res: Response) => {
     // jig's (`input_tokens`, `output_tokens`) names here so the Python side
     // doesn't need to know the wire format. Null when the provider didn't
     // return a usage block — some don't, and `null` is honest about that.
+    //
+    // Validate strictly: token counts must be finite non-negative integers.
+    // A malformed provider returning a float, NaN, Infinity, or negative
+    // value would otherwise silently corrupt jig's BudgetTracker.
+    // `Number.isInteger` rejects floats and non-numbers; combined with
+    // `>= 0` it accepts only the natural shape token counts can take.
     const u = completion.usage;
     const usage =
-      u && typeof u.prompt_tokens === 'number' && typeof u.completion_tokens === 'number'
+      u &&
+      Number.isInteger(u.prompt_tokens) &&
+      (u.prompt_tokens as number) >= 0 &&
+      Number.isInteger(u.completion_tokens) &&
+      (u.completion_tokens as number) >= 0
         ? { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens }
         : null;
 
