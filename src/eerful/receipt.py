@@ -38,15 +38,35 @@ def derive_receipt_id(payload: dict[str, Any]) -> Bytes32Hex:
     return "0x" + hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
+SPEC_VERSION: str = "0.5"
+"""Current EER spec version (§10.2). Receipts produced under this
+version carry `spec_version == SPEC_VERSION` — verifiers refuse
+older receipts (asymmetric break documented in §10.2). v0.5 adds
+`spec_version`, `evaluator_storage_root`, and `attestation_storage_root`
+as required fields; the storage_root pair lets any verifier fetch any
+receipt's bytes from any storage instance (Tier 2 cross-instance fix)."""
+
+
 class EnhancedReceipt(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     receipt_id: Bytes32Hex
 
+    # Spec version pin (in canonical signing payload, spec §10.2).
+    # Receipts authored under v0.5 must carry "0.5" — verifiers refuse
+    # mismatching versions rather than guess at semantics.
+    spec_version: str
+
     # Producer claims (in canonical signing payload)
     created_at: datetime
     evaluator_id: Bytes32Hex
     evaluator_version: str
+    # 0G Merkle root (or backend-equivalent retrieval locator) of the
+    # evaluator bundle bytes. Paired with `evaluator_id` (sha256) as a
+    # (integrity_hash, retrieval_locator) tuple per spec §6.1; required
+    # so any verifier with any storage instance can fetch the bundle
+    # without depending on producer-side sha256→root index.
+    evaluator_storage_root: Bytes32Hex
     input_commitment: Bytes32Hex | None = None
     previous_receipt_id: Bytes32Hex | None = None
 
@@ -62,6 +82,9 @@ class EnhancedReceipt(BaseModel):
     # Binding the report hash into receipt_id forecloses a same-key /
     # different-report swap post-construction.
     attestation_report_hash: Bytes32Hex
+    # Symmetric to evaluator_storage_root: backend retrieval locator
+    # for the attestation report bytes.
+    attestation_storage_root: Bytes32Hex
 
     # Attestation signature material (NOT in canonical signing payload, spec §6.3).
     # Cached for offline verification; integrity is established by the Step 5
@@ -75,9 +98,11 @@ class EnhancedReceipt(BaseModel):
 
     SIGNING_PAYLOAD_FIELDS: ClassVar[tuple[str, ...]] = (
         "attestation_report_hash",
+        "attestation_storage_root",
         "chat_id",
         "created_at",
         "evaluator_id",
+        "evaluator_storage_root",
         "evaluator_version",
         "extensions",
         "input_commitment",
@@ -85,12 +110,15 @@ class EnhancedReceipt(BaseModel):
         "previous_receipt_id",
         "provider_address",
         "response_content",
+        "spec_version",
     )
 
     SIGNING_PAYLOAD_HEX_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
             "attestation_report_hash",
+            "attestation_storage_root",
             "evaluator_id",
+            "evaluator_storage_root",
             "input_commitment",
             "previous_receipt_id",
             "provider_address",
@@ -135,17 +163,20 @@ class EnhancedReceipt(BaseModel):
         *,
         created_at: datetime,
         evaluator_id: Bytes32Hex,
+        evaluator_storage_root: Bytes32Hex,
         evaluator_version: str,
         provider_address: Address,
         chat_id: str,
         response_content: str,
         attestation_report_hash: Bytes32Hex,
+        attestation_storage_root: Bytes32Hex,
         enclave_pubkey: BytesHex,
         enclave_signature: BytesHex,
         input_commitment: Bytes32Hex | None = None,
         previous_receipt_id: Bytes32Hex | None = None,
         output_score_block: dict[str, Any] | None = None,
         extensions: dict[str, Any] | None = None,
+        spec_version: str = SPEC_VERSION,
     ) -> EnhancedReceipt:
         """Construct a receipt with receipt_id derived from the canonical
         signing payload."""
@@ -153,6 +184,7 @@ class EnhancedReceipt(BaseModel):
             "chat_id": chat_id,
             "created_at": created_at,
             "evaluator_id": evaluator_id,
+            "evaluator_storage_root": evaluator_storage_root,
             "evaluator_version": evaluator_version,
             "input_commitment": input_commitment,
             "previous_receipt_id": previous_receipt_id,
@@ -160,12 +192,30 @@ class EnhancedReceipt(BaseModel):
             "response_content": response_content,
             "output_score_block": output_score_block,
             "attestation_report_hash": attestation_report_hash,
+            "attestation_storage_root": attestation_storage_root,
             "enclave_pubkey": enclave_pubkey,
             "enclave_signature": enclave_signature,
             "extensions": extensions,
+            "spec_version": spec_version,
         }
         payload = cls._payload_from_source(all_fields)
         return cls(receipt_id=derive_receipt_id(payload), **all_fields)
+
+    @model_validator(mode="after")
+    def _verify_spec_version(self) -> EnhancedReceipt:
+        # Strict equality (not >=): a future v0.6 implementation would
+        # add this validator with `SPEC_VERSION = "0.6"` and refuse v0.5
+        # receipts. Asymmetric break documented in §10.2.
+        if self.spec_version != SPEC_VERSION:
+            raise VerificationError(
+                step=1,
+                reason=(
+                    f"spec_version mismatch: this implementation produces "
+                    f"and verifies {SPEC_VERSION!r}, receipt declares "
+                    f"{self.spec_version!r}"
+                ),
+            )
+        return self
 
     @model_validator(mode="after")
     def _verify_receipt_id(self) -> EnhancedReceipt:
