@@ -59,3 +59,13 @@ check_untyped_defs = true
 # convention; their public surface is stable and well-documented.
 module = ["eth_keys", "eth_keys.*", "eth_utils", "eth_utils.*"]
 implicit_reexport = true
+
+[[tool.mypy.overrides]]
+# jig is fully typed in source but ships without a `py.typed` marker as of
+# this writing. `follow_untyped_imports` tells mypy to read jig's actual
+# source rather than treating it as Any — necessary so we can subclass
+# `LLMClient` / `LLMResponse` (subclassing Any raises `Class cannot
+# subclass "..." (has type "Any")`). Once jig publishes a typed release we
+# can drop this override and the import resolves directly.
+module = ["jig", "jig.*"]
+follow_untyped_imports = true
