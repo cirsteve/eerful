@@ -32,6 +32,7 @@ from pathlib import Path
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.verify import verify_through_step_3
+from eerful.zg.bridge_init import bridge_init
 from eerful.zg.compute import ComputeClient
 from eerful.zg.storage import BridgeStorageClient
 
@@ -64,26 +65,16 @@ def main() -> int:
     with ComputeClient(bridge_url=bridge_url) as client, BridgeStorageClient(
         bridge_url=bridge_url
     ) as storage:
-        # ---- Step 0: health
-        h = client.healthz()
-        print(f"  bridge wallet={h['wallet']} chain={h['chain_id']}")
-
-        # ---- Step 1a: ensure ledger sub-account exists / top up
-        # Default 1.1: just above the broker's MIN_LOCKED_BALANCE = 1 0G,
-        # with a small buffer for the inference fee. Smaller values fail
-        # at the inference call with "balance below minimum lock".
-        ledger_amount = float(os.environ.get("EERFUL_0G_LEDGER_DEPOSIT", "1.1"))
-        ledger = client.add_ledger(ledger_amount)
+        # ---- Steps 0-1b: cold-boot dance (healthz + add_ledger + acknowledge)
+        status = bridge_init(client, provider_address)
+        print(f"  bridge wallet={status.wallet} chain={status.chain_id}")
         print(
-            f"  ledger: created={ledger['created']} "
-            f"balance={ledger['total_balance_0g']:.4f} 0G"
+            f"  ledger: created={status.ledger_created} "
+            f"balance={status.total_balance_0g:.4f} 0G"
         )
-
-        # ---- Step 1b: acknowledge (idempotent)
-        ack = client.acknowledge(provider_address)
         print(
-            f"  acknowledge: tee_signer={ack['tee_signer_address']} "
-            f"already={ack['already_acknowledged']}"
+            f"  acknowledge: tee_signer={status.tee_signer_address} "
+            f"already={status.already_acknowledged}"
         )
 
         # ---- Step 2: bundle

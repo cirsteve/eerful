@@ -135,6 +135,16 @@ class ComputeClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    @property
+    def bridge_url(self) -> str:
+        """The bridge base URL this client is bound to (trailing slash
+        stripped). Read-only — `ComputeClient` is single-bridge by
+        design; rebind by constructing a new client. Callers like
+        `bridge_init` use this for error messages so the message
+        always names the URL we actually talk to, not whatever the
+        caller passed."""
+        return self._bridge_url
+
     # ---------------- bridge endpoints ----------------
 
     def healthz(self) -> dict[str, Any]:

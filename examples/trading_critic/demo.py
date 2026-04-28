@@ -41,6 +41,7 @@ from eerful.commitment import SaltStore, compute_input_commitment, generate_salt
 from eerful.errors import ComputeError
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
+from eerful.zg.bridge_init import bridge_init
 from eerful.zg.compute import ComputeClient, ComputeResult
 from eerful.zg.storage import BridgeStorageClient, StorageClient
 
@@ -373,34 +374,25 @@ def main(argv: list[str] | None = None) -> int:
     salt_store = SaltStore(_SALT_STORE_PATH)
 
     with ComputeClient(bridge_url=bridge_url) as compute:
-        # R-D1.2 cold-boot guard: surface bridge-down errors with a
-        # pointer to the README rather than a raw connection-refused
-        # traceback. Done immediately so we don't burn the broker
-        # acknowledge call before realizing the bridge isn't up.
+        # R-D1.2 cold-boot guard: bridge_init re-raises ComputeError
+        # with a message pointing at the bridge README, so a
+        # connection-refused / wallet-not-loaded failure surfaces with
+        # the recovery action rather than a raw traceback. Done
+        # immediately so we don't burn the broker acknowledge call
+        # before realizing the bridge isn't up.
         try:
-            h = compute.healthz()
+            status = bridge_init(compute, provider_address)
         except ComputeError as e:
-            print(
-                f"  ✗ bridge not reachable at {bridge_url}\n"
-                f"      {e}\n"
-                f"      see services/zg-bridge/README.md and run `npm run dev`",
-                file=sys.stderr,
-            )
+            print(f"  ✗ {e}", file=sys.stderr)
             return 2
-        print(f"  bridge wallet={h['wallet']} chain={h['chain_id']}")
-
-        # Idempotent: add_ledger tops up if the sub-account exists, no-ops
-        # the funding step otherwise. acknowledge no-ops if already done.
-        ledger_amount = float(os.environ.get("EERFUL_0G_LEDGER_DEPOSIT", "1.1"))
-        ledger = compute.add_ledger(ledger_amount)
+        print(f"  bridge wallet={status.wallet} chain={status.chain_id}")
         print(
-            f"  ledger: created={ledger['created']} "
-            f"balance={ledger['total_balance_0g']:.4f} 0G"
+            f"  ledger: created={status.ledger_created} "
+            f"balance={status.total_balance_0g:.4f} 0G"
         )
-        ack = compute.acknowledge(provider_address)
         print(
-            f"  acknowledge: tee_signer={ack['tee_signer_address']} "
-            f"already={ack['already_acknowledged']}"
+            f"  acknowledge: tee_signer={status.tee_signer_address} "
+            f"already={status.already_acknowledged}"
         )
 
         with BridgeStorageClient(bridge_url=bridge_url) as storage:
