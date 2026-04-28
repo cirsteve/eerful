@@ -154,7 +154,9 @@ class EvaluationGrader(Grader[Any]):
                 metadata={
                     "eer_receipt_id": receipt.receipt_id,
                     "eer_evaluator_id": receipt.evaluator_id,
+                    "eer_evaluator_storage_root": receipt.evaluator_storage_root,
                     "eer_attestation_report_hash": receipt.attestation_report_hash,
+                    "eer_attestation_storage_root": receipt.attestation_storage_root,
                     # tags include the receipt_id so a later
                     # FeedbackQuery(tags=[receipt_id]) finds this row.
                     "tags": ["eer", receipt.receipt_id],

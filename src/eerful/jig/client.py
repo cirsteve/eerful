@@ -49,7 +49,7 @@ from eerful.errors import EvaluationClientError
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.zg.compute import ComputeResult
-from eerful.zg.storage import StorageClient
+from eerful.zg.storage import StorageClient, UploadResult
 
 
 class _ComputeProtocol(Protocol):
@@ -119,6 +119,7 @@ class EvaluationClient(LLMClient):
         salt_store: SaltStore | None = None,
         commit_inputs: bool = False,
         previous_receipt_id: Bytes32Hex | None = None,
+        evaluator_storage_root: Bytes32Hex | None = None,
     ) -> None:
         # Fail fast on a stale or wrong `evaluator_id`. A mismatched
         # value would silently produce receipts whose Step 2 verification
@@ -141,6 +142,30 @@ class EvaluationClient(LLMClient):
         self._salt_store = salt_store
         self._commit_inputs_default = commit_inputs
         self._previous_receipt_id = previous_receipt_id
+        # Resolve the bundle's storage_root: either trust the caller's
+        # override (publish-evaluator already uploaded; we have the root
+        # from the side-file or environment) or upload on construction.
+        # Bundle bytes are small (<4KB) and `getOrUpload` short-circuits
+        # on cache hit, so the construct-time upload is effectively free
+        # for re-runs. The override path keeps tests (and producers who
+        # don't have storage at construct time) ergonomic.
+        if evaluator_storage_root is None:
+            upload = storage.upload_blob(bundle.canonical_bytes())
+            if upload.content_hash != evaluator_id:
+                raise EvaluationClientError(
+                    f"bundle upload returned content_hash {upload.content_hash} "
+                    f"but bundle.evaluator_id()={evaluator_id} (canonical "
+                    "encoder drift or storage byte tampering)"
+                )
+            self._evaluator_storage_root: Bytes32Hex = upload.storage_root
+        else:
+            canonical = to_lower_hex(evaluator_storage_root)
+            if not is_bytes32_hex(canonical):
+                raise EvaluationClientError(
+                    f"evaluator_storage_root must be 0x-prefixed 64-char hex, "
+                    f"got {evaluator_storage_root!r}"
+                )
+            self._evaluator_storage_root = canonical
         # Per-instance lock serializes `complete()` calls so the
         # auto-chain pattern (`self._previous_receipt_id` read at start,
         # write at end) is concurrency-safe. Without this, two
@@ -208,14 +233,14 @@ class EvaluationClient(LLMClient):
             # matches what TeeML reported — the bridge already content-checks
             # but Step 4-style attribution belongs here too (this is the
             # producer side; the verifier runs the symmetric check).
-            report_hash_storage = await asyncio.to_thread(
+            report_upload: UploadResult = await asyncio.to_thread(
                 self._storage.upload_blob, result.attestation_report_bytes
             )
-            if report_hash_storage != result.attestation_report_hash:
+            if report_upload.content_hash != result.attestation_report_hash:
                 raise EvaluationClientError(
                     f"attestation report hash mismatch after upload: "
                     f"compute reported {result.attestation_report_hash}, "
-                    f"storage returned {report_hash_storage}"
+                    f"storage returned {report_upload.content_hash}"
                 )
 
             input_commitment = self._compute_commitment_or_none(
@@ -226,11 +251,13 @@ class EvaluationClient(LLMClient):
             receipt = EnhancedReceipt.build(
                 created_at=datetime.now(timezone.utc),
                 evaluator_id=self._evaluator_id,
+                evaluator_storage_root=self._evaluator_storage_root,
                 evaluator_version=self._bundle.version,
                 provider_address=self._provider_address,
                 chat_id=result.chat_id,
                 response_content=result.response_content,
                 attestation_report_hash=result.attestation_report_hash,
+                attestation_storage_root=report_upload.storage_root,
                 enclave_pubkey=result.enclave_pubkey,
                 enclave_signature=result.enclave_signature,
                 input_commitment=input_commitment,

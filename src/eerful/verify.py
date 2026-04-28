@@ -170,7 +170,10 @@ def verify_step_4_attestation_report(
        cheap insurance against an adapter that forgets.
     """
     try:
-        data = storage.download_blob(receipt.attestation_report_hash)
+        data = storage.download_blob(
+            receipt.attestation_report_hash,
+            receipt.attestation_storage_root,
+        )
     except TrustViolation as e:
         raise VerificationError(
             step=4,
@@ -212,7 +215,10 @@ def fetch_evaluator_bundle_bytes(
     the pure step functions stay I/O-free.
     """
     try:
-        return storage.download_blob(receipt.evaluator_id)
+        return storage.download_blob(
+            receipt.evaluator_id,
+            receipt.evaluator_storage_root,
+        )
     except TrustViolation as e:
         raise VerificationError(
             step=2,
