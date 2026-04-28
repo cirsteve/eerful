@@ -97,15 +97,27 @@ class EvaluationClient(LLMClient):
     """jig `LLMClient` bound to an `EvaluatorBundle`. Every call produces
     a verifying receipt as a side effect.
 
-    Construction is cheap (no network). Holds references to a
-    `ComputeClient` (the bridge wrapper) and a `StorageClient` (for
-    attestation report upload at receipt-build time). Both stay owned
-    by the caller — `EvaluationClient` does not close them.
+    Holds references to a `ComputeClient` (the bridge wrapper) and a
+    `StorageClient` (for attestation report upload at receipt-build
+    time, and — by default — for the bundle upload that resolves
+    `evaluator_storage_root`). Both stay owned by the caller —
+    `EvaluationClient` does not close them.
 
-    The bound `bundle` and `evaluator_id` MUST be consistent — the
-    caller is responsible for hashing the bundle's canonical bytes and
-    publishing them to Storage before constructing this client. Use
-    `eerful publish-evaluator` to do both in one shot.
+    Construction performs ONE storage round-trip by default: the
+    bundle's canonical bytes are uploaded so the resulting
+    `evaluator_storage_root` (the backend retrieval locator, spec
+    §6.1) is available for every receipt this client produces.
+    `getOrUpload`-style backends short-circuit on cache hit so
+    re-runs are effectively free. Pass `evaluator_storage_root=` to
+    skip the upload entirely — the offline/override path for tests,
+    for producers who already published via `eerful publish-evaluator`
+    and have the value cached in `<bundle>.published.json`, or for
+    any flow that wants construction to be no-network.
+
+    The bound `bundle` and `evaluator_id` MUST be consistent — when
+    `evaluator_storage_root` is left unset, the constructor verifies
+    `storage.upload_blob(canonical_bytes).content_hash == evaluator_id`
+    and raises `TrustViolation` on mismatch.
     """
 
     def __init__(
