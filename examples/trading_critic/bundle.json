@@ -19,10 +19,15 @@
     "max_tokens": 2000
   },
   "accepted_compose_hashes": [
-    "0x0000000000000000000000000000000000000000000000000000000000000000"
+    {
+      "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "category": "A",
+      "provider_address": "0xd9966e13a6026fcca4b13e7ff95c94de268c471c",
+      "notes": "placeholder; replace with live compose-hash via bundle_inspect.py before publishing"
+    }
   ],
   "metadata": {
-    "demo_provider": "0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C",
+    "demo_provider": "0xd9966e13a6026fcca4b13e7ff95c94de268c471c",
     "input_commitment_construction": "sha256(canonical_json({\"strategy_identity\": <str>}) || evaluator_id || salt) per spec §6.7",
     "compose_hash_placeholder": "The accepted_compose_hashes value 0x000...000 is a syntactic placeholder. Run examples/trading_critic/bundle_inspect.py against Provider 1 and paste the live compose-hash before publishing. The bundle MUST be republished after each compose-hash rotation."
   }

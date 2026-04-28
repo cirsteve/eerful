@@ -27,9 +27,24 @@ from eth_utils import keccak
 
 from eerful.cli import _is_loopback_bridge_url, _publish_evaluator, main
 from eerful.errors import StorageError, TrustViolation
-from eerful.evaluator import EvaluatorBundle
+from eerful.evaluator import ComposeHashEntry, EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.zg.storage import MockStorageClient, UploadResult
+
+
+_PROVIDER_ADDR = "0x" + "d" * 40
+
+
+def _entry_dict(hash_hex: str, *, category: str = "A") -> dict[str, Any]:
+    """Wire-format ComposeHashEntry for `_bundle_bytes` callers — the JSON
+    that `EvaluatorBundle.model_validate_json` expects when the input is
+    a hand-rolled bundle dict (not a model)."""
+    return {
+        "hash": hash_hex,
+        "category": category,
+        "provider_address": _PROVIDER_ADDR,
+        "notes": None,
+    }
 
 
 def _bundle_bytes(**overrides: Any) -> bytes:
@@ -145,8 +160,8 @@ def test_publish_evaluator_dry_run_surfaces_allowlist_count(tmp_path: Path) -> N
     bundle_path.write_bytes(
         _bundle_bytes(
             accepted_compose_hashes=[
-                "0x" + "a" * 64,
-                "0x" + "b" * 64,
+                _entry_dict("0x" + "a" * 64),
+                _entry_dict("0x" + "b" * 64),
             ]
         )
     )
@@ -390,7 +405,12 @@ def _make_receipt_and_artifacts(
         system_prompt="rate it",
     )
     if accepted_compose_hashes is not None:
-        bundle_kwargs["accepted_compose_hashes"] = accepted_compose_hashes
+        bundle_kwargs["accepted_compose_hashes"] = [
+            ComposeHashEntry(
+                hash=h, category="A", provider_address=_PROVIDER_ADDR
+            )
+            for h in accepted_compose_hashes
+        ]
     bundle = EvaluatorBundle(**bundle_kwargs)
     bundle_canonical = bundle.canonical_bytes()
     report_bytes, _ = _build_report_bytes()

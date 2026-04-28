@@ -12,7 +12,64 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from eerful.canonical import Bytes32Hex, canonical_json_bytes, is_bytes32_hex
+from eerful.canonical import Address, Bytes32Hex, canonical_json_bytes, is_address, is_bytes32_hex
+from eerful.zg.attestation import DeclaredComposeCategory
+
+
+class ComposeHashEntry(BaseModel):
+    """Publisher-declared entry in a bundle's `accepted_compose_hashes`
+    allowlist (spec §6.5).
+
+    Each entry asserts that a known compose-hash falls in a known §8.2
+    category and was published by a known provider. The publisher
+    classifies the category at bundle-publication time; verifiers MUST
+    treat the publisher's declaration as the authority. The diagnostic
+    returned by `categorize_compose` is a sanity check, not a substitute.
+
+    Cryptographically committed via the bundle's `evaluator_id` (sha256 of
+    canonical bundle JSON) — restructuring the entry shape changes every
+    receipt's `evaluator_id` derivation.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    hash: Bytes32Hex
+    """Lowercase 0x-prefixed sha256(app_compose) — the attested
+    compose-hash that Step 5 looks up for gating."""
+
+    category: DeclaredComposeCategory
+    """Publisher's §8.2 classification. The PrincipalPolicy's
+    `required_categories` filters on this field at gate time. Narrower
+    than `Step5Result.category` (which is the diagnostic from
+    `categorize_compose` and may be 'unknown'); a publisher knows their
+    own compose and must commit to A/B/C."""
+
+    provider_address: Address
+    """0G compute provider hosting this compose. Informational on the
+    bundle side; load-bearing on the executor's diversity rules
+    (`distinct_compose_hashes`)."""
+
+    notes: str | None = None
+    """Publisher-supplied human-readable annotation (e.g. 'vLLM --model
+    zai-org/GLM-5-FP8'). Not parsed."""
+
+    @model_validator(mode="after")
+    def _validate_invariants(self) -> ComposeHashEntry:
+        """Enforce length invariants the BeforeValidator can't express.
+
+        `Bytes32Hex` and `Address` lowercase but don't bound length; without
+        this check, a 31-byte hash or 19-byte address would propagate into
+        Step 5's lookup and the executor's diversity comparisons.
+        """
+        if not is_bytes32_hex(self.hash):
+            raise ValueError(
+                f"hash is not a valid 32-byte hex string: {self.hash!r}"
+            )
+        if not is_address(self.provider_address):
+            raise ValueError(
+                f"provider_address is not a valid 20-byte hex EVM address: {self.provider_address!r}"
+            )
+        return self
 
 
 class EvaluatorBundle(BaseModel):
@@ -37,30 +94,37 @@ class EvaluatorBundle(BaseModel):
     """Producer-recommended inference parameters (temperature, max_tokens, etc.).
     Not enforced at the protocol level — the TEE doesn't attest to them."""
 
-    accepted_compose_hashes: list[Bytes32Hex] | None = None
-    """Allowlist of attested compose-hashes (spec §6.5, §8.3). When set,
-    verification Step 5 fails if the report's compose-hash is not in this
-    list. The strongest defense against the §8 model-binding gap that the
-    receipt format alone can offer.
+    accepted_compose_hashes: list[ComposeHashEntry] | None = None
+    """Allowlist of attested composes (spec §6.5, §8.3). When set,
+    verification Step 5 fails if the report's compose-hash is not in any
+    entry. Each entry carries the publisher's §8.2 category declaration
+    and the provider address it was published from — the executor's
+    `required_categories` and `distinct_compose_hashes` rules read
+    those fields at gate time.
 
     Canonicalization: `None` means "no allowlist, no gating"; a populated
-    list means "gate Step 5 on these hashes". An empty list is rejected at
-    construction so there is exactly one canonical form for "no gating"
-    (mirrors §10.1's `extensions={}` → `null` policy). Without this rule,
-    `None` and `[]` would canonical-JSON-encode differently (`null` vs `[]`)
-    and produce diverging `evaluator_id`s for what publishers intend as the
-    same bundle."""
+    list means "gate Step 5 on these entries". An empty list is rejected
+    at construction so there is exactly one canonical form for "no
+    gating" (mirrors §10.1's `extensions={}` → `null` policy). Without
+    this rule, `None` and `[]` would canonical-JSON-encode differently
+    (`null` vs `[]`) and produce diverging `evaluator_id`s for what
+    publishers intend as the same bundle."""
 
     metadata: dict[str, Any] | None = None
     """Publisher-defined; informational."""
 
     @model_validator(mode="after")
     def _validate_accepted_compose_hashes(self) -> EvaluatorBundle:
-        """Enforce the §6.5 / §6.4 invariants the type alias can't express:
+        """Enforce the §6.5 list-level invariants the type alias can't express:
 
-        - Each entry is a syntactically valid `Bytes32Hex` (the
-          `BeforeValidator` lowercases but does not bound length).
         - The list is non-empty when present (canonical-form rule above).
+        - Each `hash` is unique across entries. Step 5 selects the first
+          matching entry (`verify.py`'s `next(...)` lookup); duplicates
+          would make category/provider resolution order-dependent and let
+          a publisher silently reclassify the same compose by re-listing
+          it with different metadata.
+
+        Per-entry hash and address shape is enforced by `ComposeHashEntry`.
         """
         items = self.accepted_compose_hashes
         if items is None:
@@ -70,11 +134,14 @@ class EvaluatorBundle(BaseModel):
                 "accepted_compose_hashes must be omitted (None) rather than empty; "
                 "an empty list has no canonical form (see §6.5 docstring)."
             )
-        for h in items:
-            if not is_bytes32_hex(h):
+        seen: set[str] = set()
+        for entry in items:
+            if entry.hash in seen:
                 raise ValueError(
-                    f"accepted_compose_hashes entry is not a valid Bytes32Hex: {h!r}"
+                    f"accepted_compose_hashes contains duplicate hash {entry.hash}; "
+                    "each compose-hash must map to exactly one entry."
                 )
+            seen.add(entry.hash)
         return self
 
     def canonical_bytes(self) -> bytes:

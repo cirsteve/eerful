@@ -37,11 +37,11 @@ from typing import Literal
 
 import jsonschema
 from eth_keys.exceptions import BadSignature, ValidationError as EthKeysValidationError
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from eerful.canonical import Bytes32Hex
 from eerful.errors import StorageError, TrustViolation, VerificationError
-from eerful.evaluator import EvaluatorBundle
+from eerful.evaluator import ComposeHashEntry, EvaluatorBundle
 from eerful.receipt import EnhancedReceipt, derive_receipt_id
 from eerful.zg.attestation import (
     ComposeCategory,
@@ -63,15 +63,44 @@ class Step5Result(BaseModel):
     """What Step 5's compose-hash subset establishes.
 
     `gating` reflects the §6.5 binary: `enforced` only when the bundle
-    populated `accepted_compose_hashes` AND the attested hash was in it;
-    `skipped` otherwise. `category` is the §8.2 diagnostic — informational,
-    not a gate."""
+    populated `accepted_compose_hashes` AND the attested hash matched an
+    entry; `skipped` otherwise.
+
+    `category` is the §8.2 diagnostic from `categorize_compose` — a heuristic
+    look at the actual compose, kept separate from the publisher's
+    declaration on `declared_entry.category`. The two should normally agree;
+    a divergence is informational ("publisher claims A, heuristic says B")
+    and warrants surfacing in CLI output but is not itself a gate failure.
+
+    `declared_entry` is the matched `ComposeHashEntry` from the bundle
+    when `gating="enforced"`, `None` when `gating="skipped"`. The executor's
+    category and provider-diversity rules consume this field."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     compose_hash: Bytes32Hex
     gating: ComposeHashGating
     category: ComposeCategory
+    declared_entry: ComposeHashEntry | None = None
+
+    @model_validator(mode="after")
+    def _validate_gating_declared_entry_invariant(self) -> Step5Result:
+        """Pin the (gating, declared_entry) cross-field invariant the type
+        alone can't express. `enforced` means the bundle's allowlist matched
+        the attested compose-hash → an entry was selected. `skipped` means
+        no allowlist was declared → no entry to surface. Without this,
+        downstream consumers (executor's `required_categories` /
+        `distinct_compose_hashes` rules) would have to defensively re-check
+        what construction already established."""
+        if self.gating == "enforced" and self.declared_entry is None:
+            raise ValueError(
+                "Step5Result invariant: gating='enforced' requires declared_entry"
+            )
+        if self.gating == "skipped" and self.declared_entry is not None:
+            raise ValueError(
+                "Step5Result invariant: gating='skipped' requires declared_entry=None"
+            )
+        return self
 
 
 class VerificationResult(BaseModel):
@@ -265,8 +294,10 @@ def verify_step_5_compose_hash_gating(
             compose_hash=parsed.compose_hash,
             gating="skipped",
             category=category,
+            declared_entry=None,
         )
-    if parsed.compose_hash not in allowlist:
+    matched = next((e for e in allowlist if e.hash == parsed.compose_hash), None)
+    if matched is None:
         raise VerificationError(
             step=5,
             reason=(
@@ -278,6 +309,7 @@ def verify_step_5_compose_hash_gating(
         compose_hash=parsed.compose_hash,
         gating="enforced",
         category=category,
+        declared_entry=matched,
     )
 
 

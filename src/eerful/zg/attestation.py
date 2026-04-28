@@ -36,10 +36,20 @@ from eerful.canonical import Bytes32Hex, to_lower_hex
 from eerful.errors import VerificationError
 
 ComposeCategory = Literal["A", "B", "C", "unknown"]
-"""§8.2 categorization of an attested compose. A: bound launch string;
-B: unrelated compose; C: centralized passthrough; unknown: heuristics
-inconclusive. Diagnostic only — the only protocol-level gate is
+"""§8.2 categorization of an attested compose, as observed by the
+heuristic `categorize_compose`. A: bound launch string; B: unrelated
+compose; C: centralized passthrough; unknown: heuristics inconclusive.
+Diagnostic only — the only protocol-level gate is
 `accepted_compose_hashes` (§6.5)."""
+
+
+DeclaredComposeCategory = Literal["A", "B", "C"]
+"""§8.2 categorization as declared by a bundle publisher in
+`ComposeHashEntry.category`. Narrower than `ComposeCategory` because
+'unknown' is a heuristic-only outcome — a publisher classifying their
+own compose at publish time has full knowledge and must commit to A/B/C.
+Allowing 'unknown' would let a publisher quietly bypass the executor's
+`required_categories` enforcement (PR 2)."""
 
 
 class ParsedAttestationReport(BaseModel):
