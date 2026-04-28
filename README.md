@@ -19,13 +19,15 @@ The protocol is **EER**. The reference implementation is **eerful**.
 ## What's in the box
 
 - `eerful` Python package — produces and verifies EERs per the spec
+- `eerful.commitment` — §6.7 input-commitment construction +
+  producer-side `SaltStore` for the chain pattern
 - `eerful.zg` — 0G TeeML inference + 0G Storage adapters
 - `eerful.jig` — adapters that let any [jig](https://github.com/rankonelabs/jig)
   agent produce EERs as part of its evaluation flow
-- `eerful` CLI — `verify`, `publish-evaluator`, `evaluate`
-- Two example evaluators with runnable demos:
-  - Trading-strategy critic (three-round iteration with chained receipts)
-  - Prompt evaluation (generality proof)
+- `eerful` CLI — `verify`, `publish-evaluator`
+- `services/zg-bridge/` — TypeScript HTTP service that wraps the 0G
+  broker + storage SDKs (the Python adapters drive it locally over
+  loopback). See [`services/zg-bridge/README.md`](services/zg-bridge/README.md).
 
 ## Install
 
@@ -36,15 +38,44 @@ uv sync
 Requires Python 3.12 and a 0G Galileo testnet wallet with faucet funds for
 real TeeML calls and Storage uploads.
 
+For producing receipts AND for the default verify path (which fetches
+artifacts from 0G Storage), also start the bridge — see
+[`services/zg-bridge/README.md`](services/zg-bridge/README.md) for
+`npm install` + env vars. Fully-offline verification with `--bundle`,
+`--report`, and `--skip-step-5` flags can avoid the bridge entirely.
+
+The bridge listens on `127.0.0.1:7878` by default; the `eerful` CLI
+refuses non-loopback bridge URLs unless you pass `--allow-remote-bridge`.
+Library callers using `BridgeStorageClient` / `ComputeClient` directly
+accept any URL — the loopback guard is CLI-only.
+
 ## Quick verify
 
 ```bash
 eerful verify path/to/receipt.json
 ```
 
-The verifier fetches the evaluator bundle and attestation report from 0G
-Storage, runs the seven-step verification algorithm (spec §7), and prints a
-verdict plus the structured score block.
+The verifier fetches the evaluator bundle and attestation report from
+0G Storage by content hash (via the local `services/zg-bridge/`), runs
+the §7.1 verification algorithm (Steps 1–6, with Step 5 in compose-hash
+gating mode per §6.5), and prints a verdict plus the structured score
+block. Step 7 (provider crosscheck) is deferred; full Step 5 (TDX/NVIDIA
+chain to vendor roots) requires the dstack-verifier integration that's
+out of scope for v0.4.
+
+**Known limitation (cross-instance fetch):** the bridge can only fetch
+content_hashes its own `uploadIndex` has seen — it can't recover the
+0G rootHash from a sha256 alone. So a verifier on a fresh bridge
+instance can't fetch a bundle that was uploaded by a different bridge
+process. Workarounds today: (a) producer + verifier share a bridge,
+(b) re-upload the bytes through the verifier's bridge to repopulate
+the index, or (c) use `--bundle` / `--report` with local files. A
+fix is planned (see `services/zg-bridge/README.md` Limitations).
+
+`--bundle <path>` and `--report <path>` override individual artifacts
+with local files (offline verification, cached blobs, or working around
+the cross-instance limitation above); `--skip-step-5` skips the report
+fetch entirely.
 
 ## What an EER proves (and doesn't)
 
@@ -76,8 +107,9 @@ spectrum:
 EER's protocol-level mitigation is the **`accepted_compose_hashes`** allowlist
 (spec §6.5): an evaluator publisher pins the compose-hashes of providers whose
 configuration they have inspected; verification fails closed when the attested
-hash isn't in the list. Verifiers running `eerful verify --report ...` get the
-category and gating status surfaced on stdout.
+hash isn't in the list. `eerful verify` surfaces the §8 category and gating
+status (`enforced` / `skipped`) on stdout by default — the report is fetched
+from storage automatically.
 
 Read §2 and §8 before relying on receipts. The spec is deliberate about what
 an EER does and does not cryptographically establish.
