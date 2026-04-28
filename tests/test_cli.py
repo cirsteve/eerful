@@ -29,7 +29,7 @@ from eerful.cli import _is_loopback_bridge_url, _publish_evaluator, main
 from eerful.errors import StorageError, TrustViolation
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
-from eerful.zg.storage import MockStorageClient
+from eerful.zg.storage import MockStorageClient, UploadResult
 
 
 def _bundle_bytes(**overrides: Any) -> bytes:
@@ -48,11 +48,14 @@ def _bundle_bytes(**overrides: Any) -> bytes:
 def test_publish_evaluator_uploads_canonical_bytes_and_returns_evaluator_id():
     bundle_bytes = _bundle_bytes()
     storage = MockStorageClient()
-    eid, bundle = _publish_evaluator(bundle_bytes, storage)
+    eid, sroot, bundle = _publish_evaluator(bundle_bytes, storage)
     assert eid == bundle.evaluator_id()
+    # Mock invariant: storage_root == content_hash; tier 2 contract is that
+    # the publisher gets a non-None storage_root back.
+    assert sroot == eid
     # Storage should hold the *canonical* encoding, not the input bytes
     # (the input may not be canonical-form JSON).
-    assert storage.download_blob(eid) == bundle.canonical_bytes()
+    assert storage.download_blob(eid, sroot) == bundle.canonical_bytes()
 
 
 def test_publish_evaluator_idempotent_uploads_dont_duplicate():
@@ -60,10 +63,11 @@ def test_publish_evaluator_idempotent_uploads_dont_duplicate():
     download still works after the second call."""
     bundle_bytes = _bundle_bytes()
     storage = MockStorageClient()
-    eid1, _ = _publish_evaluator(bundle_bytes, storage)
-    eid2, _ = _publish_evaluator(bundle_bytes, storage)
+    eid1, sroot1, _ = _publish_evaluator(bundle_bytes, storage)
+    eid2, sroot2, _ = _publish_evaluator(bundle_bytes, storage)
     assert eid1 == eid2
-    assert storage.download_blob(eid1) is not None
+    assert sroot1 == sroot2
+    assert storage.download_blob(eid1, sroot1) is not None
 
 
 def test_publish_evaluator_rejects_storage_hash_mismatch():
@@ -72,10 +76,11 @@ def test_publish_evaluator_rejects_storage_hash_mismatch():
     publisher and storage, or storage tampered with bytes mid-flight."""
 
     class _LyingStorage:
-        def upload_blob(self, data: bytes) -> str:
-            return "0x" + "0" * 64  # always lies
+        def upload_blob(self, data: bytes) -> UploadResult:
+            bogus = "0x" + "0" * 64
+            return UploadResult(content_hash=bogus, storage_root=bogus)
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise NotImplementedError
 
     with pytest.raises(TrustViolation, match="canonical encoder drift|tampering"):
@@ -87,10 +92,10 @@ def test_publish_evaluator_propagates_storage_errors():
     CLI dispatcher catches them at the boundary."""
 
     class _BrokenStorage:
-        def upload_blob(self, data: bytes) -> str:
+        def upload_blob(self, data: bytes) -> UploadResult:
             raise StorageError("bridge offline")
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise NotImplementedError
 
     with pytest.raises(StorageError, match="bridge offline"):
@@ -264,14 +269,16 @@ def test_publish_evaluator_remote_with_opt_in_passes_guard(
         def __exit__(self, *_: object) -> None:
             return None
 
-        def upload_blob(self, data: bytes) -> str:
+        def upload_blob(self, data: bytes) -> UploadResult:
             # Return the canonical hash so _publish_evaluator's
             # defense-in-depth check passes; we want to verify the
-            # guard, not exercise upload-mismatch handling.
+            # guard, not exercise upload-mismatch handling. Mirror
+            # the mock's storage_root == content_hash convention.
             bundle = EvaluatorBundle.model_validate_json(data)
-            return bundle.evaluator_id()
+            eid = bundle.evaluator_id()
+            return UploadResult(content_hash=eid, storage_root=eid)
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise NotImplementedError
 
     monkeypatch.setattr("eerful.cli.BridgeStorageClient", _FakeBridge)
@@ -371,7 +378,12 @@ def _make_receipt_and_artifacts(
     accepted_compose_hashes: list[str] | None = None,
 ) -> tuple[EnhancedReceipt, bytes, bytes]:
     """Build a verifying receipt + the bundle bytes + the report bytes
-    that storage should hold for the verify subcommand to succeed."""
+    that storage should hold for the verify subcommand to succeed.
+
+    Mock convention: `storage_root == content_hash` for both
+    artifacts, so the receipt's `evaluator_storage_root` /
+    `attestation_storage_root` equal `evaluator_id` /
+    `attestation_report_hash`."""
     bundle_kwargs: dict[str, Any] = dict(
         version="trading-critic@1.0.0",
         model_identifier="zai-org/GLM-5-FP8",
@@ -388,11 +400,13 @@ def _make_receipt_and_artifacts(
     receipt = EnhancedReceipt.build(
         created_at=datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc),
         evaluator_id=bundle.evaluator_id(),
+        evaluator_storage_root=bundle.evaluator_id(),
         evaluator_version=bundle.version,
         provider_address="0x" + "b" * 40,
         chat_id="chat-123",
         response_content="hello",
         attestation_report_hash=rh,
+        attestation_storage_root=rh,
         enclave_pubkey=pubkey,
         enclave_signature=sig,
     )

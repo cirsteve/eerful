@@ -88,7 +88,9 @@ async def test_pipeline_grader_persists_receipt_metadata_through_feedback_and_tr
     assert llm_span.metadata["eerful.receipt_id"] == md["eer_receipt_id"]
     # Attestation report bytes are in storage at the receipt's hash;
     # the report fetch + re-hash is what offline verify needs at Step 4.
-    fetched = storage.download_blob(md["eer_attestation_report_hash"])
+    fetched = storage.download_blob(
+        md["eer_attestation_report_hash"], md["eer_attestation_storage_root"]
+    )
     assert len(fetched) > 0
 
 
@@ -245,5 +247,7 @@ async def test_pipeline_receipt_is_offline_verifiable(
     assert receipt.output_score_block is not None
     assert "risk" in receipt.output_score_block
     # And the report is in storage too — Step 4 would succeed.
-    fetched = storage.download_blob(receipt.attestation_report_hash)
+    fetched = storage.download_blob(
+        receipt.attestation_report_hash, receipt.attestation_storage_root
+    )
     assert len(fetched) > 0

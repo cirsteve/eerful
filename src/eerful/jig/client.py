@@ -45,11 +45,11 @@ from jig.core.types import (
 
 from eerful.canonical import Address, Bytes32Hex, is_bytes32_hex, to_lower_hex
 from eerful.commitment import SaltStore, compute_input_commitment, generate_salt
-from eerful.errors import EvaluationClientError
+from eerful.errors import EvaluationClientError, TrustViolation
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.zg.compute import ComputeResult
-from eerful.zg.storage import StorageClient
+from eerful.zg.storage import StorageClient, UploadResult
 
 
 class _ComputeProtocol(Protocol):
@@ -97,15 +97,27 @@ class EvaluationClient(LLMClient):
     """jig `LLMClient` bound to an `EvaluatorBundle`. Every call produces
     a verifying receipt as a side effect.
 
-    Construction is cheap (no network). Holds references to a
-    `ComputeClient` (the bridge wrapper) and a `StorageClient` (for
-    attestation report upload at receipt-build time). Both stay owned
-    by the caller — `EvaluationClient` does not close them.
+    Holds references to a `ComputeClient` (the bridge wrapper) and a
+    `StorageClient` (for attestation report upload at receipt-build
+    time, and — by default — for the bundle upload that resolves
+    `evaluator_storage_root`). Both stay owned by the caller —
+    `EvaluationClient` does not close them.
 
-    The bound `bundle` and `evaluator_id` MUST be consistent — the
-    caller is responsible for hashing the bundle's canonical bytes and
-    publishing them to Storage before constructing this client. Use
-    `eerful publish-evaluator` to do both in one shot.
+    Construction performs ONE storage round-trip by default: the
+    bundle's canonical bytes are uploaded so the resulting
+    `evaluator_storage_root` (the backend retrieval locator, spec
+    §6.1) is available for every receipt this client produces.
+    `getOrUpload`-style backends short-circuit on cache hit so
+    re-runs are effectively free. Pass `evaluator_storage_root=` to
+    skip the upload entirely — the offline/override path for tests,
+    for producers who already published via `eerful publish-evaluator`
+    and have the value cached in `<bundle>.published.json`, or for
+    any flow that wants construction to be no-network.
+
+    The bound `bundle` and `evaluator_id` MUST be consistent — when
+    `evaluator_storage_root` is left unset, the constructor verifies
+    `storage.upload_blob(canonical_bytes).content_hash == evaluator_id`
+    and raises `TrustViolation` on mismatch.
     """
 
     def __init__(
@@ -119,6 +131,7 @@ class EvaluationClient(LLMClient):
         salt_store: SaltStore | None = None,
         commit_inputs: bool = False,
         previous_receipt_id: Bytes32Hex | None = None,
+        evaluator_storage_root: Bytes32Hex | None = None,
     ) -> None:
         # Fail fast on a stale or wrong `evaluator_id`. A mismatched
         # value would silently produce receipts whose Step 2 verification
@@ -141,6 +154,37 @@ class EvaluationClient(LLMClient):
         self._salt_store = salt_store
         self._commit_inputs_default = commit_inputs
         self._previous_receipt_id = previous_receipt_id
+        # Resolve the bundle's storage_root: either trust the caller's
+        # override (publish-evaluator already uploaded; we have the root
+        # from the side-file or environment) or upload on construction.
+        # Bundle bytes are small (<4KB) and `getOrUpload` short-circuits
+        # on cache hit, so the construct-time upload is effectively free
+        # for re-runs. The override path keeps tests (and producers who
+        # don't have storage at construct time) ergonomic.
+        if evaluator_storage_root is None:
+            upload = storage.upload_blob(bundle.canonical_bytes())
+            if upload.content_hash != evaluator_id:
+                # Byzantine evidence: storage's returned hash diverges
+                # from the bytes we sent. Same shape as the
+                # `_publish_evaluator` defense-in-depth check in cli.py;
+                # raise the same exception type so the integrity
+                # attribution is consistent across surfaces (caller
+                # treating `EvaluationClientError` as a parameter-bug
+                # signal would mishandle this).
+                raise TrustViolation(
+                    f"bundle upload returned content_hash {upload.content_hash} "
+                    f"but bundle.evaluator_id()={evaluator_id} (canonical "
+                    "encoder drift or storage byte tampering)"
+                )
+            self._evaluator_storage_root: Bytes32Hex = upload.storage_root
+        else:
+            canonical = to_lower_hex(evaluator_storage_root)
+            if not is_bytes32_hex(canonical):
+                raise EvaluationClientError(
+                    f"evaluator_storage_root must be 0x-prefixed 64-char hex, "
+                    f"got {evaluator_storage_root!r}"
+                )
+            self._evaluator_storage_root = canonical
         # Per-instance lock serializes `complete()` calls so the
         # auto-chain pattern (`self._previous_receipt_id` read at start,
         # write at end) is concurrency-safe. Without this, two
@@ -208,14 +252,19 @@ class EvaluationClient(LLMClient):
             # matches what TeeML reported — the bridge already content-checks
             # but Step 4-style attribution belongs here too (this is the
             # producer side; the verifier runs the symmetric check).
-            report_hash_storage = await asyncio.to_thread(
+            report_upload: UploadResult = await asyncio.to_thread(
                 self._storage.upload_blob, result.attestation_report_bytes
             )
-            if report_hash_storage != result.attestation_report_hash:
-                raise EvaluationClientError(
+            if report_upload.content_hash != result.attestation_report_hash:
+                # Byzantine evidence: same shape as the constructor's
+                # bundle-upload check above. The compute provider's
+                # report bytes hashed to one value, storage returned a
+                # different one — never trust the storage URI in that
+                # case.
+                raise TrustViolation(
                     f"attestation report hash mismatch after upload: "
                     f"compute reported {result.attestation_report_hash}, "
-                    f"storage returned {report_hash_storage}"
+                    f"storage returned {report_upload.content_hash}"
                 )
 
             input_commitment = self._compute_commitment_or_none(
@@ -226,11 +275,13 @@ class EvaluationClient(LLMClient):
             receipt = EnhancedReceipt.build(
                 created_at=datetime.now(timezone.utc),
                 evaluator_id=self._evaluator_id,
+                evaluator_storage_root=self._evaluator_storage_root,
                 evaluator_version=self._bundle.version,
                 provider_address=self._provider_address,
                 chat_id=result.chat_id,
                 response_content=result.response_content,
                 attestation_report_hash=result.attestation_report_hash,
+                attestation_storage_root=report_upload.storage_root,
                 enclave_pubkey=result.enclave_pubkey,
                 enclave_signature=result.enclave_signature,
                 input_commitment=input_commitment,

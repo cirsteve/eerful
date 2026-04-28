@@ -110,7 +110,10 @@ async def test_complete_uploads_attestation_report_to_storage(
     receipt.attestation_report_hash."""
     client, storage = _client(bundle=trading_critic_bundle, fake_compute=fake_compute)
     response = await client.complete(_user_only_params("hi"))
-    fetched = storage.download_blob(response.eer.attestation_report_hash)
+    fetched = storage.download_blob(
+        response.eer.attestation_report_hash,
+        response.eer.attestation_storage_root,
+    )
     # Round-trip: storage content matches what the receipt commits to.
     assert hashlib.sha256(fetched).hexdigest() == response.eer.attestation_report_hash[2:]
 
@@ -485,15 +488,25 @@ async def test_attestation_hash_mismatch_after_upload_raises(
     trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
 ) -> None:
     """If the storage adapter returns a different content hash than
-    what compute reported, that's byzantine — refuse to build the
-    receipt rather than silently produce one that won't verify at
-    Step 4."""
+    what compute reported for the attestation report upload, that's
+    byzantine — refuse to build the receipt rather than silently
+    produce one that won't verify at Step 4. Surfaces as `TrustViolation`
+    (mirroring `_publish_evaluator`'s defense-in-depth check) so callers
+    see a consistent integrity-failure signal across surfaces.
+
+    Pass `evaluator_storage_root` explicitly so the constructor's
+    bundle upload doesn't run; the lying behavior is scoped to the
+    attestation report upload that happens inside `.complete()`.
+    """
+    from eerful.errors import TrustViolation
+    from eerful.zg.storage import UploadResult
 
     class _LyingStorage:
-        def upload_blob(self, data: bytes) -> str:
-            return "0x" + "0" * 64  # always lies
+        def upload_blob(self, data: bytes) -> UploadResult:
+            bogus = "0x" + "0" * 64
+            return UploadResult(content_hash=bogus, storage_root=bogus)
 
-        def download_blob(self, content_hash: str) -> bytes:
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
             raise NotImplementedError
 
     client = EvaluationClient(
@@ -501,9 +514,10 @@ async def test_attestation_hash_mismatch_after_upload_raises(
         storage=_LyingStorage(),
         bundle=trading_critic_bundle,
         evaluator_id=trading_critic_bundle.evaluator_id(),
+        evaluator_storage_root="0x" + "1" * 64,
         provider_address="0x" + "b" * 40,
     )
-    with pytest.raises(EvaluationClientError, match="attestation report hash mismatch"):
+    with pytest.raises(TrustViolation, match="attestation report hash mismatch"):
         await client.complete(_user_only_params("x"))
 
 
@@ -534,6 +548,36 @@ async def test_complete_strips_caller_system_messages_and_prepends_bundle_prompt
 
 
 # ---------------- evaluator_id consistency check ----------------
+
+
+def test_constructor_rejects_byzantine_bundle_upload(
+    trading_critic_bundle: EvaluatorBundle, fake_compute: FakeComputeClient
+) -> None:
+    """Constructor-side defense-in-depth: if the storage adapter returns
+    a different content_hash than the bundle's canonical bytes hash to,
+    that's byzantine — surface as `TrustViolation` (same shape as
+    `_publish_evaluator`'s check in cli.py) rather than silently
+    producing receipts whose Step 2 verification will fail later.
+    """
+    from eerful.errors import TrustViolation
+    from eerful.zg.storage import UploadResult
+
+    class _LyingStorage:
+        def upload_blob(self, data: bytes) -> UploadResult:
+            bogus = "0x" + "0" * 64
+            return UploadResult(content_hash=bogus, storage_root=bogus)
+
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
+            raise NotImplementedError
+
+    with pytest.raises(TrustViolation, match="bundle upload"):
+        EvaluationClient(
+            compute=fake_compute,
+            storage=_LyingStorage(),
+            bundle=trading_critic_bundle,
+            evaluator_id=trading_critic_bundle.evaluator_id(),
+            provider_address="0x" + "b" * 40,
+        )
 
 
 def test_constructor_rejects_mismatched_evaluator_id(

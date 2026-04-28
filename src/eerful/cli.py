@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import ipaddress
+import json
 import os
 import sys
 from pathlib import Path
@@ -312,8 +313,8 @@ def _check_report_override_hash(
 def _publish_evaluator(
     bundle_bytes: bytes,
     storage: StorageClient,
-) -> tuple[Bytes32Hex, EvaluatorBundle]:
-    """Validate and upload a bundle. Returns (storage-side content hash, bundle).
+) -> tuple[Bytes32Hex, Bytes32Hex, EvaluatorBundle]:
+    """Validate and upload a bundle. Returns (evaluator_id, storage_root, bundle).
 
     The upload sends the bundle's canonical encoding (sort-keys etc),
     not the on-disk bytes verbatim. A bundle file authored by hand may
@@ -322,22 +323,54 @@ def _publish_evaluator(
     publisher must upload canonical bytes for fetched-bundle ↔
     receipt.evaluator_id round-trips to match.
 
-    The caller's defense-in-depth check: storage's returned hash MUST
-    equal `bundle.evaluator_id()`. A mismatch means the storage backend
-    served back different bytes than what was sent (or our canonical
-    encoder disagreed with itself between calls — the test suite catches
-    that elsewhere). Surfaces as a TrustViolation in either case.
+    The caller's defense-in-depth check: storage's returned content_hash
+    MUST equal `bundle.evaluator_id()`. A mismatch means the storage
+    backend served back different bytes than what was sent (or our
+    canonical encoder disagreed with itself between calls — the test
+    suite catches that elsewhere). Surfaces as a TrustViolation in
+    either case. `storage_root` is what receipts will carry as
+    `evaluator_storage_root` so any verifier can fetch the bundle.
     """
     bundle = EvaluatorBundle.model_validate_json(bundle_bytes)
     canonical = bundle.canonical_bytes()
     expected_id = bundle.evaluator_id()
-    uploaded = storage.upload_blob(canonical)
-    if uploaded != expected_id:
+    upload = storage.upload_blob(canonical)
+    if upload.content_hash != expected_id:
         raise TrustViolation(
-            f"upload returned {uploaded} but bundle.evaluator_id()={expected_id} "
+            f"upload returned {upload.content_hash} but bundle.evaluator_id()={expected_id} "
             "(canonical encoder drift or storage byte tampering)"
         )
-    return uploaded, bundle
+    return upload.content_hash, upload.storage_root, bundle
+
+
+def _write_published_side_file(
+    bundle_path: Path,
+    evaluator_id: Bytes32Hex,
+    evaluator_storage_root: Bytes32Hex,
+    bundle: EvaluatorBundle,
+) -> Path:
+    """Write `<bundle>.published.json` next to the bundle file.
+
+    Downstream tooling (notably the trading-critic demo) discovers the
+    bundle's `(evaluator_id, evaluator_storage_root)` tuple from this
+    side-file rather than re-uploading the bundle every run. Co-located
+    with the bundle so `Path("bundle.json")` → `Path("bundle.json.published.json")`
+    is the simplest possible discovery rule.
+    """
+    side_path = bundle_path.with_name(bundle_path.name + ".published.json")
+    side_path.write_text(
+        json.dumps(
+            {
+                "evaluator_id": evaluator_id,
+                "evaluator_storage_root": evaluator_storage_root,
+                "evaluator_version": bundle.version,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return side_path
 
 
 def _cmd_publish_evaluator(args: argparse.Namespace) -> int:
@@ -354,7 +387,10 @@ def _cmd_publish_evaluator(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"bundle does not validate: {e}", file=sys.stderr)
             return 1
-        _print_publish_summary(bundle.evaluator_id(), bundle, uploaded=False)
+        # Dry run never uploaded, so no storage_root to report or persist.
+        _print_publish_summary(
+            bundle.evaluator_id(), evaluator_storage_root=None, bundle=bundle, uploaded=False
+        )
         return 0
 
     bridge_url = args.bridge_url
@@ -368,7 +404,9 @@ def _cmd_publish_evaluator(args: argparse.Namespace) -> int:
         return 2
     try:
         with BridgeStorageClient(bridge_url=bridge_url) as storage:
-            evaluator_id, bundle = _publish_evaluator(bundle_bytes, storage)
+            evaluator_id, evaluator_storage_root, bundle = _publish_evaluator(
+                bundle_bytes, storage
+            )
     except (StorageError, TrustViolation) as e:
         print(f"publish failed: {e}", file=sys.stderr)
         return 1
@@ -377,21 +415,39 @@ def _cmd_publish_evaluator(args: argparse.Namespace) -> int:
         print(f"bundle does not validate: {e}", file=sys.stderr)
         return 1
 
-    _print_publish_summary(evaluator_id, bundle, uploaded=True)
+    side_path: Path | None = None
+    if not args.no_side_file:
+        try:
+            side_path = _write_published_side_file(
+                bundle_path, evaluator_id, evaluator_storage_root, bundle
+            )
+        except OSError as e:
+            print(f"warning: failed to write side-file: {e}", file=sys.stderr)
+    _print_publish_summary(
+        evaluator_id,
+        evaluator_storage_root=evaluator_storage_root,
+        bundle=bundle,
+        uploaded=True,
+        side_file=side_path,
+    )
     return 0
 
 
 def _print_publish_summary(
     evaluator_id: Bytes32Hex,
-    bundle: EvaluatorBundle,
     *,
+    evaluator_storage_root: Bytes32Hex | None,
+    bundle: EvaluatorBundle,
     uploaded: bool,
+    side_file: Path | None = None,
 ) -> None:
     if uploaded:
         print("OK — evaluator bundle uploaded to 0G Storage.")
     else:
         print("OK — bundle validates (dry run; nothing uploaded).")
     print(f"  evaluator_id: {evaluator_id}")
+    if evaluator_storage_root is not None:
+        print(f"  evaluator_storage_root: {evaluator_storage_root}")
     print(f"  version: {bundle.version}")
     print(f"  model_identifier: {bundle.model_identifier}")
     allowlist = bundle.accepted_compose_hashes
@@ -405,6 +461,8 @@ def _print_publish_summary(
             "  accepted_compose_hashes: not set "
             "(no compose-hash gating; see §8 for what verifiers can prove)."
         )
+    if side_file is not None:
+        print(f"  side-file: {side_file}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -499,6 +557,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="validate the bundle and print evaluator_id without uploading",
+    )
+    pub.add_argument(
+        "--no-side-file",
+        action="store_true",
+        help=(
+            "skip writing <bundle>.published.json. The side-file persists "
+            "evaluator_id and evaluator_storage_root next to the bundle for "
+            "downstream tooling; opt out for CI/automation flows that "
+            "consume the values directly from stdout."
+        ),
     )
     pub.set_defaults(func=_cmd_publish_evaluator)
 
