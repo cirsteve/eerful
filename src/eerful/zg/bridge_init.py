@@ -79,11 +79,29 @@ def bridge_init(
             f"see services/zg-bridge/README.md and run `npm run dev`"
         ) from e
 
-    amount = (
+    # Resolve the deposit amount with explicit validation at the helper
+    # boundary. A malformed `EERFUL_0G_LEDGER_DEPOSIT` would otherwise
+    # raise a raw ValueError mid-init; a zero or negative value would
+    # be accepted here and surface much later as the broker's
+    # opaque "balance below minimum lock" message at first inference.
+    raw_amount: float | str = (
         ledger_amount
         if ledger_amount is not None
-        else float(os.environ.get("EERFUL_0G_LEDGER_DEPOSIT", "1.1"))
+        else os.environ.get("EERFUL_0G_LEDGER_DEPOSIT", "1.1")
     )
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError) as e:
+        raise ComputeError(
+            f"invalid ledger amount {raw_amount!r}: expected a positive "
+            "number of 0G (set EERFUL_0G_LEDGER_DEPOSIT or pass "
+            "ledger_amount=)"
+        ) from e
+    if amount <= 0:
+        raise ComputeError(
+            f"invalid ledger amount {amount}: must be > 0 0G "
+            "(broker's MIN_LOCKED_BALANCE is 1.0; default is 1.1)"
+        )
     ledger = compute.add_ledger(amount)
     ack = compute.acknowledge(provider_address)
 

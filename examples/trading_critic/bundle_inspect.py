@@ -123,12 +123,20 @@ def _run_score_test(
                 {"role": "system", "content": bundle.system_prompt},
                 {"role": "user", "content": strategy_text},
             ]
-            result = compute.infer_full(
-                provider_address=provider_address,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            try:
+                result = compute.infer_full(
+                    provider_address=provider_address,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except ComputeError as e:
+                # Surface which strategy failed so the maintainer
+                # knows where to resume — receipts aren't being
+                # produced here so we can fail-and-bail rather than
+                # try to recover state.
+                print(f"  ✗ {version}: inference failed: {e}", file=sys.stderr)
+                return 1
             try:
                 parsed = json.loads(result.response_content)
             except json.JSONDecodeError as e:
@@ -246,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+
+    # Enforce the score-test-only contract on `--verbose` at parse time.
+    # Without this, a user passing `--verbose --confirm-compose-hash`
+    # would have the flag silently dropped — the help text would say
+    # one thing and the script would do another.
+    if args.verbose and not args.score_test:
+        parser.error("--verbose is only valid with --score-test")
 
     try:
         bundle = EvaluatorBundle.model_validate_json(args.bundle.read_bytes())
