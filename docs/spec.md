@@ -163,7 +163,7 @@ EnhancedReceipt {
 
 The pair lets any verifier with any storage instance fetch any receipt's bytes without depending on producer-side state (e.g., a sha256→rootHash index that resets on bridge restart). The integrity hash is what binds the receipt to specific bytes; the retrieval locator is what makes the bytes findable. They are not redundant.
 
-`Bytes32Hex` is the v0.5 type for both retrieval locators because 0G Merkle roots, IPFS-with-sha256 CIDs, and Arweave TX IDs all fit. A backend whose locator exceeds 32 bytes would require widening to `BytesHex`; receipts under such a backend would carry that widening as an additional canonical-form change, version-coordinated.
+`Bytes32Hex` is the v0.5 type for both retrieval locators because the profiled 0G Storage backend uses 32-byte Merkle roots. This should not be read as a claim that all alternate backends' native lookup keys fit `Bytes32Hex`: standard IPFS CIDs and standard Arweave TX IDs do not, as encoded, have that form. A backend whose native locator is not a 32-byte hex value would require a widened locator type (for example `String` or `BytesHex`) together with an explicit canonical encoding rule; adopting such a locator would be a version-coordinated canonical-form change.
 
 ### 6.2 Field semantics
 
@@ -223,7 +223,7 @@ For deterministic hashing, fields are encoded as canonical JSON:
 
 Implementations MUST produce byte-identical output across runs and across implementations. This is normative.
 
-EIP-712 typed-data encoding is a candidate for a future v0.5 follow-on to enable native EVM contract verification, additive over the canonical-JSON form. v0.5 ships canonical JSON for implementation simplicity.
+EIP-712 typed-data encoding is a candidate for a future version to enable native EVM contract verification, additive over the canonical-JSON form. v0.5 ships canonical JSON for implementation simplicity.
 
 ### 6.5 Evaluator bundle
 
@@ -264,7 +264,7 @@ Semantics:
 - **Forks permitted.** Two receipts MAY both reference the same `previous_receipt_id`. EER does not specify which is canonical; that is a higher-layer policy decision.
 - **Cross-evaluator chains permitted.** A receipt under evaluator A MAY reference a previous receipt under evaluator B. The chain documents temporal ordering of evaluations of the same artifact, not directly comparable scoring.
 
-A future version MAY add chain-completeness primitives (e.g., publication to an append-only log with on-chain root anchoring). v0.4 leaves this to higher layers.
+A future version MAY add chain-completeness primitives (e.g., publication to an append-only log with on-chain root anchoring). v0.5 leaves this to higher layers.
 
 ### 6.7 Input commitment construction
 
@@ -446,7 +446,7 @@ A producer sets `created_at` to a time in the past.
 These are limitations of EER v0.5 that future versions MAY address:
 
 - **No model-weight attestation.** TEE attests the launched compose, not the loaded weights. The compose-hash allowlist (§6.5, §8.3) lets a publisher gate on a known-good launch configuration but does not bind the weight bytes that the model server actually loads at runtime. This is a vendor-protocol gap, not a receipt-format gap. See §8.
-- **No chain-completeness guarantee.** Receipt chains are producer-asserted. A producer can hide unfavorable receipts. Append-only public logs would address this; v0.4 leaves it to higher layers.
+- **No chain-completeness guarantee.** Receipt chains are producer-asserted. A producer can hide unfavorable receipts. Append-only public logs would address this; v0.5 leaves it to higher layers.
 - **No native EVM verification.** Canonical JSON is portable but not native to EVM contracts. EIP-712 typed-data encoding would enable on-chain verification of receipts.
 - **No revocation primitive.** A bundle published to Storage cannot be deprecated at the protocol level. Higher-layer registries MAY mark evaluator IDs as deprecated; EER receipts under deprecated IDs remain technically valid but socially deprecated.
 
@@ -514,4 +514,4 @@ The receipt is a small artifact (under 4 KB typical). The verification algorithm
 
 EER is stronger than logs (signed, content-addressed, hardware-rooted), weaker than ZK proofs (trusts hardware vendors), and practical today. Where ZK is unavailable or impractically expensive — most LLM workloads — EER is the strongest available evaluation credential.
 
-This is v0.4. Comments, criticism, and proposed extensions are welcome.
+This is v0.5. Comments, criticism, and proposed extensions are welcome.

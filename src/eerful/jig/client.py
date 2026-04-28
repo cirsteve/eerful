@@ -45,7 +45,7 @@ from jig.core.types import (
 
 from eerful.canonical import Address, Bytes32Hex, is_bytes32_hex, to_lower_hex
 from eerful.commitment import SaltStore, compute_input_commitment, generate_salt
-from eerful.errors import EvaluationClientError
+from eerful.errors import EvaluationClientError, TrustViolation
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.zg.compute import ComputeResult
@@ -152,7 +152,14 @@ class EvaluationClient(LLMClient):
         if evaluator_storage_root is None:
             upload = storage.upload_blob(bundle.canonical_bytes())
             if upload.content_hash != evaluator_id:
-                raise EvaluationClientError(
+                # Byzantine evidence: storage's returned hash diverges
+                # from the bytes we sent. Same shape as the
+                # `_publish_evaluator` defense-in-depth check in cli.py;
+                # raise the same exception type so the integrity
+                # attribution is consistent across surfaces (caller
+                # treating `EvaluationClientError` as a parameter-bug
+                # signal would mishandle this).
+                raise TrustViolation(
                     f"bundle upload returned content_hash {upload.content_hash} "
                     f"but bundle.evaluator_id()={evaluator_id} (canonical "
                     "encoder drift or storage byte tampering)"
@@ -237,7 +244,12 @@ class EvaluationClient(LLMClient):
                 self._storage.upload_blob, result.attestation_report_bytes
             )
             if report_upload.content_hash != result.attestation_report_hash:
-                raise EvaluationClientError(
+                # Byzantine evidence: same shape as the constructor's
+                # bundle-upload check above. The compute provider's
+                # report bytes hashed to one value, storage returned a
+                # different one — never trust the storage URI in that
+                # case.
+                raise TrustViolation(
                     f"attestation report hash mismatch after upload: "
                     f"compute reported {result.attestation_report_hash}, "
                     f"storage returned {report_upload.content_hash}"

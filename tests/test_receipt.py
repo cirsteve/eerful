@@ -178,9 +178,10 @@ def test_created_at_serialized_as_rfc3339_z():
 
 
 def test_storage_roots_required_for_construction():
-    """v0.5 makes both storage_root fields required. Receipt construction
-    without them must raise (pydantic ValidationError) — the asymmetric
-    break is what removes the cross-instance-fetch bug entirely."""
+    """v0.5 makes both storage_root fields required. `EnhancedReceipt.build`
+    declares them as keyword-only required parameters, so omitting one
+    raises TypeError at the call site — the asymmetric break is what
+    removes the cross-instance-fetch bug entirely."""
     incomplete = {k: v for k, v in BASE.items() if k != "evaluator_storage_root"}
     with pytest.raises(TypeError):
         EnhancedReceipt.build(**incomplete)
@@ -225,19 +226,24 @@ def test_spec_version_mismatch_rejected():
 def test_storage_roots_lowercase_normalized_in_signing_payload():
     """Both storage_root fields must canonicalize to lowercase in the
     signing payload (spec §6.4). A receipt built with uppercase input
-    must produce the same receipt_id as the lowercase form."""
-    upper = {
+    must produce the same receipt_id as the lowercase form.
+
+    Uses hex-letter values so `.upper()` actually changes the strings —
+    a test using only digits like "1"/"2" would pass even if
+    normalization were broken."""
+    lower = {
         **BASE,
-        "evaluator_storage_root": "0x" + "1" * 64,  # already lowercase
-        "attestation_storage_root": "0x" + "2" * 64,
+        "evaluator_storage_root": "0x" + "ab" * 32,
+        "attestation_storage_root": "0x" + "cd" * 32,
     }
     upper_input = {
         **BASE,
-        "evaluator_storage_root": "0x" + "1" * 64,
-        "attestation_storage_root": "0x" + "2" * 64,
+        "evaluator_storage_root": ("0x" + "ab" * 32).upper().replace("0X", "0x"),
+        "attestation_storage_root": ("0x" + "cd" * 32).upper().replace("0X", "0x"),
     }
-    upper_input["evaluator_storage_root"] = upper_input["evaluator_storage_root"].upper().replace("0X", "0x")
-    upper_input["attestation_storage_root"] = upper_input["attestation_storage_root"].upper().replace("0X", "0x")
     r_upper = EnhancedReceipt.build(**upper_input)
-    r_lower = EnhancedReceipt.build(**upper)
+    r_lower = EnhancedReceipt.build(**lower)
     assert r_upper.receipt_id == r_lower.receipt_id
+    # Pin canonicalization on the storage_root fields specifically.
+    assert r_upper.evaluator_storage_root == r_lower.evaluator_storage_root
+    assert r_upper.attestation_storage_root == r_lower.attestation_storage_root
