@@ -19,7 +19,12 @@
     "max_tokens": 2000
   },
   "accepted_compose_hashes": [
-    "0x0000000000000000000000000000000000000000000000000000000000000000"
+    {
+      "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "category": "A",
+      "provider_address": "0xd9966e13a6026fcca4b13e7ff95c94de268c471c",
+      "notes": "placeholder; replace with live compose-hash via bundle_inspect.py before publishing"
+    }
   ],
   "metadata": {
     "demo_provider": "0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C",

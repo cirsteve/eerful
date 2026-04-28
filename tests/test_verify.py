@@ -12,8 +12,9 @@ from eth_keys import keys
 from eth_utils import keccak
 
 from eerful.errors import StorageError, TrustViolation, VerificationError
-from eerful.evaluator import EvaluatorBundle
+from eerful.evaluator import ComposeHashEntry, EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
+from eerful.zg.attestation import ComposeCategory
 from eerful.verify import (
     fetch_evaluator_bundle_bytes,
     verify_receipt,
@@ -110,6 +111,21 @@ def _bundle(**overrides: Any) -> EvaluatorBundle:
     )
     fields.update(overrides)
     return EvaluatorBundle(**fields)
+
+
+_ENTRY_PROVIDER = "0x" + "d" * 40
+
+
+def _entry(
+    hash: str,
+    *,
+    category: ComposeCategory = "A",
+    provider: str = _ENTRY_PROVIDER,
+) -> ComposeHashEntry:
+    """Compact ComposeHashEntry constructor for fixtures. Default category is
+    'A' so most Step 5 tests (whose synthetic compose names a vLLM model
+    string and thus heuristic-categorizes as 'A') agree publisher-vs-heuristic."""
+    return ComposeHashEntry(hash=hash, category=category, provider_address=provider)
 
 
 def _receipt(bundle: EvaluatorBundle, **overrides: Any) -> EnhancedReceipt:
@@ -265,13 +281,15 @@ def test_through_step_3_short_circuits_at_step_2():
 
 def test_step_5_passes_when_allowlist_matches():
     """Bundle declares allowlist + report's compose-hash is in it →
-    `gating='enforced'`, no error."""
+    `gating='enforced'`, matched entry surfaced, no error."""
     report_bytes, hash_hex = _build_report()
-    b = _bundle(accepted_compose_hashes=[hash_hex])
+    entry = _entry(hash_hex)
+    b = _bundle(accepted_compose_hashes=[entry])
     result = verify_step_5_compose_hash_gating(b, report_bytes)
     assert result.gating == "enforced"
     assert result.compose_hash == hash_hex
     assert result.category == "A"
+    assert result.declared_entry == entry
 
 
 def test_step_5_fails_when_allowlist_misses():
@@ -280,7 +298,7 @@ def test_step_5_fails_when_allowlist_misses():
     who lists known-good composes must reject everything else."""
     report_bytes, hash_hex = _build_report()
     other = "0x" + "f" * 64
-    b = _bundle(accepted_compose_hashes=[other])
+    b = _bundle(accepted_compose_hashes=[_entry(other)])
     with pytest.raises(VerificationError) as exc:
         verify_step_5_compose_hash_gating(b, report_bytes)
     assert exc.value.step == 5
@@ -289,9 +307,10 @@ def test_step_5_fails_when_allowlist_misses():
 
 
 def test_step_5_skips_when_no_allowlist():
-    """Bundle without allowlist → Step 5 reports `gating='skipped'` and does
-    not raise. Spec §6.5: 'When absent, no compose-hash gating is performed.'
-    A receipt is still verifiable; the §8 caveat applies."""
+    """Bundle without allowlist → Step 5 reports `gating='skipped'`, does
+    not raise, and surfaces no `declared_entry`. Spec §6.5: 'When absent,
+    no compose-hash gating is performed.' A receipt is still verifiable;
+    the §8 caveat applies."""
     report_bytes, hash_hex = _build_report()
     b = _bundle()  # accepted_compose_hashes defaults to None
     assert b.accepted_compose_hashes is None
@@ -299,17 +318,20 @@ def test_step_5_skips_when_no_allowlist():
     assert result.gating == "skipped"
     assert result.compose_hash == hash_hex
     assert result.category == "A"
+    assert result.declared_entry is None
 
 
 def test_step_5_uppercase_allowlist_matches_lowercase_report():
-    """If a bundle's allowlist is uppercase (only possible if construction
-    bypasses the BeforeValidator — defensive test), step 5 still matches.
-    The bundle validator forces lowercase, so this is belt-and-suspenders."""
+    """Entry-level Bytes32Hex BeforeValidator lowercases the hash at
+    construction, so feeding uppercase in still yields a match against the
+    lowercase attested hash — locks the canonicalization invariant down at
+    the verify-step level (already tested at the entry level too)."""
     report_bytes, hash_hex = _build_report()
-    # Bundle stores lowercase regardless of input case (tested in test_evaluator).
-    b = _bundle(accepted_compose_hashes=[hash_hex.upper()])
+    b = _bundle(accepted_compose_hashes=[_entry(hash_hex.upper())])
     result = verify_step_5_compose_hash_gating(b, report_bytes)
     assert result.gating == "enforced"
+    assert result.declared_entry is not None
+    assert result.declared_entry.hash == hash_hex
 
 
 def test_step_5_propagates_parse_errors():
@@ -431,12 +453,13 @@ def test_step_6_wraps_eth_keys_bad_signature_as_step_6_error():
 
 def test_verify_receipt_runs_full_chain_when_report_provided():
     report_bytes, hash_hex = _build_report()
-    b = _bundle(accepted_compose_hashes=[hash_hex])
+    b = _bundle(accepted_compose_hashes=[_entry(hash_hex)])
     r = _receipt(b)
     result = verify_receipt(r, b.canonical_bytes(), report_bytes)
     assert result.bundle.evaluator_id() == b.evaluator_id()
     assert result.step5 is not None
     assert result.step5.gating == "enforced"
+    assert result.step5.declared_entry is not None
 
 
 def test_verify_receipt_skips_step5_when_report_omitted():
@@ -450,7 +473,7 @@ def test_verify_receipt_short_circuits_at_step_2_before_step_5():
     """A bundle-bytes mismatch at Step 2 must surface as Step 2, not Step 5,
     even when a report is supplied — spec §7.1 ordering is normative."""
     report_bytes, hash_hex = _build_report()
-    b = _bundle(accepted_compose_hashes=[hash_hex])
+    b = _bundle(accepted_compose_hashes=[_entry(hash_hex)])
     r = _receipt(b)
     other = _bundle(system_prompt="something else")
     with pytest.raises(VerificationError) as exc:
@@ -566,7 +589,7 @@ def test_verify_receipt_with_storage_passes_full_chain():
     pass, VerificationResult shows enforced gating."""
     storage = MockStorageClient()
     report_bytes, hash_hex = _build_report()
-    b = _bundle(accepted_compose_hashes=[hash_hex])
+    b = _bundle(accepted_compose_hashes=[_entry(hash_hex)])
     storage.upload_blob(b.canonical_bytes())
     upload = storage.upload_blob(report_bytes)
     r = _receipt(b, attestation_report_hash=upload.content_hash)
@@ -605,7 +628,7 @@ def test_verify_receipt_with_storage_step_4_runs_before_step_5():
     Catches a regression where Step 4 attribution leaks to Step 5
     because Step 5 is what touches the report bytes."""
     storage = MockStorageClient()
-    b = _bundle(accepted_compose_hashes=["0x" + "f" * 64])
+    b = _bundle(accepted_compose_hashes=[_entry("0x" + "f" * 64)])
     storage.upload_blob(b.canonical_bytes())
     # Report intentionally absent — Step 4 fetch will fail.
     r = _receipt(b)
@@ -619,7 +642,7 @@ def test_verify_receipt_with_storage_propagates_step_5_failure():
     the attested compose-hash → Step 5 fails through the storage path."""
     storage = MockStorageClient()
     report_bytes, _ = _build_report()
-    b = _bundle(accepted_compose_hashes=["0x" + "f" * 64])  # not the attested hash
+    b = _bundle(accepted_compose_hashes=[_entry("0x" + "f" * 64)])  # not the attested hash
     storage.upload_blob(b.canonical_bytes())
     upload = storage.upload_blob(report_bytes)
     r = _receipt(b, attestation_report_hash=upload.content_hash)
@@ -683,7 +706,7 @@ def test_verifier_can_fetch_via_separate_storage_instance():
     verifier_storage = MockStorageClient()
 
     report_bytes, hash_hex = _build_report()
-    b = _bundle(accepted_compose_hashes=[hash_hex])
+    b = _bundle(accepted_compose_hashes=[_entry(hash_hex)])
 
     # Producer uploads to its own storage, captures both fields,
     # then builds a receipt carrying both.
@@ -716,7 +739,7 @@ def test_verify_receipt_runs_step_5_before_step_6():
     report_bytes, hash_hex = _build_report()
     # Allowlist contains some other hash, so Step 5 would fail.
     different_hash = "0x" + "f" * 64
-    b = _bundle(accepted_compose_hashes=[different_hash])
+    b = _bundle(accepted_compose_hashes=[_entry(different_hash)])
     # Fresh receipt with default valid signature, then swap the
     # signature for a structurally-invalid one. Step 5 should fire
     # first; Step 6 never runs.
