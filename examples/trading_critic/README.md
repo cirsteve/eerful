@@ -47,6 +47,16 @@ uv run python examples/trading_critic/author_strategies.py --to v3
 # Hand-edit the generated files until they read cleanly.
 ```
 
+Iterate on `bundle.json`'s `system_prompt` and the strategy text
+until the critic produces a clear monotonic-improvement story. The
+score-test flag runs the critic against v1/v2/v3 and prints scores
+side-by-side without producing receipts:
+
+```bash
+uv run python examples/trading_critic/bundle_inspect.py --score-test
+# Adjust system_prompt or strategy text, repeat. Three broker calls per run.
+```
+
 `accepted_compose_hashes` in `bundle.json` ships as a syntactic
 placeholder. Confirm Provider 1's live compose-hash and pin it
 before publishing:
