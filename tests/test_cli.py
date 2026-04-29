@@ -753,3 +753,435 @@ def test_verify_surfaces_step_attribution_on_failure(
     # The local bundle bytes should still be valid (sanity check that
     # the receipt isn't broken — the failure is purely Step 2 fetch).
     assert bundle_canonical not in err.encode()
+
+
+# ---------------- gate subcommand ----------------
+
+
+def _make_gate_artifacts(
+    *,
+    accepted_compose_hashes: list[ComposeHashEntry] | None = None,
+    output_score_block: dict[str, Any] | None = None,
+) -> tuple[EnhancedReceipt, EvaluatorBundle, bytes]:
+    """Build a receipt + bundle + report bytes for gate-subcommand tests.
+
+    Differs from `_make_receipt_and_artifacts` (which targets the verify
+    subcommand) in two ways: it surfaces the bundle (so tests can register
+    its `evaluator_id` in a policy), and it includes a default
+    `output_score_block` so the gate's all_must_pass score check succeeds
+    on the PASS path."""
+    bundle = EvaluatorBundle(
+        version="trading-critic@1.0.0",
+        model_identifier="zai-org/GLM-5-FP8",
+        system_prompt="rate it",
+        accepted_compose_hashes=accepted_compose_hashes,
+    )
+    report_bytes, _ = _build_report_bytes()
+    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
+    pubkey, sig = _sign_personal("hello")
+    score = output_score_block if output_score_block is not None else {"overall": 0.8}
+    receipt = EnhancedReceipt.build(
+        created_at=datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
+        evaluator_id=bundle.evaluator_id(),
+        evaluator_storage_root=bundle.evaluator_id(),
+        evaluator_version=bundle.version,
+        provider_address="0x" + "b" * 40,
+        chat_id="chat-1",
+        response_content="hello",
+        attestation_report_hash=rh,
+        attestation_storage_root=rh,
+        enclave_pubkey=pubkey,
+        enclave_signature=sig,
+        output_score_block=score,
+    )
+    return receipt, bundle, report_bytes
+
+
+def _write_policy(
+    tmp_path: Path,
+    *,
+    bundle_id: str,
+    n_attestations: int = 1,
+    score_threshold: float = 0.6,
+) -> Path:
+    policy_dict = {
+        "policy_version": "0.5",
+        "principal_id": "test",
+        "bundles": {"proposal_grade": bundle_id},
+        "tiers": {
+            "low_consequence": {
+                "n_attestations": n_attestations,
+                "score_threshold": score_threshold,
+                "diversity": {"distinct_signers": False, "distinct_compose_hashes": False},
+            }
+        },
+        "score_aggregation": "all_must_pass",
+    }
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps(policy_dict))
+    return p
+
+
+def test_gate_passes_minimum_viable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single receipt, no allowlist, score above threshold, storage holds
+    the bundle + report → exit 0, PASS line in stdout, canonical_set_hash
+    surfaced."""
+    receipt, bundle, report_bytes = _make_gate_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+    storage.upload_blob(report_bytes)
+
+    policy_path = _write_policy(tmp_path, bundle_id=bundle.evaluator_id())
+    receipt_path = tmp_path / "r1.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, out, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 0, err
+    assert "PASS" in out
+    assert "canonical_set_hash" in out
+    assert "1 supplied / 1 required" in out
+
+
+def test_gate_refuses_with_exit_1_on_score_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Score below threshold → REFUSE_SCORE → exit 1, REFUSE line in stderr,
+    detail surfaces the gap. Distinct from exit 2 (wiring error)."""
+    receipt, bundle, report_bytes = _make_gate_artifacts(
+        output_score_block={"overall": 0.4}
+    )
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+    storage.upload_blob(report_bytes)
+
+    policy_path = _write_policy(
+        tmp_path, bundle_id=bundle.evaluator_id(), score_threshold=0.7
+    )
+    receipt_path = tmp_path / "r1.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 1
+    assert "REFUSE" in err
+    assert "refuse_score" in err
+    assert "0.4" in err
+
+
+def test_gate_exits_2_on_unknown_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PolicyError surfaces as exit 2 (wiring bug), not 1 (refusal). Lets
+    a CI integration distinguish 'rails working as designed, refused' from
+    'someone misconfigured the policy'."""
+    receipt, bundle, _ = _make_gate_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+
+    policy_path = _write_policy(tmp_path, bundle_id=bundle.evaluator_id())
+    receipt_path = tmp_path / "r1.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "high_consequence",  # not in policy
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 2
+    assert "policy wiring error" in err
+    assert "high_consequence" in err
+
+
+def test_gate_exits_2_on_unknown_bundle_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt, bundle, _ = _make_gate_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+
+    policy_path = _write_policy(tmp_path, bundle_id=bundle.evaluator_id())
+    receipt_path = tmp_path / "r1.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "nonexistent",  # not in policy.bundles
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 2
+    assert "policy wiring error" in err
+    assert "nonexistent" in err
+
+
+def test_gate_exits_2_on_missing_policy_file(tmp_path: Path) -> None:
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(tmp_path / "nope.json"),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(tmp_path / "any.json"),
+        ]
+    )
+    assert rc == 2
+    assert "failed to load policy" in err
+
+
+def test_gate_exits_2_on_invalid_policy_json(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_bytes(b"not valid json")
+    receipt_path = tmp_path / "r.json"
+    receipt_path.write_bytes(b"{}")  # any value; we won't reach receipt loading
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 2
+    assert "policy does not validate" in err
+
+
+def test_gate_exits_2_on_invalid_receipt_json(tmp_path: Path) -> None:
+    """Bad receipt file fails before any storage lookup. Distinguishable
+    from a refusal at exit-code level."""
+    bundle_id = "0x" + "a" * 64
+    policy_path = _write_policy(tmp_path, bundle_id=bundle_id)
+    receipt_path = tmp_path / "r.json"
+    receipt_path.write_bytes(b"{not valid}")
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 2
+    assert "does not validate" in err
+
+
+def test_gate_refuses_non_loopback_bridge_url(tmp_path: Path) -> None:
+    """The loopback guard applies to gate just like verify and publish.
+    Without --allow-remote-bridge, a non-loopback URL is exit 2.
+
+    Uses a valid receipt + policy so the failure surfaces *only* on the
+    loopback check (not on input validation that happens earlier)."""
+    receipt, bundle, _ = _make_gate_artifacts()
+    policy_path = _write_policy(tmp_path, bundle_id=bundle.evaluator_id())
+    receipt_path = tmp_path / "r.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+            "--bridge-url",
+            "http://attacker.example.com:7878",
+        ]
+    )
+    assert rc == 2
+    assert "non-loopback bridge" in err
+
+
+def test_gate_exits_2_when_evaluate_raises_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defensive: if `evaluate_gate` raises ValueError that the executor
+    didn't translate to a refuse outcome (e.g. a future code path the
+    internal catch doesn't cover), the CLI must exit 2 with a controlled
+    message — not crash with a traceback at the operator surface."""
+    receipt, bundle, _ = _make_gate_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+
+    policy_path = _write_policy(tmp_path, bundle_id=bundle.evaluator_id())
+    receipt_path = tmp_path / "r1.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    def _raise_value_error(**_kwargs: Any) -> None:
+        raise ValueError("synthesized: pubkey is wrong length")
+
+    monkeypatch.setattr("eerful.cli.evaluate_gate", _raise_value_error)
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 2
+    assert "invalid input" in err
+    assert "pubkey is wrong length" in err
+
+
+def test_gate_passes_with_n2_distinct_signers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: two receipts from distinct signing keys, tier requires
+    distinct_signers=true and n_attestations=2, score above threshold →
+    PASS. Locks down the multi-receipt path through the CLI."""
+    bundle = EvaluatorBundle(
+        version="trading-critic@1.0.0",
+        model_identifier="zai-org/GLM-5-FP8",
+        system_prompt="rate it",
+    )
+    report_bytes, _ = _build_report_bytes()
+    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+    storage.upload_blob(report_bytes)
+
+    response_content = "hello"
+    pk_a = keys.PrivateKey(b"\x42" * 32)
+    pk_b = keys.PrivateKey(b"\x77" * 32)
+    text_bytes = response_content.encode()
+    msg_hash = keccak(
+        b"\x19Ethereum Signed Message:\n" + str(len(text_bytes)).encode() + text_bytes
+    )
+    pubkey_a = "0x" + pk_a.public_key.to_bytes().hex()
+    pubkey_b = "0x" + pk_b.public_key.to_bytes().hex()
+    sig_a = "0x" + pk_a.sign_msg_hash(msg_hash).to_bytes().hex()
+    sig_b = "0x" + pk_b.sign_msg_hash(msg_hash).to_bytes().hex()
+
+    common: dict[str, Any] = dict(
+        created_at=datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
+        evaluator_id=bundle.evaluator_id(),
+        evaluator_storage_root=bundle.evaluator_id(),
+        evaluator_version=bundle.version,
+        provider_address="0x" + "b" * 40,
+        response_content=response_content,
+        attestation_report_hash=rh,
+        attestation_storage_root=rh,
+        output_score_block={"overall": 0.8},
+    )
+    r1 = EnhancedReceipt.build(
+        chat_id="chat-1", enclave_pubkey=pubkey_a, enclave_signature=sig_a, **common
+    )
+    r2 = EnhancedReceipt.build(
+        chat_id="chat-2", enclave_pubkey=pubkey_b, enclave_signature=sig_b, **common
+    )
+    r1_path = tmp_path / "r1.json"
+    r2_path = tmp_path / "r2.json"
+    r1_path.write_bytes(r1.model_dump_json().encode())
+    r2_path.write_bytes(r2.model_dump_json().encode())
+
+    policy_dict: dict[str, Any] = {
+        "policy_version": "0.5",
+        "principal_id": "test",
+        "bundles": {"proposal_grade": bundle.evaluator_id()},
+        "tiers": {
+            "high_consequence": {
+                "n_attestations": 2,
+                "score_threshold": 0.6,
+                "diversity": {"distinct_signers": True, "distinct_compose_hashes": False},
+            }
+        },
+        "score_aggregation": "all_must_pass",
+    }
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy_dict))
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    rc, out, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "high_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(r1_path),
+            "--receipt",
+            str(r2_path),
+        ]
+    )
+    assert rc == 0, err
+    assert "PASS" in out
+    assert "2 supplied / 2 required" in out
