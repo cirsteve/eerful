@@ -340,7 +340,6 @@ def _gate_with_step_5_skipped(
     policy: PrincipalPolicy,
     bundle_name: str,
     receipt: EnhancedReceipt,
-    bundle: EvaluatorBundle,
     storage: MockStorageClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Any:
@@ -402,7 +401,6 @@ def test_clean_path_proposal_grade_passes(
         policy=policy,
         bundle_name="proposal_grade",
         receipt=run.proposal_receipt,
-        bundle=proposal_bundle,
         storage=storage,
         monkeypatch=monkeypatch,
     )
@@ -451,7 +449,6 @@ def test_poisoned_path_proposal_grade_refuses(
         policy=policy,
         bundle_name="proposal_grade",
         receipt=run.proposal_receipt,
-        bundle=proposal_bundle,
         storage=storage,
         monkeypatch=monkeypatch,
     )
@@ -467,7 +464,6 @@ def test_poisoned_path_proposal_grade_refuses(
         policy=policy,
         bundle_name="implementation_grade",
         receipt=run.implementation_receipt,
-        bundle=implementation_bundle,
         storage=storage,
         monkeypatch=monkeypatch,
     )

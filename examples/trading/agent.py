@@ -44,15 +44,36 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from eerful.canonical import Address
-from eerful.errors import ComputeError
+from eerful.errors import ComputeError, TrustViolation
 from eerful.evaluator import EvaluatorBundle
 from eerful.receipt import EnhancedReceipt
 from eerful.zg.bridge_init import bridge_init
-from eerful.zg.compute import ComputeClient
+from eerful.zg.compute import ComputeClient, ComputeResult
 from eerful.zg.storage import BridgeStorageClient, StorageClient
+
+
+class _ComputeProtocol(Protocol):
+    """Structural type for the agent's compute dependency.
+
+    The agent only needs `infer_full(...) -> ComputeResult` — the rest
+    of `ComputeClient`'s surface (admin endpoints, attestation fetch,
+    context-manager hooks) is the bridge-init dance, which the agent
+    delegates to its caller (CLI) rather than driving here. Tests
+    inject a `FakeComputeClient` that implements only this method;
+    annotating against the protocol means a Protocol-shaped fake
+    doesn't have to subclass `ComputeClient`."""
+
+    def infer_full(
+        self,
+        *,
+        provider_address: str,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ComputeResult: ...
 
 
 # ---------------- artifact rendering ----------------
@@ -141,7 +162,7 @@ class _ProducedReceipt:
 
 def _produce_receipt(
     *,
-    compute: ComputeClient,
+    compute: _ComputeProtocol,
     storage: StorageClient,
     bundle: EvaluatorBundle,
     provider_address: Address,
@@ -159,12 +180,14 @@ def _produce_receipt(
 
     The producer also asserts the storage-returned `content_hash` matches
     `bundle.evaluator_id()` — defense in depth against a canonicalization
-    drift between sides. A mismatch is a TrustViolation, not a refusal."""
+    drift between sides. A mismatch raises `TrustViolation` (matches the
+    error class `_publish_evaluator` raises in the same scenario, so
+    callers can catch trust/integrity failures uniformly)."""
     # Bundle upload — content-addressed, idempotent.
     bundle_bytes = bundle.canonical_bytes()
     bundle_upload = storage.upload_blob(bundle_bytes)
     if bundle_upload.content_hash != bundle.evaluator_id():
-        raise RuntimeError(
+        raise TrustViolation(
             f"storage returned content_hash {bundle_upload.content_hash} but "
             f"bundle.evaluator_id()={bundle.evaluator_id()} — canonical encoder drift"
         )
@@ -185,7 +208,7 @@ def _produce_receipt(
     # Attestation report upload — the verifier fetches by this hash.
     report_upload = storage.upload_blob(result.attestation_report_bytes)
     if report_upload.content_hash != result.attestation_report_hash:
-        raise RuntimeError(
+        raise TrustViolation(
             f"attestation report content_hash {report_upload.content_hash} != "
             f"compute-reported {result.attestation_report_hash}"
         )
@@ -282,7 +305,7 @@ def _apply_tool_response(
 
 def run_agent(
     *,
-    compute: ComputeClient,
+    compute: _ComputeProtocol,
     storage: StorageClient,
     proposal_bundle: EvaluatorBundle,
     implementation_bundle: EvaluatorBundle,
