@@ -209,8 +209,10 @@ app.post('/admin/add-ledger', async (req: Request, res: Response) => {
 
 app.post('/admin/acknowledge', async (req: Request, res: Response) => {
   const { provider_address } = req.body ?? {};
-  if (typeof provider_address !== 'string') {
-    res.status(400).json({ error: "missing 'provider_address'" });
+  if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+    });
     return;
   }
   try {
@@ -234,6 +236,41 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
     });
   }
 });
+
+// ---------------- helpers ----------------
+//
+// `amount_0g` accepted as either string (preferred — decimal-safe) or
+// number (legacy callers). String path uses `ethers.parseUnits` which
+// avoids IEEE-754 precision drift around large/decimal-heavy values.
+// Number path falls back to the same parser via .toString() — still
+// safer than Math.floor(amount * 1e18) which can quietly lose lower
+// digits for non-power-of-two fractions.
+
+function parseAmount0g(raw: unknown): bigint | null {
+  if (raw === undefined || raw === null) return null;
+  let s: string;
+  if (typeof raw === 'string') {
+    s = raw.trim();
+  } else if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    s = raw.toString();
+  } else {
+    return null;
+  }
+  if (!s) return null;
+  try {
+    const out = ethers.parseUnits(s, 18);
+    return out > 0n ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+// Format a bigint neuron value as a human-readable 0G decimal string.
+// Avoids the precision loss of `Number(bigint) / 1e18` for balances
+// above 2^53-1 wei (~9.007 0G).
+function neuronToA0gString(neuron: bigint): string {
+  return ethers.formatUnits(neuron, 18);
+}
 
 // ---------------- /admin/list-services ----------------
 //
@@ -279,8 +316,10 @@ app.post('/admin/retrieve-fund', async (_req: Request, res: Response) => {
     res.json({
       total_balance_neuron: ledger.totalBalance.toString(),
       available_balance_neuron: ledger.availableBalance.toString(),
-      total_balance_0g: Number(ledger.totalBalance) / 1e18,
-      available_balance_0g: Number(ledger.availableBalance) / 1e18,
+      // String-formatted 0G amounts preserve full precision for any
+      // ledger size; consumers who want a JS number can parseFloat() it.
+      total_balance_0g: neuronToA0gString(ledger.totalBalance),
+      available_balance_0g: neuronToA0gString(ledger.availableBalance),
     });
   } catch (err) {
     res.status(500).json({
@@ -297,20 +336,30 @@ app.post('/admin/retrieve-fund', async (_req: Request, res: Response) => {
 // available (non-locked) balance. One tx of gas, paid from the wallet.
 
 app.post('/admin/refund-ledger', async (req: Request, res: Response) => {
-  const amount_0g = Number(req.body?.amount_0g);
-  if (!Number.isFinite(amount_0g) || amount_0g <= 0) {
-    res.status(400).json({ error: "missing or invalid 'amount_0g' (positive number)" });
+  // SDK expects a number (its own internal a0giToNeuron does the
+  // bigint conversion). We accept string OR number to give callers a
+  // safe path; for SDK invocation we hand it the parsed bigint then
+  // round back to its preferred shape via formatUnits.
+  const amount_neuron = parseAmount0g(req.body?.amount_0g);
+  if (amount_neuron === null) {
+    res.status(400).json({
+      error: "missing or invalid 'amount_0g' (positive decimal string or number)",
+    });
     return;
   }
+  const amount_0g_str = neuronToA0gString(amount_neuron);
   try {
     const b = await getBroker();
-    await b.ledger.refund(amount_0g);
+    // SDK signature: refund(balance: number) — the SDK does its own
+    // float→bigint conversion internally. Our parseUnits/formatUnits
+    // round-trip ensures we hand it a value with no IEEE-754 drift.
+    await b.ledger.refund(Number(amount_0g_str));
     const ledger = await b.ledger.getLedger();
     res.json({
-      refunded_0g: amount_0g,
+      refunded_0g: amount_0g_str,
       total_balance_neuron: ledger.totalBalance.toString(),
       available_balance_neuron: ledger.availableBalance.toString(),
-      total_balance_0g: Number(ledger.totalBalance) / 1e18,
+      total_balance_0g: neuronToA0gString(ledger.totalBalance),
     });
   } catch (err) {
     res.status(500).json({
@@ -329,24 +378,29 @@ app.post('/admin/refund-ledger', async (req: Request, res: Response) => {
 
 app.post('/admin/transfer-fund', async (req: Request, res: Response) => {
   const { provider_address } = req.body ?? {};
-  const amount_0g = Number(req.body?.amount_0g);
-  if (typeof provider_address !== 'string') {
-    res.status(400).json({ error: "missing 'provider_address'" });
+  if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+    });
     return;
   }
-  if (!Number.isFinite(amount_0g) || amount_0g <= 0) {
-    res.status(400).json({ error: "missing or invalid 'amount_0g' (positive number)" });
+  // SDK's transferFund takes neuron as bigint. Use ethers.parseUnits
+  // for decimal-safe string→bigint conversion — avoids the
+  // Math.floor(amount * 1e18) IEEE-754 drift that could otherwise
+  // produce off-by-some-wei lock balances.
+  const balance_neuron = parseAmount0g(req.body?.amount_0g);
+  if (balance_neuron === null) {
+    res.status(400).json({
+      error: "missing or invalid 'amount_0g' (positive decimal string or number)",
+    });
     return;
   }
   try {
     const b = await getBroker();
-    // SDK's transferFund takes neuron as bigint. Convert via 1e18,
-    // rounding down to avoid float drift.
-    const balance_neuron = BigInt(Math.floor(amount_0g * 1e18));
     await b.ledger.transferFund(provider_address, 'inference', balance_neuron);
     res.json({
       provider_address,
-      transferred_0g: amount_0g,
+      transferred_0g: neuronToA0gString(balance_neuron),
       transferred_neuron: balance_neuron.toString(),
     });
   } catch (err) {
@@ -372,8 +426,14 @@ app.post('/admin/transfer-fund', async (req: Request, res: Response) => {
 
 app.post('/compute/inference', async (req: Request, res: Response) => {
   const { provider_address, messages, temperature, max_tokens } = req.body ?? {};
-  if (typeof provider_address !== 'string' || !Array.isArray(messages)) {
-    res.status(400).json({ error: "missing 'provider_address' or 'messages'" });
+  if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+    });
+    return;
+  }
+  if (!Array.isArray(messages)) {
+    res.status(400).json({ error: "missing 'messages'" });
     return;
   }
   // Validate each message has string role + content. Without this, malformed
@@ -527,8 +587,10 @@ app.get('/compute/signature/:chat_id', async (req: Request, res: Response) => {
 
 app.get('/compute/attestation/:provider_address', async (req: Request, res: Response) => {
   const providerAddress = req.params.provider_address;
-  if (!providerAddress) {
-    res.status(400).json({ error: "missing 'provider_address'" });
+  if (!providerAddress || !ethers.isAddress(providerAddress)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+    });
     return;
   }
   try {

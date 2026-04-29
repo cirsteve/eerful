@@ -57,9 +57,14 @@ def recv_envelope(*, timeout_sec: float = 60.0) -> tuple[str, dict[str, Any]] | 
             r.raise_for_status()
             from_peer = r.headers.get("X-From-Peer-Id", "<unknown>")
             try:
-                payload = json.loads(r.content.decode())
-            except json.JSONDecodeError:
+                payload = json.loads(r.content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
                 # Garbage from a peer we don't recognize — log & skip.
+                # Both decode errors and JSON errors land here so a
+                # malformed envelope doesn't crash the polling loop.
+                logging.getLogger(__name__).warning(
+                    "dropping malformed envelope from %s: %s", from_peer[:16], e
+                )
                 continue
             return from_peer, payload
     return None

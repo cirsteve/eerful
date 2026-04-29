@@ -60,6 +60,7 @@ _AGENT_SPEC.loader.exec_module(_AGENT_MODULE)
 
 run_agent: Callable[..., Any] = _AGENT_MODULE.run_agent
 render_proposal: Callable[..., str] = _AGENT_MODULE.render_proposal
+_produce_receipt: Callable[..., Any] = _AGENT_MODULE._produce_receipt
 
 
 _PROVIDER = "0x" + "b" * 40
@@ -260,6 +261,137 @@ def test_run_agent_poisoned_path_applies_drift(
     )
 
     assert run.applied_max_drawdown_pct == 30.0
+
+
+# ---------------- _produce_receipt: Cat C fallback ----------------
+
+
+class _CatCMockCompute:
+    """Stand-in compute client whose ComputeResult diverges
+    response_content (signed envelope) from chat_text (chat completion).
+
+    Mimics 0G Cat C 'centralized passthrough' providers (e.g. Qwen on
+    chain 16602): the signature endpoint signs an attestation envelope
+    that is NOT the model output. The actual chat completion text is
+    delivered alongside via /compute/inference and exposed on
+    ComputeResult.chat_text. _produce_receipt's Cat C fallback parses
+    output_score_block from chat_text when response_content (envelope)
+    isn't JSON.
+    """
+
+    def __init__(
+        self,
+        *,
+        signed_envelope: str,
+        chat_text: str,
+    ) -> None:
+        self._signed_envelope = signed_envelope
+        self._chat_text = chat_text
+        self._counter = 0
+
+    def infer_full(
+        self,
+        *,
+        provider_address: str,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ComputeResult:
+        # Sign the envelope with a real keypair so Step 6 verifies
+        # — same approach as FakeComputeClient.
+        from tests.jig.conftest import _sign_personal as sign
+
+        self._counter += 1
+        chat_id = f"cat-c-chat-{self._counter:03d}"
+        pubkey, sig, address = sign(self._signed_envelope)
+        report_bytes = json.dumps(
+            {"quote": "fake", "tcb_info": {"compose_hash": "00" * 32}}
+        ).encode()
+        report_hash = "0x" + __import__("hashlib").sha256(report_bytes).hexdigest()
+        return ComputeResult(
+            chat_id=chat_id,
+            response_content=self._signed_envelope,
+            chat_text=self._chat_text,
+            model_served="qwen/qwen-2.5-7b-instruct",
+            provider_endpoint="https://provider.test/v1",
+            enclave_pubkey=pubkey,
+            enclave_signature=sig,
+            signing_address=address,
+            attestation_report_bytes=report_bytes,
+            attestation_report_hash=report_hash,
+        )
+
+
+def test_produce_receipt_cat_c_falls_back_to_chat_text_for_score_block(
+    tmp_path: Path,
+    proposal_bundle: EvaluatorBundle,
+) -> None:
+    """When the TEE provider signs an attestation envelope rather than
+    the model output (Cat C semantics), `_produce_receipt`'s
+    output_score_block parsing falls back to `result.chat_text` so the
+    receipt still carries a parseable score block at gate time. Without
+    this fallback, every Cat C receipt has output_score_block=None and
+    the gate refuses on REFUSE_SCORE for the wrong reason."""
+    storage = MockStorageClient()
+    score = {
+        "mandate_compliance": 0.85,
+        "coherence": 0.8,
+        "specificity": 0.85,
+        "overall": 0.82,
+        "commentary": "compliant.",
+    }
+    compute = _CatCMockCompute(
+        signed_envelope="abc:def:centralized:aliyun:9e62",
+        chat_text=json.dumps(score),
+    )
+
+    produced = _produce_receipt(
+        compute=compute,
+        storage=storage,
+        bundle=proposal_bundle,
+        provider_address=_PROVIDER,
+        artifact_text="Strategy: ...",
+        receipts_dir=tmp_path / "receipts",
+        out_name="proposal.json",
+    )
+
+    # Receipt's response_content is the signed envelope (preserves Step
+    # 6 signature recovery), not the chat completion.
+    assert produced.receipt.response_content == "abc:def:centralized:aliyun:9e62"
+    # output_score_block was populated from chat_text via the Cat C
+    # fallback path — without it, the JSON in chat_text would be
+    # discarded.
+    assert produced.receipt.output_score_block is not None
+    assert produced.receipt.output_score_block["overall"] == 0.82
+    assert produced.receipt.output_score_block["mandate_compliance"] == 0.85
+
+
+def test_produce_receipt_cat_c_handles_markdown_fenced_chat_text(
+    tmp_path: Path,
+    proposal_bundle: EvaluatorBundle,
+) -> None:
+    """Qwen often wraps JSON in ```json ... ``` fences. _produce_receipt
+    strips them before parsing so the score block lands cleanly."""
+    storage = MockStorageClient()
+    score = {"mandate_compliance": 0.5, "coherence": 0.5, "specificity": 0.5, "overall": 0.5, "commentary": "x"}
+    fenced = "```json\n" + json.dumps(score) + "\n```"
+    compute = _CatCMockCompute(
+        signed_envelope="abc:def:centralized:aliyun:9e62",
+        chat_text=fenced,
+    )
+
+    produced = _produce_receipt(
+        compute=compute,
+        storage=storage,
+        bundle=proposal_bundle,
+        provider_address=_PROVIDER,
+        artifact_text="Strategy: ...",
+        receipts_dir=tmp_path / "receipts",
+        out_name="proposal.json",
+    )
+
+    assert produced.receipt.output_score_block is not None
+    assert produced.receipt.output_score_block["overall"] == 0.5
 
 
 def test_run_agent_receipts_round_trip_through_verify(

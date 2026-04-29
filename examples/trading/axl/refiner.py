@@ -11,6 +11,7 @@ gives the system its security properties.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -26,6 +27,33 @@ log = logging.getLogger(__name__)
 
 # Reduce Optuna's chatter — every trial logs by default.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Optional peer allowlist: when set, only drafts from this peer ID are
+# accepted. Demo runs without it (logs a warning instead of refusing) so
+# new operators don't have to figure out peer IDs to get a first run; in
+# any production-shaped deployment this MUST be set, since module_code
+# below executes whatever the sender ships.
+ALLOWED_EXPLORER_PEER_ID = os.environ.get("AXL_EXPLORER_PEER_ID")
+
+# AXL's X-From-Peer-Id header truncates the public key after ~14 bytes
+# (28 hex chars) and pads the rest with `f`. Comparing against the full
+# 64-char `our_public_key` from /topology fails even when peers match.
+# Use a conservative 24-char prefix for the allowlist check — well
+# below the truncation point and still gives 96 bits of identification.
+_PEER_PREFIX_LEN = 24
+
+
+def _peer_matches(received: str, expected: str | None) -> bool:
+    if not expected:
+        return False
+    return received[:_PEER_PREFIX_LEN] == expected[:_PEER_PREFIX_LEN]
+
+# Hard cap on Optuna trials — caller-supplied via the AXL envelope, but
+# the sender is not trusted (it's the same channel that ships executable
+# code; we already constrain risk by allowlisting peers, but a buggy
+# explorer could still pin CPU here). 200 is plenty for a single
+# strategy sweep.
+_MAX_TRIALS = 200
 
 
 def _build_objective(module_code: str, params_space: dict[str, list]):
@@ -70,23 +98,48 @@ def main() -> int:
             log.info("no message in 5min — still listening")
             continue
         from_peer, payload = recv
+        if ALLOWED_EXPLORER_PEER_ID and not _peer_matches(from_peer, ALLOWED_EXPLORER_PEER_ID):
+            log.warning(
+                "rejecting envelope from unallowed peer %s (allowlist=%s)",
+                from_peer[:_PEER_PREFIX_LEN],
+                ALLOWED_EXPLORER_PEER_ID[:_PEER_PREFIX_LEN],
+            )
+            continue
+        if not ALLOWED_EXPLORER_PEER_ID:
+            log.warning(
+                "AXL_EXPLORER_PEER_ID unset — accepting drafts from any peer "
+                "(%s). Set the env var in any production deployment.",
+                from_peer[:16],
+            )
         if payload.get("kind") != "STRATEGY_DRAFT":
             log.warning("ignoring envelope of kind %r from %s", payload.get("kind"), from_peer[:16])
             continue
         log.info("STRATEGY_DRAFT received from %s", from_peer[:16])
         try:
+            # Clamp n_trials so a malformed/malicious caller can't pin
+            # CPU. Bound matches typical single-strategy sweep budgets.
+            requested_trials = int(payload.get("n_trials", 20))
+            n_trials = max(1, min(requested_trials, _MAX_TRIALS))
+            if n_trials != requested_trials:
+                log.info("clamped n_trials %d → %d", requested_trials, n_trials)
             result = handle_request(
                 strategy_spec=payload["strategy_spec"],
                 module_code=payload["module_code"],
                 params_space=payload["params_space"],
-                n_trials=int(payload.get("n_trials", 20)),
+                n_trials=n_trials,
             )
             response = {"kind": "OPTIMIZATION_RESULT", **result}
         except Exception as e:
             log.exception("study failed")
             response = {"kind": "OPTIMIZATION_ERROR", "error": str(e)}
-        send_envelope(dest_peer_id=from_peer, payload=response)
-        log.info("response sent to %s", from_peer[:16])
+        try:
+            send_envelope(dest_peer_id=from_peer, payload=response)
+            log.info("response sent to %s", from_peer[:16])
+        except Exception:
+            # Don't crash the daemon if a single response can't be
+            # delivered (peer offline, AXL bridge restarted, etc.) —
+            # just log and continue serving the next request.
+            log.exception("failed to send response to %s", from_peer[:16])
 
 
 if __name__ == "__main__":

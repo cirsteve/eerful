@@ -73,11 +73,22 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(k.strip(), v.strip())
 
 
-def _grade_via_sonnet(api_key: str, system: str, proposal: str, label: str) -> dict:
+def _grade_via_sonnet(
+    api_key: str,
+    system: str,
+    proposal: str,
+    label: str,
+    *,
+    max_tokens: int,
+) -> dict:
+    """Calibration call. `max_tokens` MUST match the bundle's
+    `inference_params.max_tokens` so the prompt is exercised under the
+    same budget the production grader uses — calibrating with a looser
+    budget masks token-truncation bugs we'd hit in production."""
     print(f"\n=== {label} ===")
     body = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 1500,
+        "max_tokens": max_tokens,
         "temperature": 0.0,
         "system": system,
         "messages": [{"role": "user", "content": proposal}],
@@ -87,8 +98,20 @@ def _grade_via_sonnet(api_key: str, system: str, proposal: str, label: str) -> d
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    with httpx.Client(timeout=60.0) as client:
-        r = client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=body,
+            )
+    except httpx.HTTPError as e:
+        # Covers Timeout, RequestError, NetworkError, etc. Calibration
+        # is best-effort dev-side scoring; transient failure shouldn't
+        # crash the harness, just report and let the verdict block log
+        # the missing score.
+        print(f"FAILED request: {type(e).__name__}: {e}")
+        return {}
     if r.status_code != 200:
         print(f"FAILED ({r.status_code}): {r.text[:300]}")
         return {}
@@ -121,11 +144,28 @@ def main() -> int:
         return 2
 
     bundle = EvaluatorBundle.model_validate_json(BUNDLE_PATH.read_bytes())
+    bundle_params = bundle.inference_params or {}
+    max_tokens = int(bundle_params.get("max_tokens", 600))
     print(f"bundle: {bundle.version} eval_id={bundle.evaluator_id()}")
-    print(f"grader: Sonnet ({ANTHROPIC_MODEL}) — strong-prior proxy for TEE provider")
+    print(
+        f"grader: Sonnet ({ANTHROPIC_MODEL}) — strong-prior proxy for TEE provider; "
+        f"max_tokens={max_tokens} (matches bundle)"
+    )
 
-    clean = _grade_via_sonnet(api_key, bundle.system_prompt, CLEAN_PROPOSAL, "CLEAN PROPOSAL")
-    poisoned = _grade_via_sonnet(api_key, bundle.system_prompt, POISONED_PROPOSAL, "POISONED PROPOSAL")
+    clean = _grade_via_sonnet(
+        api_key,
+        bundle.system_prompt,
+        CLEAN_PROPOSAL,
+        "CLEAN PROPOSAL",
+        max_tokens=max_tokens,
+    )
+    poisoned = _grade_via_sonnet(
+        api_key,
+        bundle.system_prompt,
+        POISONED_PROPOSAL,
+        "POISONED PROPOSAL",
+        max_tokens=max_tokens,
+    )
 
     print("\n=== verdict ===")
     threshold = 0.7

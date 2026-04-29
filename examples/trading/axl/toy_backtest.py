@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 from types import ModuleType
 
@@ -47,42 +49,67 @@ def synth_prices() -> dict[str, pd.DataFrame]:
 def _load_module_from_text(name: str, code: str) -> ModuleType:
     """Materialize the explorer's submitted module string into an import.
 
-    Writes to a temp path, builds a module spec, executes. Module survives
-    one Optuna sweep then gets garbage-collected. No persistent state."""
-    tmp_path = Path(f"/tmp/{name}.py")
-    tmp_path.write_text(code)
-    spec = importlib.util.spec_from_file_location(name, tmp_path)
-    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    return mod
+    Uses a UUID-suffixed module name + tempfile so concurrent calls don't
+    collide on `sys.modules` or stomp `/tmp/<name>.py`. The temp file is
+    cleaned up after exec; the module is removed from `sys.modules` to
+    avoid bleed across sweeps."""
+    unique_name = f"{name}_{uuid.uuid4().hex}"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".py",
+        prefix=f"{name}_",
+        delete=False,
+    ) as f:
+        f.write(code)
+        tmp_path = Path(f.name)
+    try:
+        spec = importlib.util.spec_from_file_location(unique_name, tmp_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"could not build spec for {unique_name}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[unique_name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.modules.pop(unique_name, None)
+        return mod
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def run_strategy(module_code: str, params: dict) -> float:
     """Backtest synthesis: load strategy, generate signals + positions
     per coin, compute aggregate equity curve Sharpe.
 
-    Returns Sharpe (higher = better). Negative or NaN means refuse-this-
-    parameter-set and Optuna will steer away."""
-    mod = _load_module_from_text("toy_strategy", module_code)
+    Returns Sharpe (higher = better). Any error during module load,
+    signal generation, or column access returns -1.0 — Optuna treats
+    that as a failed trial and steers away. Wrapping is broad here on
+    purpose: this runs untrusted (well, refiner-allowlisted but
+    arbitrary-shape) module code and we're optimizing, not auditing."""
+    try:
+        mod = _load_module_from_text("toy_strategy", module_code)
+    except Exception:
+        return -1.0
     if not hasattr(mod, "generate_signals"):
         return -1.0  # malformed module → bad params
-    prices = synth_prices()
-    equity_returns = []
     lookback = int(params.get("lookback_periods", 42))
     if lookback < 2 or lookback >= _PERIODS - 10:
         return -1.0
-    for coin, df in prices.items():
+    prices = synth_prices()
+    equity_returns = []
+    for _coin, df in prices.items():
         try:
             df_with_signal = mod.generate_signals(df.copy(), params)
+            if not hasattr(df_with_signal, "columns") or "signal" not in df_with_signal.columns:
+                return -1.0
+            if "close" not in df_with_signal.columns:
+                return -1.0
+            # Per-coin position returns: signal aligned to next-period return
+            ret = df_with_signal["close"].pct_change().shift(-1)
+            position = df_with_signal["signal"].shift(1).fillna(0.0)
+            coin_returns = (ret * position).dropna()
         except Exception:
             return -1.0
-        if "signal" not in df_with_signal.columns:
-            return -1.0
-        # Per-coin position returns: signal aligned to next-period return
-        ret = df_with_signal["close"].pct_change().shift(-1)
-        position = df_with_signal["signal"].shift(1).fillna(0.0)
-        coin_returns = (ret * position).dropna()
         equity_returns.append(coin_returns)
     portfolio = sum(equity_returns) / len(equity_returns)
     if portfolio.std() == 0 or np.isnan(portfolio.std()):

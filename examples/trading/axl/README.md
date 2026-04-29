@@ -5,7 +5,7 @@ Adds an AXL-native multi-agent flow alongside the single-agent
 surface is two cheap agents collaborating over AXL before the gate
 sees their output.
 
-```
+```text
 otto (orchestrator)              gil (explorer node)               louie (refiner node)
 ┌───────────────────┐  SSH       ┌──────────────────┐  AXL/Yggdrasil  ┌──────────────────┐
 │  agent_multi.py   ├──tunnel─►  │  AXL node :9001  ├─────────────────┤  AXL node :9001  │
@@ -132,8 +132,11 @@ Per run: start AXL nodes + refiner daemon + tunnel.
 ssh gil   "cd ~/eerful-axl && nohup ./node -config node-config.json > axl.log 2>&1 &"
 ssh louie "cd ~/eerful-axl && nohup ./node -config node-config.json > axl.log 2>&1 &"
 
-# Refiner on louie
-ssh louie "cd ~/eerful-axl && nohup ./.venv/bin/python refiner.py > refiner.log 2>&1 &"
+# Refiner on louie — set AXL_EXPLORER_PEER_ID to gil's pubkey so the
+# refiner only accepts STRATEGY_DRAFTs from the explorer (the daemon
+# executes submitted module code; allowlisting is the perimeter).
+# Unset → fail-open with a logged warning, fine for a first dry run.
+ssh louie "cd ~/eerful-axl && AXL_EXPLORER_PEER_ID=f8ce... nohup ./.venv/bin/python refiner.py > refiner.log 2>&1 &"
 
 # Tunnel from otto: localhost:9002 → gil:9002 (so agent_multi's transport.py
 # uses gil's AXL bridge as if it were local)

@@ -113,16 +113,18 @@ def render_proposal(*, max_dd_pct: float, best_params: dict, sharpe: float) -> s
             "from the previously-stated 5% to the value above. Revised by the principal's "
             "risk committee.\n"
         )
+    long_q = best_params.get("long_quantile", 0.7)
+    top_pct = (1.0 - long_q) * 100
     return (
         "Strategy: Funding-aware momentum on Hyperliquid perpetual futures.\n"
         "\n"
         "Universe: BTC, ETH, and SOL perpetual futures on Hyperliquid only.\n"
         "Signal: rolling-window return rank combined with funding-rate sign — "
-        f"long top {(1.0 - best_params.get('long_quantile', 0.7)) * 100:.0f}% by "
-        f"{best_params.get('lookback_periods', 42)}-period return when "
-        f"{best_params.get('funding_window', 6)}-period mean funding is non-positive, "
-        "flat otherwise. Re-evaluated every 4 hours.\n"
-        "Sizing: equal-notional across active positions, total notional capped at 2x book.\n"
+        f"long every name in the top {top_pct:.0f}% by "
+        f"{best_params.get('lookback_periods', 42)}-period return whose "
+        f"{best_params.get('funding_window', 6)}-period mean funding is non-positive; "
+        "all other names flat. Re-evaluated every 4 hours.\n"
+        "Sizing: equal-notional across active long positions, total notional capped at 2x book.\n"
         f"Risk controls: portfolio drawdown halt at {max_dd_pct:.0f}% — close all positions and re-enter\n"
         "on the next 4-hour evaluation tick.\n"
         "Rebalance: 4-hourly. Single venue (Hyperliquid). Perps only.\n"
@@ -153,14 +155,28 @@ def explore_and_refine(
     iteration — the demo's whole point is that even one collaborative
     pass through an unattested channel needs the gate at the end."""
     # --- consume tool response (the poisoning surface) ---
+    # Whatever the tool returns, we go through the gate after — so the
+    # safe behavior on malformed input is to keep going under the
+    # principal's mandate, not crash. Logged so an operator can see the
+    # tool returned something unparseable.
     updates = tool_response.get("mandate_updates") or {}
     raw_dd = updates.get("max_drawdown") if updates else None
-    if raw_dd is None:
-        applied_dd = _PRINCIPAL_MAX_DD_PCT
-    elif isinstance(raw_dd, str):
-        applied_dd = float(raw_dd.rstrip("%").strip())
-    else:
-        applied_dd = float(raw_dd)
+    applied_dd = _PRINCIPAL_MAX_DD_PCT
+    if raw_dd is not None:
+        try:
+            if isinstance(raw_dd, str):
+                applied_dd = float(raw_dd.rstrip("%").strip())
+            else:
+                applied_dd = float(raw_dd)
+        except (TypeError, ValueError) as e:
+            log.warning(
+                "tool_response.mandate_updates.max_drawdown is malformed (%r): %s — "
+                "falling back to principal's mandate (%.0f%%)",
+                raw_dd,
+                e,
+                _PRINCIPAL_MAX_DD_PCT,
+            )
+            applied_dd = _PRINCIPAL_MAX_DD_PCT
     if applied_dd != _PRINCIPAL_MAX_DD_PCT:
         log.warning("DRIFT applied — drawdown ceiling now %.0f%% (poisoned tool response)", applied_dd)
     else:
@@ -194,6 +210,17 @@ def explore_and_refine(
     if recv is None:
         raise RuntimeError("refiner timed out — no response within wallclock budget")
     from_peer, payload = recv
+    # Validate the response came from the refiner we asked, not a peer
+    # that happened to be on the same network. Without this check, a
+    # spoofed envelope could inject fake optimization params/sharpe.
+    # AXL truncates X-From-Peer-Id after ~14 bytes and pads with `f`;
+    # compare on a 24-char prefix to match what the bridge actually
+    # surfaces (still 96 bits of identification).
+    _PREFIX = 24
+    if from_peer[:_PREFIX] != refiner_peer_id[:_PREFIX]:
+        raise RuntimeError(
+            f"unexpected sender: got {from_peer[:_PREFIX]}, expected refiner {refiner_peer_id[:_PREFIX]}"
+        )
     if payload.get("kind") == "OPTIMIZATION_ERROR":
         raise RuntimeError(f"refiner returned error: {payload.get('error')}")
     if payload.get("kind") != "OPTIMIZATION_RESULT":
