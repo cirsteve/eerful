@@ -437,6 +437,16 @@ def main(argv: list[str] | None = None) -> int:
     except json.JSONDecodeError as e:
         print(f"tool response at {args.tool_response} is not valid JSON: {e}", file=sys.stderr)
         return 2
+    if not isinstance(tool_response, dict):
+        # `_apply_tool_response` calls `tool_response.get(...)`; a list /
+        # string / number would crash later with AttributeError. Catch
+        # it at the CLI layer so the operator sees a clear error
+        # instead of a traceback.
+        print(
+            f"tool response at {args.tool_response} must be a JSON object",
+            file=sys.stderr,
+        )
+        return 2
 
     proposal_bundle = EvaluatorBundle.model_validate_json(
         (args.bundles_dir / "proposal_grade.json").read_bytes()
@@ -458,15 +468,26 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"   bridge wallet={status.wallet} chain={status.chain_id}")
 
-        run = run_agent(
-            compute=compute,
-            storage=storage,
-            proposal_bundle=proposal_bundle,
-            implementation_bundle=implementation_bundle,
-            provider_address=args.provider,
-            tool_response=tool_response,
-            receipts_dir=args.receipts_dir,
-        )
+        try:
+            run = run_agent(
+                compute=compute,
+                storage=storage,
+                proposal_bundle=proposal_bundle,
+                implementation_bundle=implementation_bundle,
+                provider_address=args.provider,
+                tool_response=tool_response,
+                receipts_dir=args.receipts_dir,
+            )
+        except (ComputeError, TrustViolation, ValueError) as e:
+            # ComputeError: provider/broker call failed.
+            # TrustViolation: storage returned bytes that didn't hash
+            # to the requested content_hash (canonical encoder drift,
+            # adapter bug, or substitution).
+            # ValueError: malformed `mandate_updates` in the tool
+            # response (e.g. `max_drawdown: true`).
+            # Each is a controlled CLI failure, not a bare traceback.
+            print(f"agent run failed: {e}", file=sys.stderr)
+            return 2
 
     drift_marker = (
         " (DRIFT — poisoned tool response)"

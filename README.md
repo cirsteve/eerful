@@ -103,13 +103,13 @@ Exits `0` on PASS, `1` on REFUSE (with the failing check named in
 `outcome`), `2` on a wiring error (unknown tier, missing file, etc.).
 Stdout/stderr formatting:
 
-```
+```text
 PASS — 1 receipt(s) under bundle 'proposal_grade', tier 'low_consequence'
   canonical_set_hash: 0x9d3f...
   receipts: 1 supplied / 1 required
 ```
 
-```
+```text
 REFUSE (refuse_score) — receipt 0xab12... overall 0.25 < tier 'low_consequence' threshold 0.7
   receipts: 1 supplied / 1 required
 ```

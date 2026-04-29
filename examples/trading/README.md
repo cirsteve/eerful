@@ -129,7 +129,7 @@ hash.
 
 ## Architecture, end-to-end
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Principal (off-screen, before the agent runs)               │
 │   - Authors mandate (M1/M2/M3)                              │
