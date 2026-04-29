@@ -211,7 +211,7 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
   const { provider_address } = req.body ?? {};
   if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
     res.status(400).json({
-      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
     });
     return;
   }
@@ -348,12 +348,33 @@ app.post('/admin/refund-ledger', async (req: Request, res: Response) => {
     return;
   }
   const amount_0g_str = neuronToA0gString(amount_neuron);
+  // SDK signature: `refund(balance: number)` — JS number is the only
+  // shape the SDK accepts, and `Number(amount_0g_str)` reintroduces
+  // IEEE-754 drift for amounts that aren't exactly representable
+  // (>2^53 wei or fractional values that can't round-trip cleanly).
+  // Round-trip the JS number back through parseUnits and refuse the
+  // request on any drift, so we fail closed rather than refunding the
+  // wrong neuron amount. Demo refunds (~1 0G) round-trip exactly;
+  // larger refunds need the caller to choose a representable amount.
+  const amount_0g_num = Number(amount_0g_str);
+  let round_tripped: bigint;
+  try {
+    round_tripped = ethers.parseUnits(amount_0g_num.toString(), 18);
+  } catch {
+    res.status(400).json({
+      error: "amount_0g cannot be safely round-tripped through JS number; choose a smaller or exactly-representable amount",
+    });
+    return;
+  }
+  if (round_tripped !== amount_neuron) {
+    res.status(400).json({
+      error: `amount_0g lost precision in float conversion (input ${amount_neuron.toString()} neuron, round-tripped to ${round_tripped.toString()}); use a smaller or exactly-representable amount`,
+    });
+    return;
+  }
   try {
     const b = await getBroker();
-    // SDK signature: refund(balance: number) — the SDK does its own
-    // float→bigint conversion internally. Our parseUnits/formatUnits
-    // round-trip ensures we hand it a value with no IEEE-754 drift.
-    await b.ledger.refund(Number(amount_0g_str));
+    await b.ledger.refund(amount_0g_num);
     const ledger = await b.ledger.getLedger();
     res.json({
       refunded_0g: amount_0g_str,
@@ -380,7 +401,7 @@ app.post('/admin/transfer-fund', async (req: Request, res: Response) => {
   const { provider_address } = req.body ?? {};
   if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
     res.status(400).json({
-      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
     });
     return;
   }
@@ -428,7 +449,7 @@ app.post('/compute/inference', async (req: Request, res: Response) => {
   const { provider_address, messages, temperature, max_tokens } = req.body ?? {};
   if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
     res.status(400).json({
-      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
     });
     return;
   }
@@ -589,7 +610,7 @@ app.get('/compute/attestation/:provider_address', async (req: Request, res: Resp
   const providerAddress = req.params.provider_address;
   if (!providerAddress || !ethers.isAddress(providerAddress)) {
     res.status(400).json({
-      error: "missing or invalid 'provider_address' (must be a checksummed EVM address)",
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
     });
     return;
   }

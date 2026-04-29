@@ -14,7 +14,9 @@ about, not novel strategy generation."""
 from __future__ import annotations
 
 import logging
+import math
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -165,9 +167,15 @@ def explore_and_refine(
     if raw_dd is not None:
         try:
             if isinstance(raw_dd, str):
-                applied_dd = float(raw_dd.rstrip("%").strip())
+                parsed_dd = float(raw_dd.rstrip("%").strip())
             else:
-                applied_dd = float(raw_dd)
+                parsed_dd = float(raw_dd)
+            # `float()` happily accepts "nan"/"inf"/negatives, so an
+            # adversarial tool could otherwise slip a NaN drawdown
+            # through this fallback. Constrain to finite, in (0, 100].
+            if not math.isfinite(parsed_dd) or not (0.0 < parsed_dd <= 100.0):
+                raise ValueError(f"out-of-range max_drawdown: {parsed_dd!r}")
+            applied_dd = parsed_dd
         except (TypeError, ValueError) as e:
             log.warning(
                 "tool_response.mandate_updates.max_drawdown is malformed (%r): %s — "
@@ -205,28 +213,52 @@ def explore_and_refine(
     )
 
     # --- wait for response ---
-    log.info("waiting for OPTIMIZATION_RESULT (timeout %.0fs)", timeout_sec)
-    recv = recv_envelope(timeout_sec=timeout_sec)
-    if recv is None:
-        raise RuntimeError("refiner timed out — no response within wallclock budget")
-    from_peer, payload = recv
-    # Validate the response came from the refiner we asked, not a peer
-    # that happened to be on the same network. Without this check, a
-    # spoofed envelope could inject fake optimization params/sharpe.
+    # Loop until deadline rather than aborting on the first envelope:
+    # a stray/spoofed peer sending garbage shouldn't be able to force
+    # a false failure before the legitimate refiner response arrives.
     # AXL truncates X-From-Peer-Id after ~14 bytes and pads with `f`;
-    # compare on a 24-char prefix to match what the bridge actually
-    # surfaces (still 96 bits of identification).
+    # compare on a 24-char prefix (still 96 bits of identification).
     _PREFIX = 24
-    if from_peer[:_PREFIX] != refiner_peer_id[:_PREFIX]:
+    log.info("waiting for OPTIMIZATION_RESULT (timeout %.0fs)", timeout_sec)
+    deadline = time.time() + timeout_sec
+    payload: dict | None = None
+    while time.time() < deadline:
+        remaining = max(0.0, deadline - time.time())
+        recv = recv_envelope(timeout_sec=min(5.0, remaining))
+        if recv is None:
+            continue
+        from_peer, candidate = recv
+        if from_peer[:_PREFIX] != refiner_peer_id[:_PREFIX]:
+            log.warning(
+                "ignoring envelope from unexpected sender: %s (expected refiner %s)",
+                from_peer[:_PREFIX],
+                refiner_peer_id[:_PREFIX],
+            )
+            continue
+        kind = candidate.get("kind")
+        if kind == "OPTIMIZATION_ERROR":
+            raise RuntimeError(f"refiner returned error: {candidate.get('error')}")
+        if kind != "OPTIMIZATION_RESULT":
+            log.warning("ignoring non-result envelope from refiner: kind=%r", kind)
+            continue
+        payload = candidate
+        break
+    if payload is None:
+        raise RuntimeError("refiner timed out — no response within wallclock budget")
+
+    # Validate the result payload before indexing — the AXL channel is
+    # untrusted by design and a malformed envelope shouldn't crash with
+    # KeyError/TypeError when an explicit RuntimeError is more legible.
+    best_params = payload.get("best_params")
+    if not isinstance(best_params, dict):
         raise RuntimeError(
-            f"unexpected sender: got {from_peer[:_PREFIX]}, expected refiner {refiner_peer_id[:_PREFIX]}"
+            f"invalid OPTIMIZATION_RESULT.best_params: {type(best_params).__name__}"
         )
-    if payload.get("kind") == "OPTIMIZATION_ERROR":
-        raise RuntimeError(f"refiner returned error: {payload.get('error')}")
-    if payload.get("kind") != "OPTIMIZATION_RESULT":
-        raise RuntimeError(f"unexpected envelope kind from refiner: {payload.get('kind')}")
-    best_params = payload["best_params"]
-    sharpe = float(payload["sharpe"])
+    raw_sharpe = payload.get("sharpe")
+    try:
+        sharpe = float(raw_sharpe)
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(f"invalid OPTIMIZATION_RESULT.sharpe: {raw_sharpe!r}") from e
     log.info("OPTIMIZATION_RESULT — sharpe=%.3f params=%s", sharpe, best_params)
 
     # --- render final artifacts ---

@@ -116,7 +116,16 @@ def _grade_via_sonnet(
         print(f"FAILED ({r.status_code}): {r.text[:300]}")
         return {}
     payload = r.json()
-    raw = payload["content"][0]["text"]
+    # Anthropic /v1/messages normally returns
+    # {"content": [{"type":"text","text":"..."}], ...}
+    # but a malformed/error response may have empty content or missing
+    # keys. Index defensively so a shape change doesn't crash the
+    # harness (Optuna / demo flows want this script to fail soft).
+    try:
+        raw = payload["content"][0]["text"]
+    except (KeyError, IndexError, TypeError) as e:
+        print(f"FAILED unexpected API response shape: {e}: {str(payload)[:200]}")
+        return {}
     print("raw:", raw[:400])
     try:
         scored = json.loads(raw)
