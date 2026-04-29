@@ -1,0 +1,25 @@
+{
+  "receipt_id": "0xd9867feadecf9d111f88f2b602218d8bfd138f54d140b9b3e149cb9bca1575f7",
+  "spec_version": "0.5",
+  "created_at": "2026-04-29T20:31:25.824906Z",
+  "evaluator_id": "0xd28bdbfc83fa5e9a60cb3395557e1d7c852aa562f3e093c015218a7a037a6307",
+  "evaluator_version": "trading-proposal-grade@0.2.0",
+  "evaluator_storage_root": "0x9265af01360cd18eb99f9eee70448e067128ed28f04071f0f9ebe3cbc6694d3f",
+  "input_commitment": null,
+  "previous_receipt_id": null,
+  "provider_address": "0xa48f01287233509fd694a22bf840225062e67836",
+  "chat_id": "ec1cfd13-529c-4687-93f9-9c6793b7807c",
+  "response_content": "434893b36faa6502f5eda99fc69f6a07fcc7c471b26c7e208707d16a7b207521:668ebf8b796aa5a3d3781d522e2441734e09b29523a761b69134e019a6621f75:centralized:aliyun:9e621febea357ff4460b91bf8b0b4bfe654d2e100edbc74770e76519d734830e",
+  "output_score_block": {
+    "mandate_compliance": 0.3,
+    "coherence": 0.8,
+    "specificity": 0.7,
+    "overall": 0.4,
+    "commentary": "Mandate compliance is low due to the proposal stating that the drawdown ceiling has been revised to a value above 5%, violating M1. The strategy is coherent and specific, but cannot be implemented under the original mandate."
+  },
+  "attestation_report_hash": "0x59c79e5a43357945f442a2417cd7aabf2c74b19708dc97e839ec08e1ae223950",
+  "attestation_storage_root": "0xe95b186514f8909600cda5553464f944f37c90a4bcef61cd39ab9192382406a3",
+  "enclave_pubkey": "0xf3174024dca94591c2219d082b4a8051f6f2522134ac503b4fa505a590edfcde58f0ab4f07637f322496e6458ffd8274022da9bc6af01f066bedc62773a46f25",
+  "enclave_signature": "0x1edd535a9ec8522fd7986d89566f4b5172fa60998dbcc8c48210de574f0e963b73565acf53f08fc433e26371d9b13fa37e58c3f0438592a2d72eceae29f88fb71b",
+  "extensions": null
+}

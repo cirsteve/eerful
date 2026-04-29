@@ -1,6 +1,6 @@
 {
   "tool": "fetch_market_research",
-  "headline": "Q1 2026 large-cap volatility regime persists",
-  "summary": "Realized vol on S&P 500 components has compressed 18% YoY but cross-sectional dispersion is up — favors single-name selection over index momentum. No regulatory or mandate updates this period.",
+  "headline": "Q1 2026 perp funding regime — BTC/ETH/SOL dispersion widening",
+  "summary": "Realized vol on Hyperliquid perps has compressed 14% QoQ but funding-rate dispersion across BTC, ETH, and SOL is at a 6-month high — favors funding-aware momentum over directional carry. No regulatory or mandate updates this period.",
   "mandate_updates": null
 }

@@ -235,6 +235,127 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
   }
 });
 
+// ---------------- /admin/list-services ----------------
+//
+// Read-only — no tx, no fees. Lists the current set of compute providers
+// registered with the broker. Use to confirm a provider address is live
+// before attempting acknowledge or inference.
+
+app.get('/admin/list-services', async (_req: Request, res: Response) => {
+  try {
+    const b = await getBroker();
+    const services = await b.inference.listService();
+    res.json({
+      count: services.length,
+      services: services.map((s: any) => ({
+        provider: s.provider,
+        name: s.name ?? null,
+        url: s.url ?? null,
+        model: s.model ?? null,
+        verifiability: s.verifiability ?? null,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ---------------- /admin/retrieve-fund ----------------
+//
+// Pulls all funds from per-provider inference locks back to the broker
+// ledger's available pool. Wraps SDK
+// `ledger.retrieveFund('inference')`. Use to reclaim funds locked to a
+// provider you no longer want to call (e.g. one returning junk). One tx
+// of gas. After this, available ledger balance increases; transferFund
+// against a new working provider is the next step.
+
+app.post('/admin/retrieve-fund', async (_req: Request, res: Response) => {
+  try {
+    const b = await getBroker();
+    await b.ledger.retrieveFund('inference');
+    const ledger = await b.ledger.getLedger();
+    res.json({
+      total_balance_neuron: ledger.totalBalance.toString(),
+      available_balance_neuron: ledger.availableBalance.toString(),
+      total_balance_0g: Number(ledger.totalBalance) / 1e18,
+      available_balance_0g: Number(ledger.availableBalance) / 1e18,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ---------------- /admin/refund-ledger ----------------
+//
+// Pulls `amount_0g` from the broker ledger back to the bridge's wallet.
+// Wraps SDK `ledger.refund(balance: number)`. Use to reclaim unused
+// funds; the SDK enforces that `amount_0g` does not exceed the ledger's
+// available (non-locked) balance. One tx of gas, paid from the wallet.
+
+app.post('/admin/refund-ledger', async (req: Request, res: Response) => {
+  const amount_0g = Number(req.body?.amount_0g);
+  if (!Number.isFinite(amount_0g) || amount_0g <= 0) {
+    res.status(400).json({ error: "missing or invalid 'amount_0g' (positive number)" });
+    return;
+  }
+  try {
+    const b = await getBroker();
+    await b.ledger.refund(amount_0g);
+    const ledger = await b.ledger.getLedger();
+    res.json({
+      refunded_0g: amount_0g,
+      total_balance_neuron: ledger.totalBalance.toString(),
+      available_balance_neuron: ledger.availableBalance.toString(),
+      total_balance_0g: Number(ledger.totalBalance) / 1e18,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ---------------- /admin/transfer-fund ----------------
+//
+// Moves `amount_0g` from ledger-available into the provider's locked
+// balance (per-provider lock). Wraps SDK
+// `ledger.transferFund(provider, 'inference', balance_neuron_bigint)`.
+// One tx of gas. Use to top up a provider's lock when unsettled fees
+// push the required minimum above the current lock.
+
+app.post('/admin/transfer-fund', async (req: Request, res: Response) => {
+  const { provider_address } = req.body ?? {};
+  const amount_0g = Number(req.body?.amount_0g);
+  if (typeof provider_address !== 'string') {
+    res.status(400).json({ error: "missing 'provider_address'" });
+    return;
+  }
+  if (!Number.isFinite(amount_0g) || amount_0g <= 0) {
+    res.status(400).json({ error: "missing or invalid 'amount_0g' (positive number)" });
+    return;
+  }
+  try {
+    const b = await getBroker();
+    // SDK's transferFund takes neuron as bigint. Convert via 1e18,
+    // rounding down to avoid float drift.
+    const balance_neuron = BigInt(Math.floor(amount_0g * 1e18));
+    await b.ledger.transferFund(provider_address, 'inference', balance_neuron);
+    res.json({
+      provider_address,
+      transferred_0g: amount_0g,
+      transferred_neuron: balance_neuron.toString(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
 // ---------------- /compute/inference ----------------
 //
 // Body: { provider_address, messages: [{role, content}], temperature?, max_tokens? }

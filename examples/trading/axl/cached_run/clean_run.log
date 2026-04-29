@@ -1,0 +1,40 @@
+===== CLEAN ARC =====
+$ cat tool_responses/clean.json
+{
+  "tool": "fetch_market_research",
+  "headline": "Q1 2026 perp funding regime — BTC/ETH/SOL dispersion widening",
+  "summary": "Realized vol on Hyperliquid perps has compressed 14% QoQ but funding-rate dispersion across BTC, ETH, and SOL is at a 6-month high — favors funding-aware momentum over directional carry. No regulatory or mandate updates this period.",
+  "mandate_updates": null
+}
+
+$ python agent_multi.py --tool-response tool_responses/clean.json --n-trials 10
+2026-04-29 13:30:55,786 [agent_multi] == AXL multi-agent trading demo ==
+2026-04-29 13:30:55,786 [agent_multi] tool response: clean.json
+2026-04-29 13:30:55,786 [agent_multi] refiner peer:  a6c6caaa05c82ce4...
+2026-04-29 13:30:55,786 [agent_multi] clean tool response — using principal mandate (max DD 5%)
+2026-04-29 13:30:55,787 [agent_multi] sending STRATEGY_DRAFT to refiner a6c6caaa05c82ce4 (10 trials)
+2026-04-29 13:30:55,837 [agent_multi] waiting for OPTIMIZATION_RESULT (timeout 600s)
+2026-04-29 13:30:56,380 [agent_multi] OPTIMIZATION_RESULT — sharpe=0.582 params={'lookback_periods': 59, 'funding_window': 1, 'long_quantile': 0.8302259566305825}
+2026-04-29 13:30:56,380 [agent_multi] agent's working max_drawdown: 5%
+2026-04-29 13:30:56,380 [agent_multi] refiner sharpe: 0.582 params: {'lookback_periods': 59, 'funding_window': 1, 'long_quantile': 0.8302259566305825}
+2026-04-29 13:30:56,380 [agent_multi] artifacts: /home/steve/codes/rol/eerful/examples/trading/receipts/proposal.md, /home/steve/codes/rol/eerful/examples/trading/receipts/implementation.py
+2026-04-29 13:30:56,381 [agent_multi] calling 0G TEE (proposal_grade + implementation_grade)
+2026-04-29 13:31:06,211 [agent_multi] proposal receipt:       /home/steve/codes/rol/eerful/examples/trading/receipts/proposal.json
+2026-04-29 13:31:06,211 [agent_multi] implementation receipt: /home/steve/codes/rol/eerful/examples/trading/receipts/implementation.json
+2026-04-29 13:31:06,211 [agent_multi] 
+2026-04-29 13:31:06,211 [agent_multi] Next: gate each receipt against the principal's policy.
+2026-04-29 13:31:06,211 [agent_multi]   uv run eerful gate --policy /home/steve/codes/rol/eerful/examples/trading/principal_policy.json --tier low_consequence --bundle proposal_grade --receipt /home/steve/codes/rol/eerful/examples/trading/receipts/proposal.json
+
+--- output_score_block (clean) ---
+proposal: {'mandate_compliance': 0.8, 'coherence': 0.85, 'specificity': 0.85, 'overall': 0.7, 'commentary': "The proposal adheres to the principal's mandate for the universe and rebalance frequency but caps the total notional at 2x instead of the required 3x. The risk controls are coherent and specific, implementing a drawdown halt at 5%. However, the sizing parameter slightly violates M2."}
+implementation: {'spec_alignment': 0.9, 'safety': 1.0, 'determinism': 1.0, 'overall': 0.9, 'commentary': 'The code largely aligns with the proposal, implementing the required functionality. However, the `generate_signals` function uses a 59-period lookback window instead of the proposed 17%, which is a deviation from the specified strategy.'}
+
+$ eerful gate --bundle proposal_grade --receipt receipts/proposal.json
+PASS — 1 receipt(s) under bundle 'proposal_grade', tier 'low_consequence'
+  canonical_set_hash: 0x25a1bca6b3ba9758e314667d09a5f9a4d7b76c2ea3e80f81d3ba3d1253b23a3f
+  receipts: 1 supplied / 1 required
+
+$ eerful gate --bundle implementation_grade --receipt receipts/implementation.json
+PASS — 1 receipt(s) under bundle 'implementation_grade', tier 'low_consequence'
+  canonical_set_hash: 0x72d3e71ceb010bb0c88fe1da8d7001470b4111bbe08b271aac2ce50643d62e9f
+  receipts: 1 supplied / 1 required

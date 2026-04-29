@@ -1,0 +1,25 @@
+{
+  "receipt_id": "0x4e00ce61e49c6bb7dd56890b1efcb78fea411f327bf4f89cc7540cdc5c4a42f0",
+  "spec_version": "0.5",
+  "created_at": "2026-04-29T20:31:29.869954Z",
+  "evaluator_id": "0x937bb6e7148621e3d84c9b1e334c729201eb48944137100a555149011bc50e11",
+  "evaluator_version": "trading-implementation-grade@0.1.0",
+  "evaluator_storage_root": "0xfc2ce06f3d37a4b3cbf32a4d02409e1958e7cfac88b68e320818121f527f3891",
+  "input_commitment": null,
+  "previous_receipt_id": null,
+  "provider_address": "0xa48f01287233509fd694a22bf840225062e67836",
+  "chat_id": "33ee2ba3-86f9-4235-ab92-07be8ef90b2e",
+  "response_content": "60ccb70d9466122856e0973aec02fd7f1c1878d7df4a3b2578c117433fa69dfa:3fef9785ea553600f0083a587e19b8a4ca3cf8710124bf33fff18eca5891c328:centralized:aliyun:9e621febea357ff4460b91bf8b0b4bfe654d2e100edbc74770e76519d734830e",
+  "output_score_block": {
+    "spec_alignment": 0.9,
+    "safety": 1.0,
+    "determinism": 1.0,
+    "overall": 0.9,
+    "commentary": "The code largely aligns with the proposal, implementing a 27-period lookback window and a 1-period funding window as specified. However, the `long_quantile` parameter is set to 0.6577500623701187 instead of the stated 34% (0.34), which may affect the strategy's performance."
+  },
+  "attestation_report_hash": "0x59c79e5a43357945f442a2417cd7aabf2c74b19708dc97e839ec08e1ae223950",
+  "attestation_storage_root": "0xe95b186514f8909600cda5553464f944f37c90a4bcef61cd39ab9192382406a3",
+  "enclave_pubkey": "0xf3174024dca94591c2219d082b4a8051f6f2522134ac503b4fa505a590edfcde58f0ab4f07637f322496e6458ffd8274022da9bc6af01f066bedc62773a46f25",
+  "enclave_signature": "0xa95516213bae14ec040a738213c7c29c9d0153bfc3cbde66a70ebcece7a23f305b6c40b4fdab9790c27c211a6e5918e6c036b585de1ed0a9e54ca737f107976b1c",
+  "extensions": null
+}

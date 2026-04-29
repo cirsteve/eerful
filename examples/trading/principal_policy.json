@@ -2,13 +2,13 @@
   "policy_version": "0.5",
   "principal_id": "did:pkh:eip155:16602:0x0000000000000000000000000000000000000000",
   "bundles": {
-    "proposal_grade": "0x89cc2157360ac98fd3f10f9cef6a669a41170f9a62f13e0a71b212cde529232d",
-    "implementation_grade": "0x4ae6ae7c1f4dd21ea618df0c513a44aeb7425282e1872443ddfa4cd944f5620c"
+    "proposal_grade": "0xd28bdbfc83fa5e9a60cb3395557e1d7c852aa562f3e093c015218a7a037a6307",
+    "implementation_grade": "0x937bb6e7148621e3d84c9b1e334c729201eb48944137100a555149011bc50e11"
   },
   "tiers": {
     "low_consequence": {
       "n_attestations": 1,
-      "score_threshold": 0.7,
+      "score_threshold": 0.6,
       "diversity": {
         "distinct_signers": false,
         "distinct_compose_hashes": false

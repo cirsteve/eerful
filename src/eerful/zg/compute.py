@@ -103,6 +103,15 @@ class ComputeResult(BaseModel):
     attestation_report_hash: Bytes32Hex
     input_tokens: int | None = None
     output_tokens: int | None = None
+    chat_text: str = ""
+    """The model's chat completion content (from `/compute/inference`'s
+    `response_content` — i.e. `choices[0].message.content`). For Cat A
+    providers chat_text == response_content (the TEE signs the model
+    output). For Cat C centralized passthrough providers (e.g. Qwen on
+    16602), `response_content` is the provider's signed attestation
+    envelope and `chat_text` is the actual model output — used to
+    populate the receipt's `output_score_block`. Defaults to empty
+    string for backwards compatibility with pre-Cat-C test fixtures."""
 
 
 class ComputeClient:
@@ -274,6 +283,7 @@ class ComputeClient:
         return ComputeResult(
             chat_id=inference["chat_id"],
             response_content=signed_text,
+            chat_text=inference.get("response_content", ""),
             model_served=inference["model_served"],
             provider_endpoint=inference["provider_endpoint"],
             enclave_pubkey=pubkey_hex,
