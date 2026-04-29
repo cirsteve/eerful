@@ -231,13 +231,20 @@ An evaluator bundle is a JSON document published to content-addressed storage. T
 
 ```
 EvaluatorBundle {
-  version                  : str            # human-readable, e.g. "trading-critic@1.2.0"
-  model_identifier         : str            # e.g. "zai-org/GLM-5-FP8"
-  system_prompt            : str            # the criteria, in natural language
-  output_schema            : dict?          # JSON Schema for output_score_block; nullable
-  inference_params         : dict?          # temperature, max_tokens, etc.; nullable
-  accepted_compose_hashes  : [Bytes32Hex]?  # allowlist of attested compose-hashes; nullable
-  metadata                 : dict?          # publisher-defined; informational
+  version                  : str                  # human-readable, e.g. "trading-critic@1.2.0"
+  model_identifier         : str                  # e.g. "zai-org/GLM-5-FP8"
+  system_prompt            : str                  # the criteria, in natural language
+  output_schema            : dict?                # JSON Schema for output_score_block; nullable
+  inference_params         : dict?                # temperature, max_tokens, etc.; nullable
+  accepted_compose_hashes  : [ComposeHashEntry]?  # allowlist of attested composes; nullable
+  metadata                 : dict?                # publisher-defined; informational
+}
+
+ComposeHashEntry {
+  hash              : Bytes32Hex          # sha256(app_compose); the attested compose-hash
+  category          : "A" | "B" | "C"     # publisher's §8.2 declaration; see below
+  provider_address  : Address             # 0G compute provider hosting this compose
+  notes             : str?                # publisher-supplied annotation (e.g. "vLLM --model X"); nullable
 }
 ```
 
@@ -247,7 +254,16 @@ EvaluatorBundle {
 
 `inference_params`, when present, fix the inference parameters (temperature, top-p, max_tokens, etc.) the producer SHOULD use. They are not enforced at the protocol level — the TEE doesn't attest to them — but consistent params across producers using the same evaluator improve cross-receipt comparability.
 
-`accepted_compose_hashes`, when present, is an allowlist of TEE compose-hashes the publisher has reviewed and accepts as valid environments for producing receipts under this evaluator. Verifiers MUST extract the attested compose-hash from the attestation report (§7.1 Step 5) and reject the receipt if it is not in the allowlist. When absent, no compose-hash gating is performed and the receipt's model-environment claim rests on the protocol-level attestation alone (see §8). Publishers SHOULD populate this field when they have specific providers in mind whose compose configuration they have inspected; this is the strongest practical defense against the §8 gap available without upstream protocol changes.
+`accepted_compose_hashes`, when present, is an allowlist of TEE compose configurations the publisher has reviewed and accepts as valid environments for producing receipts under this evaluator. Each entry binds four facts the publisher commits to via the bundle's content hash:
+
+- `hash` — the attested compose-hash the entry refers to. Verifiers MUST extract the attested compose-hash from the attestation report (§7.1 Step 5), look up the matching entry in the allowlist, and reject the receipt if no entry matches.
+- `category` — the publisher's §8.2 declaration for this compose. MUST be one of `"A"`, `"B"`, `"C"`. The "unknown" outcome of the heuristic categorizer is reserved for verifier-side diagnostics; publishers classify their own composes with full knowledge of what they run, so allowing "unknown" here would let a publisher declare a compose without committing to its category. Higher-layer executors MAY enforce a tier-specific category subset (e.g., refuse a tier requiring Category A receipts when the matched entry is declared B or C); see §8.3.
+- `provider_address` — the 0G compute provider whose broker hosts this compose. Informational on the receipt-verification side; load-bearing on higher-layer diversity rules that compare across receipt sets.
+- `notes` — optional human-readable annotation. Not parsed.
+
+When the field is absent, no compose-hash gating is performed and the receipt's model-environment claim rests on the protocol-level attestation alone (see §8). When present, the list MUST be non-empty (an empty list has no canonical "no gating" form) and each `hash` MUST be unique across entries (Step 5 picks the first match; duplicates with conflicting categories would make resolution order-dependent).
+
+Publishers SHOULD populate this field when they have specific providers in mind whose compose configuration they have inspected; this is the strongest practical defense against the §8 gap available without upstream protocol changes.
 
 Bundles are immutable after publication. A new version of an evaluator publishes a new bundle with a new `evaluator_id`. Receipts under the old `evaluator_id` remain valid under their evaluator; cohort comparison across `evaluator_id`s is a higher-layer concern.
 
@@ -376,7 +392,7 @@ This split is empirical, not normative — 0G's protocol does not categorize pro
 
 These are layered. Verifiers and publishers may combine them.
 
-- **Compose-hash allowlist (protocol-level, EER-native).** An evaluator publisher populates `accepted_compose_hashes` (§6.5) with the compose-hashes of providers whose configuration they have inspected and accept. Verification Step 5 fails closed when the attested compose-hash is not in the list. This is the strongest defense the receipt format alone can offer: it shifts trust from "any TEE provider" to "any provider whose compose the publisher reviewed." It is opt-in; bundles without the field do no compose-hash gating.
+- **Compose-hash allowlist (protocol-level, EER-native).** An evaluator publisher populates `accepted_compose_hashes` (§6.5) with the compose-hashes of providers whose configuration they have inspected and accept. Verification Step 5 fails closed when the attested compose-hash is not in the list. Each entry also commits the publisher's §8.2 category declaration (`A`/`B`/`C`) for the compose, content-addressed alongside the hash; higher-layer executors MAY enforce a tier-specific category subset on top of Step 5 (e.g., a high-consequence policy that refuses any receipt whose declared category is not `A`, even when the compose-hash matches the allowlist). The compose-hash binding is the strongest defense the receipt format alone can offer; it shifts trust from "any TEE provider" to "any provider whose compose the publisher reviewed." It is opt-in; bundles without the field do no compose-hash gating.
 
 - **Compose inspection at verification time (advisory).** Even without an allowlist, a verifier can parse the attested `app_compose` and check that the declared `model_identifier` appears in a launch command. This catches Category B and C providers automatically. It is not protocol-mandated because the parsing is provider-specific and brittle, but tooling MAY perform it.
 
@@ -421,6 +437,10 @@ A poorly designed system prompt or scoring schema produces meaningless receipts.
 The provider is honest about TEE setup but cooperates with a producer who submits cherry-picked inputs. The receipts are authentic but the evaluation is rigged.
 *Mitigation:* none structurally. EER is per-receipt authenticity, not honest-evaluation. Higher-layer protocols MAY require receipts be produced against committed inputs (`input_commitment`) the producer cannot retroactively choose, or require append-only publication of receipt sequences.
 
+**Threat: Producer (autonomous agent) is compromised between mandate and receipt.**
+A poisoned tool response, prompt injection through retrieved content, or an adversarial RAG corpus causes the producer to submit an artifact that violates the principal's pre-committed criteria. The receipts are authentic — the TEE faithfully evaluated whatever the agent submitted — but the agent's input was compromised upstream.
+*Mitigation:* not at the receipt layer. EER is per-receipt authenticity. Mitigation lives one layer up: a principal commits (by content hash) to evaluator bundles whose `system_prompt` encodes the principal's true criteria, then refuses to act on receipts whose scores fall below threshold. The bundle's content hash is the reference point the agent cannot reach. See `examples/trading/` for a concrete demonstration: an executor consumes EER receipts and a principal-authored policy, refuses on mandate drift detected by a `proposal_grade` evaluator whose prompt pins the principal's mandate at bundle hash. Receipts are the substrate; the executor + policy is the gate.
+
 **Threat: Compute provider runs a different model than the evaluator declares.**
 See §8 for full discussion. The provider's TEE attests "real hardware ran something"; it does not attest "real hardware ran the model the evaluator named."
 *Mitigation:* partial; covered in §8.2.
@@ -446,6 +466,7 @@ A producer sets `created_at` to a time in the past.
 These are limitations of EER v0.5 that future versions MAY address:
 
 - **No model-weight attestation.** TEE attests the launched compose, not the loaded weights. The compose-hash allowlist (§6.5, §8.3) lets a publisher gate on a known-good launch configuration but does not bind the weight bytes that the model server actually loads at runtime. This is a vendor-protocol gap, not a receipt-format gap. See §8.
+- **No standalone signature on `output_score_block`.** Step 6's enclave signature covers `response_content` only. `output_score_block` is included in the canonical signing payload that yields `receipt_id`, so tampering with the score on an existing receipt fails Step 1. But an attacker holding a legitimately TEE-signed `(response_content, enclave_signature)` pair can construct a *new* receipt with a fabricated score block, recompute `receipt_id`, and the result passes all six verification steps. Verifiers that care about score integrity SHOULD deterministically re-derive `output_score_block` from `response_content` per the producer/verifier-agreed parsing rule (e.g., canonical JSON decode of the response body), or rely on a tight `output_schema` that fabricated blocks won't satisfy. v0.6 MAY add a separate enclave signature over the score block to close this gap natively.
 - **No chain-completeness guarantee.** Receipt chains are producer-asserted. A producer can hide unfavorable receipts. Append-only public logs would address this; v0.5 leaves it to higher layers.
 - **No native EVM verification.** Canonical JSON is portable but not native to EVM contracts. EIP-712 typed-data encoding would enable on-chain verification of receipts.
 - **No revocation primitive.** A bundle published to Storage cannot be deprecated at the protocol level. Higher-layer registries MAY mark evaluator IDs as deprecated; EER receipts under deprecated IDs remain technically valid but socially deprecated.
