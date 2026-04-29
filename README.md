@@ -251,7 +251,10 @@ bundle's criteria, not the caller's.
 ## Spec
 
 - [`docs/spec.md`](docs/spec.md) — EER protocol (v0.5)
-- [`specs/executor-and-rails-design.md`](specs/executor-and-rails-design.md) — executor + multi-attestation rails design (gitignored; local artifact)
+
+The executor + multi-attestation rails design is captured in a
+local-only planning artifact — its substance has been incorporated
+into the threat-model framing above and [`examples/trading/README.md`](examples/trading/README.md).
 
 Status: pre-hackathon submission. The trading demo
 ([`examples/trading/`](examples/trading/)) is the recordable

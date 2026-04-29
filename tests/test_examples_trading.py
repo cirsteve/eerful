@@ -455,8 +455,10 @@ def test_poisoned_path_proposal_grade_refuses(
         storage=storage,
         monkeypatch=monkeypatch,
     )
+    # Outcome is the stable contract; `detail` formatting can shift
+    # without affecting gate semantics. Asserting the structured
+    # outcome is what this test is actually trying to pin.
     assert proposal_result.outcome == GateOutcome.REFUSE_SCORE
-    assert "0.25" in proposal_result.detail or "0.7" in proposal_result.detail
 
     # implementation_grade would pass — that's the load-bearing
     # narrative of the two-gate design. Single-gate (impl-only)

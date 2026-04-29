@@ -195,11 +195,19 @@ def _produce_receipt(
     # compliant JSON, which is an upstream issue (the score-test loop catches
     # this before publication). Persist the raw response in the receipt either
     # way so the gate's REFUSE_SCORE detail can surface what was wrong.
+    #
+    # `output_score_block` is typed `dict | None` on `EnhancedReceipt`, so a
+    # response that decodes to a list / number / string would fail receipt
+    # construction. Guard explicitly: non-dict → None, gate refuses via the
+    # existing REFUSE_SCORE branch rather than crashing the producer.
     response_content = result.response_content
+    output_score_block: dict[str, Any] | None
     try:
-        output_score_block: dict[str, Any] | None = json.loads(response_content)
+        parsed = json.loads(response_content)
     except json.JSONDecodeError:
         output_score_block = None
+    else:
+        output_score_block = parsed if isinstance(parsed, dict) else None
 
     receipt = EnhancedReceipt.build(
         created_at=datetime.now(timezone.utc),

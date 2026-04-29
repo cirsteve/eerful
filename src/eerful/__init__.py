@@ -1,6 +1,6 @@
 """eerful — reference implementation of Enhanced Evaluation Receipts.
 
-Spec: docs/spec.md (canonical) or specs/eer_spec.md (working draft).
+Spec: docs/spec.md (canonical).
 """
 
 from eerful.canonical import (
