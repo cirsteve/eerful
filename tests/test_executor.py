@@ -484,6 +484,40 @@ def test_evaluate_gate_refuses_when_receipt_fails_step_4_storage_miss():
     assert "Step 4" in result.detail
 
 
+def test_evaluate_gate_refuses_when_storage_raises_value_error():
+    """`BridgeStorageClient.download_blob` raises ValueError when a
+    receipt's storage_root is malformed hex (Pydantic's BeforeValidator
+    only lowercases — length isn't enforced at the field level). The
+    gate must translate ValueError to REFUSE_INVALID_RECEIPT, not
+    crash, so the rails fail closed even on malformed receipt input."""
+    r, bundle, _ = _make_receipt_and_storage()
+
+    class _ValidatingStorage:
+        """Mimics BridgeStorageClient's hex validation — raises
+        ValueError instead of returning bytes when given a malformed
+        content_hash. Mock doesn't do this; bridge does."""
+
+        def upload_blob(self, data: bytes) -> Any:
+            raise NotImplementedError
+
+        def download_blob(self, content_hash: str, storage_root: str) -> bytes:
+            raise ValueError(
+                f"content_hash must be 0x-prefixed 64-char lowercase hex, got {content_hash!r}"
+            )
+
+    p = _policy(bundle_id=bundle.evaluator_id())
+    result = evaluate_gate(
+        policy=p,
+        tier="low_consequence",
+        bundle_name="proposal_grade",
+        receipts=[r],
+        storage=_ValidatingStorage(),
+    )
+    assert result.outcome == GateOutcome.REFUSE_INVALID_RECEIPT
+    assert "malformed" in result.detail
+    assert r.receipt_id in result.detail
+
+
 def test_evaluate_gate_refuses_when_receipt_fails_step_5_allowlist():
     """Bundle declares allowlist not matching the report's compose →
     Step 5 fails → REFUSE_INVALID_RECEIPT."""

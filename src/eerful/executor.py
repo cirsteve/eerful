@@ -245,6 +245,25 @@ def evaluate_gate(
                     f"receipt {r.receipt_id} failed §7.1 Step {e.step}: {e.reason}"
                 ),
             )
+        except (ValueError, TypeError) as e:
+            # Storage-layer hex/length validators (e.g.
+            # `BridgeStorageClient.download_blob`) raise `ValueError` on
+            # a malformed `evaluator_storage_root` /
+            # `attestation_storage_root` — Pydantic's `Bytes32Hex`
+            # BeforeValidator only lowercases, so length-bad inputs reach
+            # storage and surface here. Translate to a refuse outcome so
+            # the gate fails closed with attribution rather than crashing.
+            return _refuse(
+                outcome=GateOutcome.REFUSE_INVALID_RECEIPT,
+                tier=tier,
+                bundle_name=bundle_name,
+                receipts_supplied=n_supplied,
+                receipts_required=n_required,
+                detail=(
+                    f"receipt {r.receipt_id} is malformed or has invalid "
+                    f"verification inputs: {e}"
+                ),
+            )
 
     # Check 4: declared category is in tier.required_categories (when set).
     # Step 5 already enforced compose-hash ∈ bundle.accepted_compose_hashes;

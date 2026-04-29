@@ -469,9 +469,17 @@ def _print_publish_summary(
 
 def _print_gate_result(result: GateResult) -> None:
     """Surface the executor's outcome + detail for the operator + any
-    downstream watcher pattern-matching on stdout. Outcome prints as the
-    enum's string value (`pass`, `refuse_score`, etc.) so a tail-and-grep
-    workflow stays sensible."""
+    downstream watcher pattern-matching on stdout/stderr.
+
+    Output shape:
+      PASS  → stdout: ``PASS — <detail>`` (no enum suffix; PASS is unambiguous)
+      REFUSE → stderr: ``REFUSE (<outcome.value>) — <detail>`` (six refuse
+               variants, so the lowercase enum value in parens identifies
+               which check fired)
+
+    Mirrors the `verify` and `publish-evaluator` subcommands' uppercase
+    `OK — ...` convention while keeping the specific REFUSE variant
+    machine-greppable via the enum value."""
     if result.outcome == GateOutcome.PASS:
         print(f"PASS — {result.detail}")
         if result.canonical_set_hash is not None:
@@ -546,6 +554,21 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     except (StorageError, TrustViolation) as e:
         # Network / byzantine evidence — neither is a gate refusal.
         print(f"gate evaluation failed (storage): {e}", file=sys.stderr)
+        return 2
+    except VerificationError as e:
+        # Defensive: `evaluate_gate` translates VerificationError to
+        # REFUSE_INVALID_RECEIPT internally, so this branch normally
+        # shouldn't fire. Kept so a future refactor that suppresses the
+        # internal catch doesn't crash the CLI.
+        print(f"gate evaluation failed (verification): {e}", file=sys.stderr)
+        return 2
+    except ValueError as e:
+        # Defensive belt-and-suspenders: `evaluate_gate` already catches
+        # ValueError from the storage hex validators, but if a future
+        # caller path raises ValueError outside that catch (or from a
+        # storage adapter that doesn't yet exist), we don't want a
+        # bare traceback at the operator surface.
+        print(f"gate evaluation failed (invalid input): {e}", file=sys.stderr)
         return 2
 
     _print_gate_result(result)

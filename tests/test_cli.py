@@ -1058,6 +1058,46 @@ def test_gate_refuses_non_loopback_bridge_url(tmp_path: Path) -> None:
     assert "non-loopback bridge" in err
 
 
+def test_gate_exits_2_when_evaluate_raises_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defensive: if `evaluate_gate` raises ValueError that the executor
+    didn't translate to a refuse outcome (e.g. a future code path the
+    internal catch doesn't cover), the CLI must exit 2 with a controlled
+    message — not crash with a traceback at the operator surface."""
+    receipt, bundle, _ = _make_gate_artifacts()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+
+    policy_path = _write_policy(tmp_path, bundle_id=bundle.evaluator_id())
+    receipt_path = tmp_path / "r1.json"
+    receipt_path.write_bytes(receipt.model_dump_json().encode())
+
+    _patch_bridge_with_storage(monkeypatch, storage)
+
+    def _raise_value_error(**_kwargs: Any) -> None:
+        raise ValueError("synthesized: pubkey is wrong length")
+
+    monkeypatch.setattr("eerful.cli.evaluate_gate", _raise_value_error)
+
+    rc, _, err = _run_main(
+        [
+            "gate",
+            "--policy",
+            str(policy_path),
+            "--tier",
+            "low_consequence",
+            "--bundle",
+            "proposal_grade",
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    assert rc == 2
+    assert "invalid input" in err
+    assert "pubkey is wrong length" in err
+
+
 def test_gate_passes_with_n2_distinct_signers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
