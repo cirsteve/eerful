@@ -67,9 +67,11 @@ pre-commitment to bundle hashes is the load-bearing trust anchor.
 
 **5. Response tampering.** EER verification guarantees that changing
 `response_content` breaks Step 6 (signature recovery against
-`enclave_pubkey`), and changing any payload field changes the
-content-addressed `receipt_id` (Step 1 catches single-field tampering
-on a fixed receipt). What EER does *not* guarantee: `output_score_block`
+`enclave_pubkey`), and changing any *canonical signing payload* field
+(spec §6.3 — excludes `enclave_pubkey` and `enclave_signature`)
+changes the content-addressed `receipt_id`, so Step 1 catches
+single-field tampering on a fixed receipt within that payload. What
+EER does *not* guarantee: `output_score_block`
 is not separately signed by the TEE — Step 6 covers `response_content`
 only. An attacker with a legitimate
 `(response_content, enclave_signature)` pair can construct a *new*
