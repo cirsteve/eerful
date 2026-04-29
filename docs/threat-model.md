@@ -65,10 +65,22 @@ evaluator than the principal committed to fails Check 2 of the gate
 (`receipt.evaluator_id != policy.bundles[bundle_name]`). The principal's
 pre-commitment to bundle hashes is the load-bearing trust anchor.
 
-**5. Score forgery.** A receipt with a fabricated score block fails
-Step 1 (`receipt_id` recomputation) or Step 6 (signature recovery
-against `enclave_pubkey`). EER receipts are tamper-evident at the
-field level.
+**5. Response tampering.** EER verification guarantees that changing
+`response_content` breaks Step 6 (signature recovery against
+`enclave_pubkey`), and changing any payload field changes the
+content-addressed `receipt_id` (Step 1 catches single-field tampering
+on a fixed receipt). What EER does *not* guarantee: `output_score_block`
+is not separately signed by the TEE — Step 6 covers `response_content`
+only. An attacker with a legitimate
+`(response_content, enclave_signature)` pair can construct a *new*
+receipt that carries a fabricated `output_score_block` and a freshly
+computed `receipt_id`; the result passes Steps 1–6 cleanly but the
+score block is attacker-chosen, not TEE-derived. A verifier who cares
+about score integrity must deterministically re-derive
+`output_score_block` from `response_content` (the spec doesn't enforce
+this; producers and verifiers need to agree on a parser, or the
+bundle's `output_schema` needs to be tight enough that fabricated
+blocks fail Step 3).
 
 ## What the rails do NOT defend against
 
