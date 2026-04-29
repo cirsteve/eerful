@@ -27,6 +27,7 @@ This module never prints. Logging is the CLI's responsibility.
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence
@@ -380,9 +381,18 @@ def evaluate_gate(
                     ),
                 )
             overall = score_block.get("overall")
-            if not isinstance(overall, (int, float)) or isinstance(overall, bool):
+            if (
+                isinstance(overall, bool)
+                or not isinstance(overall, (int, float))
+                or not math.isfinite(overall)
+            ):
                 # `bool` is `int` in Python; reject explicitly to catch
                 # JSON-decoded `true/false` masquerading as a score.
+                # `math.isfinite` rejects NaN and ±Infinity: NaN
+                # comparisons always return False (so `NaN < threshold`
+                # is False and would silently PASS), and `+Infinity <
+                # threshold` is also False — both bypass the threshold
+                # check below without an explicit finite-check guard.
                 return _refuse(
                     outcome=GateOutcome.REFUSE_SCORE,
                     tier=tier,
@@ -391,7 +401,7 @@ def evaluate_gate(
                     receipts_required=n_required,
                     detail=(
                         f"receipt {r.receipt_id} output_score_block.overall is "
-                        f"{overall!r}, not a numeric value"
+                        f"{overall!r}, not a finite numeric value"
                     ),
                 )
             if overall < threshold:

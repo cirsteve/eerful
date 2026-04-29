@@ -810,7 +810,84 @@ def test_evaluate_gate_refuses_when_overall_is_non_numeric():
         storage=storage,
     )
     assert result.outcome == GateOutcome.REFUSE_SCORE
-    assert "not a numeric value" in result.detail
+    assert "not a finite numeric value" in result.detail
+
+
+def _exercise_score_check_with_nonfinite_overall(
+    monkeypatch: pytest.MonkeyPatch, value: float
+) -> Any:
+    """Drive the executor's score-check branch with a non-finite
+    `overall`, bypassing the upstream canonicalization+verification that
+    would otherwise catch the malformed score before the score check
+    runs.
+
+    Production-shape receipts can't carry non-finite floats: both
+    `EnhancedReceipt.build()` and `model_validate_json` route through
+    `canonical_json_bytes(allow_nan=False)`, and even a `model_construct`
+    bypass dies at Step 1 receipt-id verification (also canonicalized).
+    The executor's finite-check guard is therefore belt-and-suspenders
+    for callers that bypass pydantic entirely (cached fixtures,
+    hand-rolled adapters, future code paths). To exercise the guard we
+    have to monkeypatch `verify_receipt_with_storage` to return a
+    successful result, then `model_construct` a receipt with the
+    forbidden score in place."""
+    r, bundle, storage = _make_receipt_and_storage()
+    bad = EnhancedReceipt.model_construct(
+        **{**r.model_dump(), "output_score_block": {"overall": value}}
+    )
+
+    from eerful.verify import VerificationResult
+    fake_result = VerificationResult(bundle=bundle, step5=None)
+
+    def _passthrough_verify(*args: Any, **kwargs: Any) -> VerificationResult:
+        return fake_result
+
+    monkeypatch.setattr(
+        "eerful.executor.verify_receipt_with_storage", _passthrough_verify
+    )
+
+    p = _policy(bundle_id=bundle.evaluator_id(), score_threshold=0.6)
+    return evaluate_gate(
+        policy=p,
+        tier="low_consequence",
+        bundle_name="proposal_grade",
+        receipts=[bad],
+        storage=storage,
+    )
+
+
+def test_evaluate_gate_refuses_when_overall_is_nan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`float('nan')` passes the `isinstance(overall, (int, float))` check
+    but `NaN < threshold` is False — without a finite-check guard, a
+    NaN score would silently PASS. Reject as REFUSE_SCORE explicitly."""
+    result = _exercise_score_check_with_nonfinite_overall(monkeypatch, float("nan"))
+    assert result.outcome == GateOutcome.REFUSE_SCORE
+    assert "not a finite numeric value" in result.detail
+
+
+def test_evaluate_gate_refuses_when_overall_is_positive_infinity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`+Infinity < threshold` is False — would silently PASS without
+    the finite-check guard. Most pernicious of the non-finite cases:
+    arithmetically suggests "infinitely high score" which should
+    obviously pass, but the comparison semantics flip it to refuse."""
+    result = _exercise_score_check_with_nonfinite_overall(monkeypatch, float("inf"))
+    assert result.outcome == GateOutcome.REFUSE_SCORE
+    assert "not a finite numeric value" in result.detail
+
+
+def test_evaluate_gate_refuses_when_overall_is_negative_infinity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`-Infinity < threshold` is True, so the threshold path would
+    refuse correctly even without the finite-check guard. We still
+    reject it up front for clean semantics: a non-finite score is
+    malformed regardless of sign, and the operator-facing detail
+    should say so explicitly rather than 'overall -inf < 0.6'."""
+    result = _exercise_score_check_with_nonfinite_overall(monkeypatch, float("-inf"))
+    assert result.outcome == GateOutcome.REFUSE_SCORE
+    assert "not a finite numeric value" in result.detail
 
 
 def test_evaluate_gate_refuses_when_overall_is_bool():
@@ -829,7 +906,7 @@ def test_evaluate_gate_refuses_when_overall_is_bool():
         storage=storage,
     )
     assert result.outcome == GateOutcome.REFUSE_SCORE
-    assert "not a numeric value" in result.detail
+    assert "not a finite numeric value" in result.detail
 
 
 def test_evaluate_gate_passes_when_overall_equals_threshold():
