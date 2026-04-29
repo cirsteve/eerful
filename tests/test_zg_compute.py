@@ -295,6 +295,99 @@ def test_infer_full_end_to_end():
     # from "definitely zero").
     assert result.input_tokens is None
     assert result.output_tokens is None
+    # Cat C support: chat_text captures the chat completion content from
+    # /compute/inference, separate from the signed text. For Cat A
+    # providers the two are equal; for Cat C they diverge.
+    assert result.chat_text == "Hi there!"
+
+
+def test_infer_full_chat_text_handles_null_response_content():
+    """Cat C type-guard: if the bridge returns `response_content: null`
+    (or any non-string sentinel) on /compute/inference, ComputeResult
+    falls back to "" rather than propagating null into the receipt.
+    Ensures the Cat C parsing path stays graceful rather than crashing
+    json.loads on a None value."""
+    text = "canonical-signed-body"
+    privkey = b"\x66" * 32
+    sig_hex, _, _ = _sign_personal(text, privkey)
+    raw_report = b'{"quote":"abc"}'
+    expected_hash = "0x" + hashlib.sha256(raw_report).hexdigest()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/compute/inference":
+            return httpx.Response(
+                200,
+                json={
+                    "chat_id": "chat-null",
+                    "response_content": None,  # the case under test
+                    "model_served": "m",
+                    "provider_endpoint": "https://e/v1",
+                },
+            )
+        if path == "/compute/signature/chat-null":
+            return httpx.Response(200, json={"signature_hex": sig_hex, "message_text": text})
+        if path.startswith("/compute/attestation/"):
+            return httpx.Response(200, content=raw_report, headers={"X-Report-Hash": expected_hash})
+        return httpx.Response(404)
+
+    with _make_client(httpx.MockTransport(handle)) as c:
+        result = c.infer_full(
+            provider_address="0x" + "a" * 40,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    assert result.chat_text == ""
+    # Signed-text path is unaffected.
+    assert result.response_content == text
+
+
+def test_infer_full_cat_c_chat_text_diverges_from_signed_text():
+    """Cat C provider semantics: signature endpoint returns an
+    attestation envelope (not the model output), and /compute/inference
+    returns the actual chat completion. ComputeResult must surface both
+    so downstream receipt construction can parse output_score_block from
+    chat_text when response_content (envelope) isn't JSON."""
+    chat_completion = '{"mandate_compliance":0.9,"overall":0.8}'
+    signed_envelope = "abc:def:centralized:aliyun:9e62"  # not the chat text
+    privkey = b"\x77" * 32
+    sig_hex, _, _ = _sign_personal(signed_envelope, privkey)
+    raw_report = b'{"quote":"x"}'
+    expected_hash = "0x" + hashlib.sha256(raw_report).hexdigest()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/compute/inference":
+            return httpx.Response(
+                200,
+                json={
+                    "chat_id": "chat-cat-c",
+                    "response_content": chat_completion,  # what the model said
+                    "model_served": "qwen/qwen-2.5-7b-instruct",
+                    "provider_endpoint": "https://e/v1",
+                },
+            )
+        if path == "/compute/signature/chat-cat-c":
+            return httpx.Response(
+                200,
+                json={"signature_hex": sig_hex, "message_text": signed_envelope},
+            )
+        if path.startswith("/compute/attestation/"):
+            return httpx.Response(200, content=raw_report, headers={"X-Report-Hash": expected_hash})
+        return httpx.Response(404)
+
+    with _make_client(httpx.MockTransport(handle)) as c:
+        result = c.infer_full(
+            provider_address="0x" + "a" * 40,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    # The two diverge: receipt's response_content stays the signed
+    # envelope (preserves Step 6 signature verification); chat_text
+    # carries the model's actual JSON output for score parsing.
+    assert result.response_content == signed_envelope
+    assert result.chat_text == chat_completion
+    assert result.response_content != result.chat_text
 
 
 def test_infer_full_surfaces_token_usage_when_bridge_returns_it():

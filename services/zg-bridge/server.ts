@@ -209,8 +209,10 @@ app.post('/admin/add-ledger', async (req: Request, res: Response) => {
 
 app.post('/admin/acknowledge', async (req: Request, res: Response) => {
   const { provider_address } = req.body ?? {};
-  if (typeof provider_address !== 'string') {
-    res.status(400).json({ error: "missing 'provider_address'" });
+  if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
+    });
     return;
   }
   try {
@@ -235,6 +237,230 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
   }
 });
 
+// ---------------- helpers ----------------
+//
+// `amount_0g` accepted as either string (preferred — decimal-safe) or
+// number (legacy callers). String path uses `ethers.parseUnits` which
+// avoids IEEE-754 precision drift around large/decimal-heavy values.
+// Number path falls back to the same parser via .toString() — still
+// safer than Math.floor(amount * 1e18) which can quietly lose lower
+// digits for non-power-of-two fractions.
+
+// Result type lets us tell the caller "that was malformed input" vs
+// "no amount was supplied" — different error messages downstream.
+type ParseAmount0gResult = { value: bigint | null; error: string | null };
+
+function parseAmount0g(raw: unknown): ParseAmount0gResult {
+  if (raw === undefined || raw === null) {
+    return { value: null, error: null };
+  }
+  let s: string;
+  if (typeof raw === 'string') {
+    s = raw.trim();
+  } else if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    s = raw.toString();
+    // JS stringifies very small numbers in scientific notation
+    // (`(1e-7).toString() === "1e-7"`), and `ethers.parseUnits` does
+    // not accept exponent form. Reject explicitly with a 400-friendly
+    // message rather than silently failing as malformed input.
+    if (/[eE]/.test(s)) {
+      return {
+        value: null,
+        error:
+          "scientific-notation numeric inputs (e.g. 1e-7) are not supported; pass amount_0g as a decimal string",
+      };
+    }
+  } else {
+    return { value: null, error: null };
+  }
+  if (!s) return { value: null, error: null };
+  try {
+    const out = ethers.parseUnits(s, 18);
+    if (out <= 0n) return { value: null, error: null };
+    return { value: out, error: null };
+  } catch {
+    return { value: null, error: null };
+  }
+}
+
+// Format a bigint neuron value as a human-readable 0G decimal string.
+// Avoids the precision loss of `Number(bigint) / 1e18` — JS Number is
+// IEEE-754 double and can only represent integers exactly up to
+// 2^53-1 wei, which at 1e18 wei/0G is ~0.009007 0G. Any ledger balance
+// above that decimal threshold round-trips lossily through Number().
+function neuronToA0gString(neuron: bigint): string {
+  return ethers.formatUnits(neuron, 18);
+}
+
+// ---------------- /admin/list-services ----------------
+//
+// Read-only — no tx, no fees. Lists the current set of compute providers
+// registered with the broker. Use to confirm a provider address is live
+// before attempting acknowledge or inference.
+
+app.get('/admin/list-services', async (_req: Request, res: Response) => {
+  try {
+    const b = await getBroker();
+    const services = await b.inference.listService();
+    res.json({
+      count: services.length,
+      services: services.map((s: any) => ({
+        provider: s.provider,
+        name: s.name ?? null,
+        url: s.url ?? null,
+        model: s.model ?? null,
+        verifiability: s.verifiability ?? null,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ---------------- /admin/retrieve-fund ----------------
+//
+// Pulls all funds from per-provider inference locks back to the broker
+// ledger's available pool. Wraps SDK
+// `ledger.retrieveFund('inference')`. Use to reclaim funds locked to a
+// provider you no longer want to call (e.g. one returning junk). One tx
+// of gas. After this, available ledger balance increases; transferFund
+// against a new working provider is the next step.
+
+app.post('/admin/retrieve-fund', async (_req: Request, res: Response) => {
+  try {
+    const b = await getBroker();
+    await b.ledger.retrieveFund('inference');
+    const ledger = await b.ledger.getLedger();
+    res.json({
+      total_balance_neuron: ledger.totalBalance.toString(),
+      available_balance_neuron: ledger.availableBalance.toString(),
+      // String-formatted 0G amounts preserve full precision for any
+      // ledger size; consumers who want a JS number can parseFloat() it.
+      total_balance_0g: neuronToA0gString(ledger.totalBalance),
+      available_balance_0g: neuronToA0gString(ledger.availableBalance),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ---------------- /admin/refund-ledger ----------------
+//
+// Pulls `amount_0g` from the broker ledger back to the bridge's wallet.
+// Wraps SDK `ledger.refund(balance: number)`. Use to reclaim unused
+// funds; the SDK enforces that `amount_0g` does not exceed the ledger's
+// available (non-locked) balance. One tx of gas, paid from the wallet.
+
+app.post('/admin/refund-ledger', async (req: Request, res: Response) => {
+  // SDK expects a number (its own internal a0giToNeuron does the
+  // bigint conversion). We accept string OR number to give callers a
+  // safe path; for SDK invocation we hand it the parsed bigint then
+  // round back to its preferred shape via formatUnits.
+  const parsed = parseAmount0g(req.body?.amount_0g);
+  if (parsed.error !== null) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+  if (parsed.value === null) {
+    res.status(400).json({
+      error: "missing or invalid 'amount_0g' (positive decimal string or number)",
+    });
+    return;
+  }
+  const amount_neuron = parsed.value;
+  const amount_0g_str = neuronToA0gString(amount_neuron);
+  // SDK signature: `refund(balance: number)` — JS number is the only
+  // shape the SDK accepts, and `Number(amount_0g_str)` reintroduces
+  // IEEE-754 drift for any amount whose decimal representation isn't
+  // exactly representable as a double. The threshold is *not* 9 0G:
+  // JS Number is exact up to 2^53-1 wei (~0.009 0G), so essentially
+  // any non-trivial refund could drift. Round-trip the JS number back
+  // through parseUnits and refuse the request on any mismatch, so we
+  // fail closed rather than refunding the wrong neuron amount.
+  const amount_0g_num = Number(amount_0g_str);
+  let round_tripped: bigint;
+  try {
+    round_tripped = ethers.parseUnits(amount_0g_num.toString(), 18);
+  } catch {
+    res.status(400).json({
+      error: "amount_0g cannot be safely round-tripped through JS number; choose a smaller or exactly-representable amount",
+    });
+    return;
+  }
+  if (round_tripped !== amount_neuron) {
+    res.status(400).json({
+      error: `amount_0g lost precision in float conversion (input ${amount_neuron.toString()} neuron, round-tripped to ${round_tripped.toString()}); use a smaller or exactly-representable amount`,
+    });
+    return;
+  }
+  try {
+    const b = await getBroker();
+    await b.ledger.refund(amount_0g_num);
+    const ledger = await b.ledger.getLedger();
+    res.json({
+      refunded_0g: amount_0g_str,
+      total_balance_neuron: ledger.totalBalance.toString(),
+      available_balance_neuron: ledger.availableBalance.toString(),
+      total_balance_0g: neuronToA0gString(ledger.totalBalance),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ---------------- /admin/transfer-fund ----------------
+//
+// Moves `amount_0g` from ledger-available into the provider's locked
+// balance (per-provider lock). Wraps SDK
+// `ledger.transferFund(provider, 'inference', balance_neuron_bigint)`.
+// One tx of gas. Use to top up a provider's lock when unsettled fees
+// push the required minimum above the current lock.
+
+app.post('/admin/transfer-fund', async (req: Request, res: Response) => {
+  const { provider_address } = req.body ?? {};
+  if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
+    });
+    return;
+  }
+  // SDK's transferFund takes neuron as bigint. Use ethers.parseUnits
+  // for decimal-safe string→bigint conversion — avoids the
+  // Math.floor(amount * 1e18) IEEE-754 drift that could otherwise
+  // produce off-by-some-wei lock balances.
+  const parsed = parseAmount0g(req.body?.amount_0g);
+  if (parsed.error !== null) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+  if (parsed.value === null) {
+    res.status(400).json({
+      error: "missing or invalid 'amount_0g' (positive decimal string or number)",
+    });
+    return;
+  }
+  const balance_neuron = parsed.value;
+  try {
+    const b = await getBroker();
+    await b.ledger.transferFund(provider_address, 'inference', balance_neuron);
+    res.json({
+      provider_address,
+      transferred_0g: neuronToA0gString(balance_neuron),
+      transferred_neuron: balance_neuron.toString(),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
 // ---------------- /compute/inference ----------------
 //
 // Body: { provider_address, messages: [{role, content}], temperature?, max_tokens? }
@@ -251,8 +477,14 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
 
 app.post('/compute/inference', async (req: Request, res: Response) => {
   const { provider_address, messages, temperature, max_tokens } = req.body ?? {};
-  if (typeof provider_address !== 'string' || !Array.isArray(messages)) {
-    res.status(400).json({ error: "missing 'provider_address' or 'messages'" });
+  if (typeof provider_address !== 'string' || !ethers.isAddress(provider_address)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
+    });
+    return;
+  }
+  if (!Array.isArray(messages)) {
+    res.status(400).json({ error: "missing 'messages'" });
     return;
   }
   // Validate each message has string role + content. Without this, malformed
@@ -406,8 +638,10 @@ app.get('/compute/signature/:chat_id', async (req: Request, res: Response) => {
 
 app.get('/compute/attestation/:provider_address', async (req: Request, res: Response) => {
   const providerAddress = req.params.provider_address;
-  if (!providerAddress) {
-    res.status(400).json({ error: "missing 'provider_address'" });
+  if (!providerAddress || !ethers.isAddress(providerAddress)) {
+    res.status(400).json({
+      error: "missing or invalid 'provider_address' (must be a valid EVM address)",
+    });
     return;
   }
   try {

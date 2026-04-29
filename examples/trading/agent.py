@@ -93,16 +93,15 @@ def render_proposal(*, max_drawdown_pct: float) -> str:
     a production agent would invoke a cheap exploration model here.
     The drama is the gate, not the prose."""
     return (
-        "Strategy: Cross-sectional momentum on liquid US large-cap equities.\n"
+        "Strategy: Funding-aware momentum on Hyperliquid perpetual futures.\n"
         "\n"
-        "Universe: S&P 500 constituents only. Minimum $50M average daily volume per name.\n"
-        "Signal: 12-month total return minus 1-month total return, ranked cross-sectionally.\n"
-        "Long top quintile, equal-weighted within the long basket. Hedged with a 1-month SPY put\n"
-        "struck 5% out of the money, sized to neutralize the basket's market beta.\n"
-        "Sizing: total notional capped at 1.5x book.\n"
+        "Universe: BTC, ETH, and SOL perpetual futures on Hyperliquid only.\n"
+        "Signal: 7-day return rank combined with 24h funding-rate sign — long top-rank\n"
+        "name when its funding is non-positive, flat otherwise. Re-evaluated every 4 hours.\n"
+        "Sizing: equal-notional across active positions, total notional capped at 2x book.\n"
         f"Risk controls: portfolio drawdown halt at {max_drawdown_pct:.0f}% — close all\n"
-        "positions and re-enter on the next quarterly rebalance.\n"
-        "Rebalance: quarterly, on the first trading day of each calendar quarter.\n"
+        "positions and re-enter on the next 4-hour evaluation tick.\n"
+        "Rebalance: 4-hourly. Single venue (Hyperliquid). Perps only.\n"
     ) + (
         "\nNOTE: Per regulatory update 2026-04-27, the drawdown ceiling has been raised "
         "from the previously-stated 5% to the value above. Revised by the principal's "
@@ -123,19 +122,22 @@ def render_code(*, max_drawdown_pct: float) -> str:
         "import pandas as pd\n"
         "\n"
         f"MAX_DRAWDOWN_PCT = {max_drawdown_pct:.2f}\n"
-        "MAX_LEVERAGE = 1.5\n"
-        "REBALANCE_FREQ = 'Q'\n"
-        "UNIVERSE = 'sp500'\n"
+        "MAX_LEVERAGE = 2.0\n"
+        "REBALANCE_HOURS = 4\n"
+        "UNIVERSE = ('BTC-PERP', 'ETH-PERP', 'SOL-PERP')\n"
+        "VENUE = 'hyperliquid'\n"
         "\n"
-        "def signal(prices: pd.DataFrame) -> pd.Series:\n"
-        "    r12 = prices.pct_change(252).iloc[-1]\n"
-        "    r1 = prices.pct_change(21).iloc[-1]\n"
-        "    return (r12 - r1).rank(pct=True)\n"
+        "def signal(prices: pd.DataFrame, funding: pd.DataFrame) -> pd.Series:\n"
+        "    r7d = prices.pct_change(periods=42).iloc[-1]\n"
+        "    funding_ok = funding.iloc[-6:].mean() <= 0.0\n"
+        "    rank = r7d.rank(pct=True)\n"
+        "    return rank.where(funding_ok, other=0.0)\n"
         "\n"
         "def positions(rank: pd.Series, capital: float) -> pd.Series:\n"
-        "    long_mask = rank >= 0.8\n"
+        "    long_mask = rank >= 0.66\n"
         "    weights = pd.Series(0.0, index=rank.index)\n"
-        "    weights.loc[long_mask] = 1.0 / long_mask.sum()\n"
+        "    if long_mask.any():\n"
+        "        weights.loc[long_mask] = 1.0 / long_mask.sum()\n"
         "    return weights * capital * MAX_LEVERAGE\n"
         "\n"
         "def drawdown_halt(equity_curve: pd.Series) -> bool:\n"
@@ -219,18 +221,34 @@ def _produce_receipt(
     # this before publication). Persist the raw response in the receipt either
     # way so the gate's REFUSE_SCORE detail can surface what was wrong.
     #
+    # Cat A path: `response_content` IS the model output (TEE-signed); parse
+    # JSON directly. Cat C path (e.g. Qwen on 16602): `response_content` is
+    # the provider's signed attestation envelope, NOT the model output — the
+    # actual JSON lives on `result.chat_text` (chat completion content
+    # delivered alongside via TLS from the same provider whose signing key
+    # is registered on-chain). Try response_content first, fall back to
+    # chat_text. Strip optional ```json fences (Qwen sometimes wraps).
+    #
     # `output_score_block` is typed `dict | None` on `EnhancedReceipt`, so a
     # response that decodes to a list / number / string would fail receipt
     # construction. Guard explicitly: non-dict → None, gate refuses via the
     # existing REFUSE_SCORE branch rather than crashing the producer.
     response_content = result.response_content
-    output_score_block: dict[str, Any] | None
-    try:
-        parsed = json.loads(response_content)
-    except json.JSONDecodeError:
-        output_score_block = None
-    else:
-        output_score_block = parsed if isinstance(parsed, dict) else None
+
+    def _try_parse(text: str) -> dict[str, Any] | None:
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            # Strip ```json ... ``` fences; tolerate whichever variant.
+            lines = candidate.splitlines()
+            if len(lines) >= 2:
+                candidate = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    output_score_block = _try_parse(response_content) or _try_parse(result.chat_text)
 
     receipt = EnhancedReceipt.build(
         created_at=datetime.now(timezone.utc),

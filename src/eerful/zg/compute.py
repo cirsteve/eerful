@@ -27,7 +27,7 @@ from typing import Any
 import httpx
 from eth_keys import keys
 from eth_utils import keccak
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from eerful.canonical import Address, Bytes32Hex, BytesHex, to_lower_hex
 from eerful.errors import ComputeError
@@ -103,6 +103,19 @@ class ComputeResult(BaseModel):
     attestation_report_hash: Bytes32Hex
     input_tokens: int | None = None
     output_tokens: int | None = None
+    chat_text: str = Field(
+        default="",
+        description=(
+            "The model's chat completion content (from /compute/inference's "
+            "response_content — i.e. choices[0].message.content). For Cat A "
+            "providers chat_text == response_content (the TEE signs the model "
+            "output). For Cat C centralized passthrough providers (e.g. Qwen "
+            "on 16602), response_content is the provider's signed attestation "
+            "envelope and chat_text is the actual model output — used to "
+            "populate the receipt's output_score_block. Defaults to empty "
+            "string for backwards compatibility with pre-Cat-C test fixtures."
+        ),
+    )
 
 
 class ComputeClient:
@@ -271,9 +284,15 @@ class ComputeClient:
                 input_tokens = it
                 output_tokens = ot
 
+        # Type-guard: bridge may return null / non-string under unusual
+        # provider conditions; coerce to "" so downstream Cat C parsing
+        # stays graceful (a non-string would propagate and crash json.loads).
+        chat_text_raw = inference.get("response_content")
+        chat_text = chat_text_raw if isinstance(chat_text_raw, str) else ""
         return ComputeResult(
             chat_id=inference["chat_id"],
             response_content=signed_text,
+            chat_text=chat_text,
             model_served=inference["model_served"],
             provider_endpoint=inference["provider_endpoint"],
             enclave_pubkey=pubkey_hex,
