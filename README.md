@@ -1,33 +1,75 @@
 # eerful
 
-Reference implementation of **Enhanced Evaluation Receipts** (EER) — a portable,
-third-party-verifiable artifact for recording the result of an LLM evaluation
-executed inside a Trusted Execution Environment.
+> Run your agents nuts, then make them prove it before the executor sees the trade.
 
-An EER binds a public evaluator definition (content-addressed), an optional
-private input commitment, an attested model execution (hardware-rooted
-signature), and an optional structured score. Verification is offline: a third
-party with only the receipt and content-addressed storage can confirm
-authenticity without trusting the producer or the inference provider's liveness.
+Autonomous agents in 2026 will get compromised. Prompt injection through
+retrieved documents, tool poisoning via malicious MCP servers,
+adversarial RAG content, supply-chain attacks on cheap-model weights —
+these aren't hypothetical, they're the dominant attack surface for any
+agent doing real work. The defensive architecture has to assume the
+cheap exploration layer is compromisable and place an **attested gate**
+before any compromise can have consequences.
 
-The protocol is **EER**. The reference implementation is **eerful**.
+eerful is that gate. Run generation nuts — local models, retrieval,
+spray-and-pray search, parallel sampling, untrusted tooling, whatever.
+Then put a hard, attested gate before anything reaches the executor.
+The gate runs an LLM evaluation in a TEE against criteria the principal
+pinned by hash *before the agent ran*. Receipts prove the gate ran
+honestly. The executor refuses to act without them.
 
-- Spec: [`docs/spec.md`](docs/spec.md) (v0.4)
-- Built on: 0G Compute Network (TeeML) + 0G Storage
-- Status: in development for hackathon submission Sunday morning
+## The pattern
+
+Domain-agnostic. Trading is the headline demo because the consequences
+are vivid (real money), but the architecture supports any consequential
+agent action: PR-merge gating, RFC compliance, plan-vs-action validation,
+fiduciary mandate compliance.
+
+1. **Cheap exploration layer.** Anything goes — local models, retrieval,
+   parallel sampling, parameter sweeps, synthesis via untrusted
+   tooling. Optimize for breadth, speed, creativity. Don't bother
+   attesting it.
+2. **Pinned criteria.** A principal commits (by content hash) to one
+   or more evaluator bundles before the agent runs. The bundles
+   encode what "acceptable" means in this domain.
+3. **Attested gate.** Before any consequential action, candidate
+   outputs run through the bundle(s) inside a TEE. Each call produces
+   a receipt — a portable, third-party-verifiable record of the
+   evaluation, signed by an enclave-born key.
+4. **Hard refuse.** The executor checks receipts against the
+   committed bundle hashes and the principal's tier policy. No
+   matching valid receipts → no action. Period.
+
+eerful is the implementation of (3) and (4). The exploration layer is
+the user's; (2) is the principal's job.
+
+The diversity rule (high-consequence tier: N receipts from N distinct
+TEE signers) extends the threat model — an attacker now has to compromise
+the cheap exploration layer *and* N independent TEEs for a bad action
+to execute. Defense in depth at the architectural level.
 
 ## What's in the box
 
-- `eerful` Python package — produces and verifies EERs per the spec
-- `eerful.commitment` — §6.7 input-commitment construction +
-  producer-side `SaltStore` for the chain pattern
-- `eerful.zg` — 0G TeeML inference + 0G Storage adapters
-- `eerful.jig` — adapters that let any [jig](https://github.com/rankonelabs/jig)
-  agent produce EERs as part of its evaluation flow
-- `eerful` CLI — `verify`, `publish-evaluator`
-- `services/zg-bridge/` — TypeScript HTTP service that wraps the 0G
-  broker + storage SDKs (the Python adapters drive it locally over
+- **`eerful` Python package** — produces and verifies EERs per the
+  EER spec.
+- **`eerful.policy`** — `PrincipalPolicy` schema: bundle hash
+  registry + per-tier attestation requirements (N, score threshold,
+  category constraints, diversity rules).
+- **`eerful.executor.evaluate_gate`** — the six-check gate. Reusable
+  from any orchestrator; the CLI is a thin wrapper.
+- **`eerful.commitment`** — input-commitment construction for the
+  chain pattern.
+- **`eerful.zg`** — 0G TeeML inference + 0G Storage adapters.
+- **`eerful.jig`** — adapters that let any
+  [jig](https://github.com/rankonelabs/jig) agent produce EERs as
+  part of its evaluation flow.
+- **`eerful` CLI** — `verify`, `publish-evaluator`, `gate`.
+- **`services/zg-bridge/`** — TypeScript HTTP service that wraps the
+  0G broker + storage SDKs (the Python adapters drive it locally over
   loopback). See [`services/zg-bridge/README.md`](services/zg-bridge/README.md).
+- **`examples/trading/`** — the headline demo: a two-gate trading
+  agent (`proposal_grade` + `implementation_grade`) with a recordable
+  happy path and a recordable poisoned path that the rails refuse on
+  screen. See [`examples/trading/README.md`](examples/trading/README.md).
 
 ## Install
 
@@ -35,11 +77,9 @@ The protocol is **EER**. The reference implementation is **eerful**.
 uv sync
 ```
 
-Requires Python 3.12 and a 0G Galileo testnet wallet with faucet funds for
-real TeeML calls and Storage uploads.
-
-For producing receipts AND for the default verify path (which fetches
-artifacts from 0G Storage), also start the bridge — see
+Requires Python 3.12. For producing receipts (and for the default
+verify / gate paths, which fetch artifacts from 0G Storage), also
+start the bridge — see
 [`services/zg-bridge/README.md`](services/zg-bridge/README.md) for
 `npm install` + env vars. Fully-offline verification with `--bundle`,
 `--report`, and `--skip-step-5` flags can avoid the bridge entirely.
@@ -49,6 +89,36 @@ refuses non-loopback bridge URLs unless you pass `--allow-remote-bridge`.
 Library callers using `BridgeStorageClient` / `ComputeClient` directly
 accept any URL — the loopback guard is CLI-only.
 
+## Quick gate
+
+```bash
+eerful gate \
+    --policy examples/trading/principal_policy.json \
+    --tier low_consequence \
+    --bundle proposal_grade \
+    --receipt path/to/proposal_receipt.json
+```
+
+Exits `0` on PASS, `1` on REFUSE (with the failing check named in
+`outcome`), `2` on a wiring error (unknown tier, missing file, etc.).
+Stdout/stderr formatting:
+
+```text
+PASS — 1 receipt(s) under bundle 'proposal_grade', tier 'low_consequence'
+  canonical_set_hash: 0x9d3f...
+  receipts: 1 supplied / 1 required
+```
+
+```text
+REFUSE (refuse_score) — receipt 0xab12... overall 0.25 < tier 'low_consequence' threshold 0.7
+  receipts: 1 supplied / 1 required
+```
+
+The six refusal outcomes (`refuse_insufficient_receipts`,
+`refuse_bundle_mismatch`, `refuse_invalid_receipt`, `refuse_diversity`,
+`refuse_category`, `refuse_score`) are machine-greppable enum values,
+each named for the check that fired first.
+
 ## Quick verify
 
 ```bash
@@ -56,70 +126,72 @@ eerful verify path/to/receipt.json
 ```
 
 The verifier fetches the evaluator bundle and attestation report from
-0G Storage by content hash (via the local `services/zg-bridge/`), runs
-the §7.1 verification algorithm (Steps 1–6, with Step 5 in compose-hash
-gating mode per §6.5), and prints a verdict plus the structured score
-block. Step 7 (provider crosscheck) is deferred; full Step 5 (TDX/NVIDIA
-chain to vendor roots) requires the dstack-verifier integration that's
-out of scope for v0.4.
-
-**Known limitation (cross-instance fetch):** the bridge can only fetch
-content_hashes its own `uploadIndex` has seen — it can't recover the
-0G rootHash from a sha256 alone. So a verifier on a fresh bridge
-instance can't fetch a bundle that was uploaded by a different bridge
-process. Workarounds today: (a) producer + verifier share a bridge,
-(b) re-upload the bytes through the verifier's bridge to repopulate
-the index, or (c) use `--bundle` / `--report` with local files. A
-fix is planned (see `services/zg-bridge/README.md` Limitations).
-
-`--bundle <path>` and `--report <path>` override individual artifacts
-with local files (offline verification, cached blobs, or working around
-the cross-instance limitation above); `--skip-step-5` skips the report
-fetch entirely.
+0G Storage by content hash (via the local bridge), runs the §7.1
+verification algorithm, and prints a verdict plus the structured
+score block. `--bundle <path>` and `--report <path>` override
+individual artifacts with local files; `--skip-step-5` skips the
+report fetch entirely.
 
 ## What an EER proves (and doesn't)
 
-A valid EER proves a specific response was produced by attested TEE hardware
-under publicly defined evaluation criteria, with the response signed by an
-enclave-born key. Authenticity is what EER provides.
+A valid EER proves a specific response was produced by attested TEE
+hardware under publicly defined evaluation criteria, with the response
+signed by an enclave-born key. Authenticity is what EER provides.
 
-It does **not** prove the evaluation is correct, the score is meaningful, the
-producer chose representative input, or — most importantly for honest framing
-— that the model the TEE loaded matches the model the evaluator declared.
+It does **not** prove the evaluation is correct, the score is
+meaningful, the producer chose representative input, or — most
+importantly for honest framing — that the model the TEE loaded matches
+the model the evaluator declared.
 
 That last gap is the subject of [spec §8](docs/spec.md#8-compose-vs-model-identity-binding),
-which lays out the empirical state of 0G TeeML providers as a three-tier
-spectrum:
+which lays out the empirical state of 0G TeeML providers as a
+three-tier spectrum:
 
-- **Category A — bound launch string.** RTMR3 binds a compose whose launch
-  command names the model identifier. The strongest model claim available
-  today on widely deployed primitives (1 of 7 mainnet providers as of
-  2026-04). Weights themselves still come from HuggingFace at runtime and
-  are not measured.
-- **Category B — unrelated compose.** RTMR3 binds a compose that does not
-  reference the advertised model at all (3 of 7 — observed running a Phala
-  demo Next.js starter). Receipts under such providers verify only that
-  "some dstack TD ran some app."
-- **Category C — centralized passthrough.** The compose attests a broker
-  proxy that routes to a centralized backend with no TEE attestation (3 of
-  7). The provider's own broker code admits this.
+- **Category A — bound launch string.** RTMR3 binds a compose whose
+  launch command names the model identifier. The strongest model
+  claim available today on widely deployed primitives (1 of 7
+  observed mainnet providers). Weights themselves still come from
+  HuggingFace at runtime and are not measured.
+- **Category B — unrelated compose.** RTMR3 binds a compose that
+  does not reference the advertised model at all. Receipts under such
+  providers verify "some dstack TD ran some app" — nothing about the
+  model.
+- **Category C — centralized passthrough.** The compose attests a
+  broker proxy that routes to a centralized backend with no TEE
+  attestation. The provider's own broker code admits this in its
+  error messages.
 
-EER's protocol-level mitigation is the **`accepted_compose_hashes`** allowlist
-(spec §6.5): an evaluator publisher pins the compose-hashes of providers whose
-configuration they have inspected; verification fails closed when the attested
-hash isn't in the list. `eerful verify` surfaces the §8 category and gating
-status (`enforced` / `skipped`) on stdout by default — the report is fetched
-from storage automatically.
+EER's protocol-level mitigation is the **`accepted_compose_hashes`**
+allowlist (spec §6.5): an evaluator publisher pins the compose-hashes
+of providers whose configuration they have inspected, *along with the
+publisher's declared category*. Verification Step 5 fails closed when
+the attested hash isn't in the allowlist. The executor's policy can
+further constrain to a category subset (`required_categories: ["A"]`
+for high-consequence) — receipts from Category B/C providers refuse
+even if they're allowlisted.
 
-Read §2 and §8 before relying on receipts. The spec is deliberate about what
-an EER does and does not cryptographically establish.
+`eerful verify` surfaces the §8 category and gating status (`enforced`
+/ `skipped`) on stdout by default. Read §2 and §8 before relying on
+receipts.
+
+## Substrate
+
+This implementation runs against 0G's TeeML / Storage primitives on
+the Galileo testnet — chosen because the receipt-attestation primitives
+are observable and the cost is faucet-cheap. The architecture is
+substrate-independent: the executor reads receipts and policies, not
+substrate. If 0G's ecosystem matures (per §6 of the design doc, the
+high-consequence-tier supply gap on Cat A is real today), the rails
+already enforce against it. If the right substrate turns out to be
+Phala, Marlin, AWS Nitro, or something not yet shipped, the executor
+ports without changes.
 
 ## Producing receipts from a jig pipeline
 
 `eerful.jig` plugs into [jig](https://github.com/rankonelabs/jig)'s
-`LLMClient` / `Grader` / `TracingLogger` interfaces so any pipeline step
-graded by an `EvaluationGrader` produces a verifying receipt as a side
-effect.
+`LLMClient` / `Grader` / `TracingLogger` interfaces so any pipeline
+step graded by an `EvaluationGrader` produces a verifying receipt as
+a side effect.
 
 ```python
 import asyncio
@@ -150,16 +222,16 @@ async def main():
             storage=storage,
             bundle=bundle,
             evaluator_id=bundle.evaluator_id(),
-            provider_address="0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C",
+            provider_address="0x...",
         )
         grader = EvaluationGrader(client=client)
 
         config = PipelineConfig(
-            name="trading-critic",
-            steps=[Step(name="critic", fn=my_step, grader=grader)],
+            name="trading-proposal-grade",
+            steps=[Step(name="grader", fn=my_step, grader=grader)],
             tracer=SQLiteTracer("traces.db"),
         )
-        result = await run_pipeline(config, input="market-neutral-v1")
+        result = await run_pipeline(config, input="strategy-v1")
 
 
 asyncio.run(main())
@@ -170,17 +242,21 @@ asyncio.run(main())
 # `previous_receipt_id`; pin per-call with provider_params.
 ```
 
-The grader only emits scores for top-level numeric fields of the bundle's
-`output_schema`; `score_dimensions=[...]` filters further. Tools, mismatched
-system prompts, and conflicting inference params raise `EvaluationClientError`
-— the receipt has to attest the bundle's criteria, not the caller's.
+The grader only emits scores for top-level numeric fields of the
+bundle's `output_schema`; `score_dimensions=[...]` filters further.
+Tools, mismatched system prompts, and conflicting inference params
+raise `EvaluationClientError` — the receipt has to attest the
+bundle's criteria, not the caller's.
 
-## Demo provider
+## Spec
 
-The reference demo runs against **Provider 1 — `zai-org/GLM-5-FP8` at
-`0xd9966e13a6026Fcca4b13E7ff95c94DE268C471C`**, the only acknowledged 0G TeeML
-provider observed in Category A as of 2026-04. Its attested compose runs
-vLLM with `--model zai-org/GLM-5-FP8` on the launch command, so RTMR3 binds
-the model identifier as a string. The demo evaluator bundle pins this
-provider's compose-hash in `accepted_compose_hashes` so receipts produced
-against it pass Step 5 with `gating: enforced`.
+- [`docs/spec.md`](docs/spec.md) — EER protocol (v0.5)
+
+The executor + multi-attestation rails design is captured in a
+local-only planning artifact — its substance has been incorporated
+into the threat-model framing above and [`examples/trading/README.md`](examples/trading/README.md).
+
+Status: pre-hackathon submission. The trading demo
+([`examples/trading/`](examples/trading/)) is the recordable
+end-to-end artifact; everything else is the framework that lets you
+build your own.

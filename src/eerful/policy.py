@@ -1,6 +1,7 @@
 """PrincipalPolicy — what attestation a principal demands per tier.
 
-Spec design: `specs/executor-and-rails-design.md` §3.
+Spec design: §3 of the executor + multi-attestation rails design
+(local planning artifact).
 
 A policy is external to bundles: bundles are the public criteria
 (content-addressed by `evaluator_id`); the policy answers "how much
@@ -37,8 +38,8 @@ ScoreAggregation = Literal["all_must_pass"]
 
 v0.5 ships `all_must_pass` only — every receipt's `overall` ≥
 `score_threshold`. `median` and `threshold_of_passers` are deferred
-(`specs/executor-and-rails-design.md` §5.3): they raise "why did this pass
-when a TEE said no" questions you don't want at demo time."""
+(per the rails design): they raise "why did this pass when a TEE
+said no" questions you don't want at demo time."""
 
 
 class DiversityRules(BaseModel):

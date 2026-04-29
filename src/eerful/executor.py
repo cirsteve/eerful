@@ -1,6 +1,9 @@
 """Executor — the hard gate that fronts consequential actions.
 
-Spec design: `specs/executor-and-rails-design.md` §4.
+Spec design: §4 of the executor + multi-attestation rails design
+(local planning artifact; the substantive content is captured in
+the repo README's threat-model framing and
+`examples/trading/README.md`'s arc).
 
 `evaluate_gate` checks a set of receipts against a `PrincipalPolicy`'s
 named tier. PASS only if every check below succeeds, in spec order; on
@@ -118,11 +121,11 @@ def canonical_set_hash(receipts: Sequence[EnhancedReceipt]) -> Bytes32Hex:
     the same hash. Used as `previous_receipt_id` when a downstream
     action chains off a multi-attestation gate.
 
-    Spec note: `specs/executor-and-rails-design.md` §5.4 calls this
-    `canonical_set_hash` and uses a `sha256:` prefix for human
-    legibility; we use the codebase's `0x...` Bytes32Hex convention so
-    the value can flow into `previous_receipt_id` (which is typed as
-    `Bytes32Hex`) without a format adapter.
+    Spec note: §5.4 of the rails design calls this `canonical_set_hash`
+    and uses a `sha256:` prefix for human legibility; we use the
+    codebase's `0x...` Bytes32Hex convention so the value can flow
+    into `previous_receipt_id` (which is typed as `Bytes32Hex`)
+    without a format adapter.
     """
     leaves = sorted({r.receipt_id for r in receipts})
     digest = hashlib.sha256("\n".join(leaves).encode("utf-8")).hexdigest()
