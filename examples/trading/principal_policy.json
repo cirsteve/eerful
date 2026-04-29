@@ -1,0 +1,27 @@
+{
+  "policy_version": "0.5",
+  "principal_id": "did:pkh:eip155:16602:0x0000000000000000000000000000000000000000",
+  "bundles": {
+    "proposal_grade": "0x89cc2157360ac98fd3f10f9cef6a669a41170f9a62f13e0a71b212cde529232d",
+    "implementation_grade": "0x4ae6ae7c1f4dd21ea618df0c513a44aeb7425282e1872443ddfa4cd944f5620c"
+  },
+  "tiers": {
+    "low_consequence": {
+      "n_attestations": 1,
+      "score_threshold": 0.7,
+      "diversity": {
+        "distinct_signers": false,
+        "distinct_compose_hashes": false
+      }
+    },
+    "high_consequence": {
+      "n_attestations": 4,
+      "score_threshold": 0.7,
+      "diversity": {
+        "distinct_signers": true,
+        "distinct_compose_hashes": false
+      }
+    }
+  },
+  "score_aggregation": "all_must_pass"
+}
