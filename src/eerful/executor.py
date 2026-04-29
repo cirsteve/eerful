@@ -208,10 +208,26 @@ def evaluate_gate(
             detail=detail,
         )
 
+    # Dedup by `receipt_id` (preserving first occurrence) for checks 2-6.
+    # Without this, a caller who accidentally passes `[r, r]` with N=1
+    # (which legitimately passes Check 1's distinct count) would still
+    # trip Check 5's `distinct_signers` / `distinct_compose_hashes` on
+    # the duplicate, producing a false REFUSE_DIVERSITY for what is
+    # semantically a single-receipt set. Dedup-then-iterate keeps the
+    # downstream checks aligned with the distinct-set semantics already
+    # established by Check 1.
+    seen_ids: set[str] = set()
+    unique_receipts: list[EnhancedReceipt] = []
+    for r in receipts:
+        if r.receipt_id in seen_ids:
+            continue
+        seen_ids.add(r.receipt_id)
+        unique_receipts.append(r)
+
     # Check 2: every receipt names the policy-pinned evaluator_id.
     # Catches a swapped-bundle attempt where receipts came from a
     # different evaluator than the principal committed to.
-    for r in receipts:
+    for r in unique_receipts:
         if r.evaluator_id != expected_evaluator_id:
             return _refuse(
                 outcome=GateOutcome.REFUSE_BUNDLE_MISMATCH,
@@ -232,7 +248,7 @@ def evaluate_gate(
     # want to fetch+parse a second time for the category and diversity
     # checks below.
     verification_results: list[VerificationResult] = []
-    for r in receipts:
+    for r in unique_receipts:
         try:
             verification_results.append(verify_receipt_with_storage(r, storage))
         except VerificationError as e:
@@ -274,7 +290,7 @@ def evaluate_gate(
     # REFUSE_CATEGORY (the policy demanded a category enforcement the
     # bundle can't provide).
     if tier_policy.required_categories is not None:
-        for r, result in zip(receipts, verification_results, strict=True):
+        for r, result in zip(unique_receipts, verification_results, strict=True):
             entry = result.step5.declared_entry if result.step5 is not None else None
             if entry is None:
                 return _refuse(
@@ -306,7 +322,7 @@ def evaluate_gate(
     # actual security — without it, an attacker compromising one TEE has
     # the same access as N legitimate signers.
     if tier_policy.diversity.distinct_signers:
-        signers = [tee_signer_address_from_pubkey(r.enclave_pubkey) for r in receipts]
+        signers = [tee_signer_address_from_pubkey(r.enclave_pubkey) for r in unique_receipts]
         if len(set(signers)) != len(signers):
             return _refuse(
                 outcome=GateOutcome.REFUSE_DIVERSITY,
@@ -315,14 +331,14 @@ def evaluate_gate(
                 receipts_supplied=n_supplied,
                 receipts_required=n_required,
                 detail=(
-                    f"distinct_signers required but {n_supplied - len(set(signers))} "
+                    f"distinct_signers required but {len(unique_receipts) - len(set(signers))} "
                     f"duplicate signer(s) found across the receipt set"
                 ),
             )
 
     if tier_policy.diversity.distinct_compose_hashes:
         compose_hashes: list[str] = []
-        for r, result in zip(receipts, verification_results, strict=True):
+        for r, result in zip(unique_receipts, verification_results, strict=True):
             if result.step5 is None:
                 # Defensive: `verify_receipt_with_storage` defaults to
                 # fetch_report=True so step5 is always populated when
@@ -353,8 +369,8 @@ def evaluate_gate(
                 receipts_required=n_required,
                 detail=(
                     f"distinct_compose_hashes required but "
-                    f"{n_supplied - len(set(compose_hashes))} duplicate compose-hash(es) "
-                    f"found across the receipt set"
+                    f"{len(unique_receipts) - len(set(compose_hashes))} duplicate "
+                    f"compose-hash(es) found across the receipt set"
                 ),
             )
 
@@ -366,7 +382,7 @@ def evaluate_gate(
     # surfaces here as a clear unimplemented case.
     threshold = tier_policy.score_threshold
     if policy.score_aggregation == "all_must_pass":
-        for r in receipts:
+        for r in unique_receipts:
             score_block = r.output_score_block
             if score_block is None:
                 return _refuse(
@@ -416,6 +432,18 @@ def evaluate_gate(
                         f"tier {tier!r} threshold {threshold}"
                     ),
                 )
+    else:
+        # Fail closed if a future v0.6 widens `ScoreAggregation` (median,
+        # threshold_of_passers per spec §5.3) without updating this
+        # branch, or if a policy is constructed via `model_construct`
+        # that bypasses the Literal validation. PrincipalPolicy's type
+        # constrains valid values today, so this only fires when the
+        # contract is broken — a crash beats a silent PASS that
+        # skipped the score check entirely.
+        raise NotImplementedError(
+            f"unsupported score_aggregation: {policy.score_aggregation!r} "
+            "(v0.5 ships only 'all_must_pass')"
+        )
 
     # All six checks passed — anchor the receipt set.
     # `detail` is outcome-neutral; the CLI prefixes with the human label
@@ -431,5 +459,5 @@ def evaluate_gate(
             f"{n_supplied} receipt(s) under bundle {bundle_name!r}, "
             f"tier {tier!r}"
         ),
-        canonical_set_hash=canonical_set_hash(receipts),
+        canonical_set_hash=canonical_set_hash(unique_receipts),
     )

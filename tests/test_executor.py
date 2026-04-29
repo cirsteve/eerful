@@ -419,6 +419,28 @@ def test_evaluate_gate_refuses_zero_receipts():
     assert result.outcome == GateOutcome.REFUSE_INSUFFICIENT_RECEIPTS
 
 
+def test_evaluate_gate_passes_when_duplicates_collapse_to_satisfying_distinct_set():
+    """`[r, r]` with `n_attestations=1` and `distinct_signers=True` must
+    PASS — after dedup the distinct set is `{r}`, satisfying both the
+    count and the diversity rule. Without internal dedup, Check 5 would
+    see two duplicate signers from the raw list and falsely
+    REFUSE_DIVERSITY for what is semantically a single-receipt set."""
+    r, bundle, storage = _make_receipt_and_storage()
+    p = _policy(
+        bundle_id=bundle.evaluator_id(),
+        n_attestations=1,
+        diversity=DiversityRules(distinct_signers=True),
+    )
+    result = evaluate_gate(
+        policy=p,
+        tier="low_consequence",
+        bundle_name="proposal_grade",
+        receipts=[r, r],
+        storage=storage,
+    )
+    assert result.outcome == GateOutcome.PASS
+
+
 def test_evaluate_gate_refuses_when_duplicate_receipts_pad_count():
     """Passing the same receipt N times must NOT satisfy an N=2
     attestation tier when diversity rules are off — the count check
@@ -907,6 +929,32 @@ def test_evaluate_gate_refuses_when_overall_is_bool():
     )
     assert result.outcome == GateOutcome.REFUSE_SCORE
     assert "not a finite numeric value" in result.detail
+
+
+def test_evaluate_gate_raises_on_unsupported_score_aggregation():
+    """Fail-closed guard: if a policy bypasses `ScoreAggregation`'s
+    Literal validation (or if v0.6 widens the type without updating the
+    executor), the gate must crash with NotImplementedError rather than
+    silently skip the score check and return PASS. Locks the contract:
+    an unrecognized aggregation is never a 'no-op' that lets bad scores
+    through.
+
+    Use `model_copy(update={...})` so the typed `tiers` dict survives —
+    `model_construct` after `model_dump` flattens nested TierPolicy
+    instances to plain dicts and breaks attribute access. `model_copy`
+    skips re-validation under pydantic v2 so the Literal violation
+    actually reaches the executor."""
+    r, bundle, storage = _make_receipt_and_storage()
+    p = _policy(bundle_id=bundle.evaluator_id())
+    bad_policy = p.model_copy(update={"score_aggregation": "median"})
+    with pytest.raises(NotImplementedError, match="unsupported score_aggregation"):
+        evaluate_gate(
+            policy=bad_policy,
+            tier="low_consequence",
+            bundle_name="proposal_grade",
+            receipts=[r],
+            storage=storage,
+        )
 
 
 def test_evaluate_gate_passes_when_overall_equals_threshold():
