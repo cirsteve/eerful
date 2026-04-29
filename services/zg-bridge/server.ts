@@ -246,28 +246,48 @@ app.post('/admin/acknowledge', async (req: Request, res: Response) => {
 // safer than Math.floor(amount * 1e18) which can quietly lose lower
 // digits for non-power-of-two fractions.
 
-function parseAmount0g(raw: unknown): bigint | null {
-  if (raw === undefined || raw === null) return null;
+// Result type lets us tell the caller "that was malformed input" vs
+// "no amount was supplied" — different error messages downstream.
+type ParseAmount0gResult = { value: bigint | null; error: string | null };
+
+function parseAmount0g(raw: unknown): ParseAmount0gResult {
+  if (raw === undefined || raw === null) {
+    return { value: null, error: null };
+  }
   let s: string;
   if (typeof raw === 'string') {
     s = raw.trim();
   } else if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
     s = raw.toString();
+    // JS stringifies very small numbers in scientific notation
+    // (`(1e-7).toString() === "1e-7"`), and `ethers.parseUnits` does
+    // not accept exponent form. Reject explicitly with a 400-friendly
+    // message rather than silently failing as malformed input.
+    if (/[eE]/.test(s)) {
+      return {
+        value: null,
+        error:
+          "scientific-notation numeric inputs (e.g. 1e-7) are not supported; pass amount_0g as a decimal string",
+      };
+    }
   } else {
-    return null;
+    return { value: null, error: null };
   }
-  if (!s) return null;
+  if (!s) return { value: null, error: null };
   try {
     const out = ethers.parseUnits(s, 18);
-    return out > 0n ? out : null;
+    if (out <= 0n) return { value: null, error: null };
+    return { value: out, error: null };
   } catch {
-    return null;
+    return { value: null, error: null };
   }
 }
 
 // Format a bigint neuron value as a human-readable 0G decimal string.
-// Avoids the precision loss of `Number(bigint) / 1e18` for balances
-// above 2^53-1 wei (~9.007 0G).
+// Avoids the precision loss of `Number(bigint) / 1e18` — JS Number is
+// IEEE-754 double and can only represent integers exactly up to
+// 2^53-1 wei, which at 1e18 wei/0G is ~0.009007 0G. Any ledger balance
+// above that decimal threshold round-trips lossily through Number().
 function neuronToA0gString(neuron: bigint): string {
   return ethers.formatUnits(neuron, 18);
 }
@@ -340,22 +360,27 @@ app.post('/admin/refund-ledger', async (req: Request, res: Response) => {
   // bigint conversion). We accept string OR number to give callers a
   // safe path; for SDK invocation we hand it the parsed bigint then
   // round back to its preferred shape via formatUnits.
-  const amount_neuron = parseAmount0g(req.body?.amount_0g);
-  if (amount_neuron === null) {
+  const parsed = parseAmount0g(req.body?.amount_0g);
+  if (parsed.error !== null) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+  if (parsed.value === null) {
     res.status(400).json({
       error: "missing or invalid 'amount_0g' (positive decimal string or number)",
     });
     return;
   }
+  const amount_neuron = parsed.value;
   const amount_0g_str = neuronToA0gString(amount_neuron);
   // SDK signature: `refund(balance: number)` — JS number is the only
   // shape the SDK accepts, and `Number(amount_0g_str)` reintroduces
-  // IEEE-754 drift for amounts that aren't exactly representable
-  // (>2^53 wei or fractional values that can't round-trip cleanly).
-  // Round-trip the JS number back through parseUnits and refuse the
-  // request on any drift, so we fail closed rather than refunding the
-  // wrong neuron amount. Demo refunds (~1 0G) round-trip exactly;
-  // larger refunds need the caller to choose a representable amount.
+  // IEEE-754 drift for any amount whose decimal representation isn't
+  // exactly representable as a double. The threshold is *not* 9 0G:
+  // JS Number is exact up to 2^53-1 wei (~0.009 0G), so essentially
+  // any non-trivial refund could drift. Round-trip the JS number back
+  // through parseUnits and refuse the request on any mismatch, so we
+  // fail closed rather than refunding the wrong neuron amount.
   const amount_0g_num = Number(amount_0g_str);
   let round_tripped: bigint;
   try {
@@ -409,13 +434,18 @@ app.post('/admin/transfer-fund', async (req: Request, res: Response) => {
   // for decimal-safe string→bigint conversion — avoids the
   // Math.floor(amount * 1e18) IEEE-754 drift that could otherwise
   // produce off-by-some-wei lock balances.
-  const balance_neuron = parseAmount0g(req.body?.amount_0g);
-  if (balance_neuron === null) {
+  const parsed = parseAmount0g(req.body?.amount_0g);
+  if (parsed.error !== null) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+  if (parsed.value === null) {
     res.status(400).json({
       error: "missing or invalid 'amount_0g' (positive decimal string or number)",
     });
     return;
   }
+  const balance_neuron = parsed.value;
   try {
     const b = await getBroker();
     await b.ledger.transferFund(provider_address, 'inference', balance_neuron);

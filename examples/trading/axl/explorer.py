@@ -235,6 +235,16 @@ def explore_and_refine(
                 refiner_peer_id[:_PREFIX],
             )
             continue
+        # Even when the sender prefix matches, the JSON body could
+        # decode to a list/string/number (malformed sender or genuine
+        # bug on the other side). `.get()` would raise AttributeError;
+        # skip and keep waiting for a properly-shaped envelope.
+        if not isinstance(candidate, dict):
+            log.warning(
+                "ignoring malformed envelope from refiner: expected object, got %s",
+                type(candidate).__name__,
+            )
+            continue
         kind = candidate.get("kind")
         if kind == "OPTIMIZATION_ERROR":
             raise RuntimeError(f"refiner returned error: {candidate.get('error')}")
@@ -249,16 +259,42 @@ def explore_and_refine(
     # Validate the result payload before indexing — the AXL channel is
     # untrusted by design and a malformed envelope shouldn't crash with
     # KeyError/TypeError when an explicit RuntimeError is more legible.
-    best_params = payload.get("best_params")
-    if not isinstance(best_params, dict):
+    # We also coerce + range-check each best_params field: the refiner's
+    # PARAMS_SPACE is the contract, render_proposal does arithmetic on
+    # `long_quantile`, and a NaN/Inf would silently propagate into the
+    # final artifact otherwise.
+    raw_best = payload.get("best_params")
+    if not isinstance(raw_best, dict):
         raise RuntimeError(
-            f"invalid OPTIMIZATION_RESULT.best_params: {type(best_params).__name__}"
+            f"invalid OPTIMIZATION_RESULT.best_params: {type(raw_best).__name__}"
+        )
+    try:
+        best_params = {
+            "lookback_periods": int(raw_best["lookback_periods"]),
+            "funding_window": int(raw_best["funding_window"]),
+            "long_quantile": float(raw_best["long_quantile"]),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        raise RuntimeError(f"invalid OPTIMIZATION_RESULT.best_params: {raw_best!r}") from e
+    # Bounds match the refiner's PARAMS_SPACE in _STRATEGY_MODULE_TEMPLATE.
+    # `math.isfinite` rejects NaN/Inf that would otherwise pass the
+    # numeric range comparison via float weirdness.
+    if (
+        not (6 <= best_params["lookback_periods"] <= 84)
+        or not (1 <= best_params["funding_window"] <= 12)
+        or not math.isfinite(best_params["long_quantile"])
+        or not (0.5 <= best_params["long_quantile"] <= 0.85)
+    ):
+        raise RuntimeError(
+            f"out-of-range OPTIMIZATION_RESULT.best_params: {best_params!r}"
         )
     raw_sharpe = payload.get("sharpe")
     try:
         sharpe = float(raw_sharpe)
     except (TypeError, ValueError) as e:
         raise RuntimeError(f"invalid OPTIMIZATION_RESULT.sharpe: {raw_sharpe!r}") from e
+    if not math.isfinite(sharpe):
+        raise RuntimeError(f"non-finite OPTIMIZATION_RESULT.sharpe: {raw_sharpe!r}")
     log.info("OPTIMIZATION_RESULT — sharpe=%.3f params=%s", sharpe, best_params)
 
     # --- render final artifacts ---
