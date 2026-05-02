@@ -49,8 +49,8 @@ to execute. Defense in depth at the architectural level.
 
 ## What's in the box
 
-- **`eerful` Python package** — produces and verifies EERs per the
-  EER spec.
+- **`eerful` Python package** — produces and verifies Enhanced
+  Evaluation Receipts (EERs) per the EER spec.
 - **`eerful.policy`** — `PrincipalPolicy` schema: bundle hash
   registry + per-tier attestation requirements (N, score threshold,
   category constraints, diversity rules).
