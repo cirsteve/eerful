@@ -22,6 +22,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from toy_backtest import run_strategy  # noqa: E402
 from transport import recv_envelope, send_envelope  # noqa: E402
 
+# emit_event lives in `eerful._emit` in the source tree; on louie, the
+# deployed daemon doesn't have eerful installed (just httpx, optuna,
+# numpy, pandas — see axl/README.md). The sibling fallback handles that
+# deploy: scp `src/eerful/_emit.py` next to refiner.py and the local
+# import wins.
+try:
+    from eerful._emit import emit_event  # noqa: E402
+except ImportError:  # pragma: no cover — deploy-shape fallback
+    from _emit import emit_event  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [refiner] %(message)s")
 log = logging.getLogger(__name__)
 
@@ -77,16 +87,58 @@ def _build_objective(module_code: str, params_space: dict[str, list]):
     return objective
 
 
+_PROGRESS_EVERY = 5
+
+
+def _progress_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """Optuna `callbacks=[...]` runs this after each trial. Throttled
+    to one emit per `_PROGRESS_EVERY` trials so 20-trial sweeps don't
+    flood the SSE wire with 20 near-identical events."""
+    n = trial.number + 1
+    if n % _PROGRESS_EVERY != 0:
+        return
+    try:
+        best_value = study.best_value
+        best_params = study.best_params
+    except ValueError:
+        # First few trials may not have produced a valid value yet.
+        return
+    emit_event(
+        source="refiner",
+        kind="optuna_progress",
+        trial=n,
+        best_sharpe=float(best_value),
+        params=best_params,
+    )
+
+
 def handle_request(strategy_spec: str, module_code: str, params_space: dict, n_trials: int = 20) -> dict:
     """Run one Optuna study against the submitted strategy. Returns
     {best_params, sharpe, n_trials}. If no trial produces a positive
     Sharpe, returns the best (worst) one anyway — the demo recording
     still wants to *see* the sweep complete and ship a result."""
     log.info("starting study: %d trials, params=%s", n_trials, list(params_space.keys()))
+    emit_event(
+        source="refiner",
+        kind="optuna_started",
+        n_trials=n_trials,
+        params=list(params_space.keys()),
+    )
     study = optuna.create_study(direction="maximize")
-    study.optimize(_build_objective(module_code, params_space), n_trials=n_trials, show_progress_bar=False)
+    study.optimize(
+        _build_objective(module_code, params_space),
+        n_trials=n_trials,
+        show_progress_bar=False,
+        callbacks=[_progress_callback],
+    )
     best = study.best_trial
     log.info("study done — best sharpe=%.3f params=%s", best.value, best.params)
+    emit_event(
+        source="refiner",
+        kind="optuna_finished",
+        sharpe=float(best.value),
+        best_params=best.params,
+    )
     return {"best_params": best.params, "sharpe": float(best.value), "n_trials": n_trials}
 
 
@@ -115,6 +167,19 @@ def main() -> int:
             log.warning("ignoring envelope of kind %r from %s", payload.get("kind"), from_peer[:16])
             continue
         log.info("STRATEGY_DRAFT received from %s", from_peer[:16])
+
+        # Fresh run_id per draft so the SPA's run-boundary logic groups
+        # this request's events together (without trying to thread the
+        # explorer's run_id through the AXL envelope).
+        os.environ["EERFUL_DEMO_RUN_ID"] = "refiner-" + os.urandom(4).hex()
+        emit_event(
+            source="refiner",
+            kind="axl_recv",
+            envelope_kind="STRATEGY_DRAFT",
+            peer_id_prefix=from_peer[:16],
+            n_trials=int(payload.get("n_trials", 20)),
+        )
+
         try:
             # Clamp n_trials so a malformed/malicious caller can't pin
             # CPU. Bound matches typical single-strategy sweep budgets.
@@ -135,6 +200,12 @@ def main() -> int:
         try:
             send_envelope(dest_peer_id=from_peer, payload=response)
             log.info("response sent to %s", from_peer[:16])
+            emit_event(
+                source="refiner",
+                kind="axl_send",
+                envelope_kind=response.get("kind", "?"),
+                peer_id_prefix=from_peer[:16],
+            )
         except Exception:
             # Don't crash the daemon if a single response can't be
             # delivered (peer offline, AXL bridge restarted, etc.) —

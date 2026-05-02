@@ -123,6 +123,11 @@ scp /tmp/axl-deploy/louie/* louie:~/eerful-axl/
 # Refiner deps + code
 ssh louie "python3 -m venv ~/eerful-axl/.venv && ~/eerful-axl/.venv/bin/pip install httpx optuna numpy pandas"
 scp examples/trading/axl/{refiner.py,transport.py,toy_backtest.py} louie:~/eerful-axl/
+
+# Demo-UI emit helper (sibling fallback — refiner.py imports it when the
+# full eerful package isn't available on louie). Re-scp after any edit
+# to src/eerful/_emit.py.
+scp src/eerful/_emit.py louie:~/eerful-axl/
 ```
 
 Per run: start AXL nodes + refiner daemon + tunnel.
@@ -136,7 +141,15 @@ ssh louie "cd ~/eerful-axl && nohup ./node -config node-config.json > axl.log 2>
 # refiner only accepts STRATEGY_DRAFTs from the explorer (the daemon
 # executes submitted module code; allowlisting is the perimeter).
 # Unset → fail-open with a logged warning, fine for a first dry run.
-ssh louie "cd ~/eerful-axl && AXL_EXPLORER_PEER_ID=f8ce... nohup ./.venv/bin/python refiner.py > refiner.log 2>&1 &"
+#
+# EERFUL_DEMO_UI_URL points at otto's demo-UI sidecar so refiner-side
+# events (axl_recv, optuna_progress, axl_send) land on the same SSE
+# stream as the otto-side events. Unset → emit_event still writes to
+# louie's local NDJSON but nothing reaches the SPA.
+ssh louie "cd ~/eerful-axl && \
+    AXL_EXPLORER_PEER_ID=f8ce... \
+    EERFUL_DEMO_UI_URL=http://<otto-LAN-ip>:8088 \
+    nohup ./.venv/bin/python refiner.py > refiner.log 2>&1 &"
 
 # Tunnel from otto: localhost:9002 → gil:9002 (so agent_multi's transport.py
 # uses gil's AXL bridge as if it were local)
