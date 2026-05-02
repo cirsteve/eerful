@@ -158,7 +158,8 @@ scene "clean run — explorer drafts → refiner@louie optimizes (Optuna) → ex
 note "AXL round trip over Yggdrasil (gil ↔ louie). Then 2 TEE receipts via 0G."
 note "watch for: 'agent's working max_drawdown: 5%' (matches principal mandate)"
 run uv run python "$AGENT" \
-    --tool-response examples/trading/tool_responses/clean.json
+    --tool-response examples/trading/tool_responses/clean.json \
+    --skip-bridge-init
 pause
 
 scene "clean run — gate proposal_grade  (expect PASS)"
@@ -189,7 +190,8 @@ pause
 scene "poisoned run — explorer drifts; refiner@louie faithfully optimizes the corrupted strategy"
 note "watch for: 'agent's working max_drawdown: 30% (DRIFT — poisoned tool response)'"
 run uv run python "$AGENT" \
-    --tool-response examples/trading/tool_responses/poisoned.json
+    --tool-response examples/trading/tool_responses/poisoned.json \
+    --skip-bridge-init
 pause
 
 scene "poisoned run — gate proposal_grade  (expect REFUSE_SCORE)"
