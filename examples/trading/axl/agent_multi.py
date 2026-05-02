@@ -41,6 +41,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(TRADING_DIR))
 
 from agent import _produce_receipt, _PRINCIPAL_MANDATE_MAX_DRAWDOWN_PCT  # noqa: E402
+from eerful._emit import emit_event  # noqa: E402
 from eerful.canonical import Address  # noqa: E402
 from eerful.errors import ComputeError, TrustViolation  # noqa: E402
 from eerful.evaluator import EvaluatorBundle  # noqa: E402
@@ -140,6 +141,14 @@ def main(argv: list[str] | None = None) -> int:
     log.info("== AXL multi-agent trading demo ==")
     log.info("tool response: %s", args.tool_response.name)
     log.info("refiner peer:  %s...", args.refiner_peer[:16])
+
+    emit_event(
+        source="agent_multi",
+        kind="run_started",
+        tool_response_path=str(args.tool_response),
+        tool_response_name=args.tool_response.name,
+        refiner_peer_prefix=args.refiner_peer[:16],
+    )
 
     # ---- 1. AXL round trip: explorer → refiner → explorer ----
     artifacts = explore_and_refine(
