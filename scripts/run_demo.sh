@@ -120,6 +120,41 @@ else
     ok "  0G provider address              OK"
 fi
 
+# 5. Wallet free balance — soft warn, doesn't fail. Catches the case
+#    where someone re-introduces the missing --skip-bridge-init flag
+#    (would attempt a 1.1 0G add-ledger deposit per run) before the
+#    on-chain failure shows up mid-recording. Threshold is 0.5 0G —
+#    well above the per-call gas (~0.0003) and per-top-up cost
+#    (~0.001 + gas) so a green light here means several hours of
+#    recording without any wallet involvement.
+WALLET_BAL_0G=$(python3 - <<'PY' 2>/dev/null
+import json, urllib.request, sys
+try:
+    h = json.load(urllib.request.urlopen("http://127.0.0.1:7878/healthz", timeout=3))
+    wallet, rpc = h["wallet"], h["rpc"]
+    req = urllib.request.Request(
+        rpc,
+        data=json.dumps({"jsonrpc":"2.0","method":"eth_getBalance","params":[wallet,"latest"],"id":1}).encode(),
+        headers={"Content-Type":"application/json"},
+    )
+    r = json.load(urllib.request.urlopen(req, timeout=3))
+    print(int(r["result"], 16) / 1e18)
+except Exception as e:
+    print("?", file=sys.stderr)
+PY
+)
+if [ -z "$WALLET_BAL_0G" ] || [ "$WALLET_BAL_0G" = "?" ]; then
+    note "  wallet balance                   (couldn't read — proceeding)"
+elif awk -v b="$WALLET_BAL_0G" 'BEGIN{exit !(b < 0.5)}'; then
+    fail "  wallet balance ${WALLET_BAL_0G} 0G   LOW"
+    echo "      thin headroom for any tx-firing path (top-up, retrieve-fund,"
+    echo "      or an accidental bridge_init re-fire). Faucet at:"
+    echo "      https://faucet.0g.ai/  (your address: $(curl -sf http://127.0.0.1:7878/healthz | python3 -c 'import json,sys; print(json.load(sys.stdin)["wallet"])' 2>/dev/null))"
+    echo "      or pull funds back via /admin/retrieve-fund."
+else
+    ok "  wallet balance ${WALLET_BAL_0G} 0G   OK"
+fi
+
 if ! $PREFLIGHT_OK; then
     echo
     fail "preflight failed — fix the above and re-run."
