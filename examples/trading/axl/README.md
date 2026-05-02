@@ -144,11 +144,15 @@ ssh louie "cd ~/eerful-axl && nohup ./node -config node-config.json > axl.log 2>
 #
 # EERFUL_DEMO_UI_URL points at otto's demo-UI sidecar so refiner-side
 # events (axl_recv, optuna_progress, axl_send) land on the same SSE
-# stream as the otto-side events. Unset → emit_event still writes to
-# louie's local NDJSON but nothing reaches the SPA.
+# stream as the otto-side events. Uses Tailscale MagicDNS, so
+# `otto` resolves on every machine in the homelab. Unset →
+# emit_event still writes to louie's local NDJSON but nothing reaches
+# the SPA. The UI server on otto must be bound to 0.0.0.0 (not the
+# loopback default) for cross-machine POSTs to land:
+#   uv run uvicorn services.demo_ui.server:app --port 8088 --host 0.0.0.0
 ssh louie "cd ~/eerful-axl && \
     AXL_EXPLORER_PEER_ID=f8ce... \
-    EERFUL_DEMO_UI_URL=http://<otto-LAN-ip>:8088 \
+    EERFUL_DEMO_UI_URL=http://otto:8088 \
     nohup ./.venv/bin/python refiner.py > refiner.log 2>&1 &"
 
 # Tunnel from otto: localhost:9002 → gil:9002 (so agent_multi's transport.py
