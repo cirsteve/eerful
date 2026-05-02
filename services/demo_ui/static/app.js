@@ -135,23 +135,40 @@ function animateWire({ direction, label }) {
 }
 
 // ---------- event handlers ----------
-function clearForNewRun(evt) {
-  state.runId = evt.run_id;
+function resetState({ runIdText, runIdLive } = {}) {
+  state.runId = null;
   $("explorer-events").innerHTML = "";
   $("refiner-events").innerHTML = "";
   $("verdict-stack").innerHTML = "";
-  setStatus("explorer-status", "running", true);
-  setStatus("refiner-status", "awaiting STRATEGY_DRAFT", false);
+  setStatus("explorer-status", "idle", false);
+  setStatus("refiner-status", "idle", false);
   setStatus("gate-status", "awaiting receipts", false);
-  $("run-id").textContent = "run " + (evt.run_id || "").slice(0, 8);
-  $("run-id").classList.add("live");
-  const tr = (evt.payload || {}).tool_response_name || "";
-  $("tool-response").textContent = tr ? `tool_response: ${tr}` : "";
-  $("tool-response").className = "tool-response " + (tr.includes("poison") ? "poisoned" : "clean");
-  // Reset mandate badge
+  $("run-id").textContent = runIdText || "no run yet";
+  $("run-id").classList.toggle("live", !!runIdLive);
+  $("tool-response").textContent = "";
+  $("tool-response").className = "tool-response";
+  $("threshold").textContent = "—";
   const m = $("mandate-badge");
   m.classList.remove("drift");
   m.textContent = "mandate: 5% drawdown · 2x leverage · BTC/ETH/SOL";
+  // Hide wire dot if it's mid-animation
+  const dot = $("wire-dot");
+  if (dot) dot.classList.add("hidden");
+  const lbl = $("wire-label");
+  if (lbl) lbl.classList.remove("visible");
+}
+
+function clearForNewRun(evt) {
+  const tr = (evt.payload || {}).tool_response_name || "";
+  resetState({
+    runIdText: "run " + (evt.run_id || "").slice(0, 8),
+    runIdLive: true,
+  });
+  state.runId = evt.run_id;
+  setStatus("explorer-status", "running", true);
+  setStatus("refiner-status", "awaiting STRATEGY_DRAFT", false);
+  $("tool-response").textContent = tr ? `tool_response: ${tr}` : "";
+  $("tool-response").className = "tool-response " + (tr.includes("poison") ? "poisoned" : "clean");
 }
 
 function handleEvent(evt) {
@@ -262,8 +279,14 @@ function renderVerdict(p) {
 }
 
 // ---------- SSE ----------
+let es = null;
+
 function connect() {
-  const es = new EventSource("/events");
+  if (es) {
+    es.close();
+    es = null;
+  }
+  es = new EventSource("/events");
   es.onmessage = (e) => {
     let evt;
     try { evt = JSON.parse(e.data); } catch { return; }
@@ -276,5 +299,26 @@ function connect() {
     if (!state.runId) setStatus("explorer-status", "connected — waiting for run", false);
   };
 }
+
+// ---------- clear button ----------
+async function clearAll() {
+  const btn = $("clear-btn");
+  btn.disabled = true;
+  try {
+    await fetch("/admin/clear", { method: "POST" });
+  } catch (err) {
+    // Best-effort: even if the server clear fails, still reset the
+    // client view so the operator gets a fresh canvas.
+    console.warn("clear request failed:", err);
+  }
+  resetState();
+  // Reconnect SSE so the client picks up the truncated history (otherwise
+  // its file-position cursor would skip past the new EOF and miss the
+  // next batch of events).
+  connect();
+  btn.disabled = false;
+}
+
+document.getElementById("clear-btn").addEventListener("click", clearAll);
 
 connect();

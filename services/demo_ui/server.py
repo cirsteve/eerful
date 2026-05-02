@@ -54,6 +54,16 @@ async def post_event(request: Request) -> dict[str, str]:
     return {"ok": "true"}
 
 
+@app.post("/admin/clear")
+async def clear_events() -> dict[str, str]:
+    """Truncate the NDJSON file so a fresh SSE connection replays an
+    empty history. Used by the SPA's clear button between recording
+    takes."""
+    NDJSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    NDJSON_PATH.write_text("")
+    return {"ok": "true"}
+
+
 async def _tail_ndjson() -> AsyncIterator[str]:
     """Yield each new line as it's appended. Replays history first
     (capped to HISTORY_CAP), then tails."""
