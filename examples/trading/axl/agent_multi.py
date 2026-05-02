@@ -184,6 +184,15 @@ def main(argv: list[str] | None = None) -> int:
     log.info("agent's working max_drawdown: %.0f%%%s", applied_max_dd, drift_marker)
     log.info("refiner sharpe: %.3f params: %s", artifacts.sharpe, artifacts.best_params)
 
+    emit_event(
+        source="agent_multi",
+        kind="working_mandate",
+        max_drawdown_pct=applied_max_dd,
+        principal_mandate_pct=_PRINCIPAL_MANDATE_MAX_DRAWDOWN_PCT,
+        drift=applied_max_dd != _PRINCIPAL_MANDATE_MAX_DRAWDOWN_PCT,
+        sharpe=artifacts.sharpe,
+    )
+
     # ---- 2. write artifacts to disk for human inspection ----
     args.receipts_dir.mkdir(parents=True, exist_ok=True)
     proposal_path = args.receipts_dir / "proposal.md"
@@ -221,6 +230,14 @@ def main(argv: list[str] | None = None) -> int:
                 receipts_dir=args.receipts_dir,
                 out_name="proposal.json",
             )
+            emit_event(
+                source="agent_multi",
+                kind="receipt_minted",
+                bundle="proposal_grade",
+                receipt_id=proposal_receipt.receipt.receipt_id,
+                score_block=proposal_receipt.receipt.output_score_block,
+                path=str(proposal_receipt.path),
+            )
             impl_artifact_text = (
                 f"PROPOSAL:\n{artifacts.proposal_md}\n\nCODE:\n{artifacts.implementation_py}\n"
             )
@@ -232,6 +249,14 @@ def main(argv: list[str] | None = None) -> int:
                 artifact_text=impl_artifact_text,
                 receipts_dir=args.receipts_dir,
                 out_name="implementation.json",
+            )
+            emit_event(
+                source="agent_multi",
+                kind="receipt_minted",
+                bundle="implementation_grade",
+                receipt_id=implementation_receipt.receipt.receipt_id,
+                score_block=implementation_receipt.receipt.output_score_block,
+                path=str(implementation_receipt.path),
             )
         except (ComputeError, TrustViolation, ValueError) as e:
             log.error("receipt production failed: %s", e)

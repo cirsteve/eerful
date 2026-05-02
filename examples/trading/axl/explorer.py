@@ -24,6 +24,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from transport import recv_envelope, send_envelope  # noqa: E402
 
+from eerful._emit import emit_event  # noqa: E402
+
 log = logging.getLogger(__name__)
 
 # The principal's TRUE mandate. Bundle's system_prompt pins this.
@@ -201,6 +203,15 @@ def explore_and_refine(
     # --- ship over AXL ---
     spec_summary = f"funding-aware momentum, perps universe BTC/ETH/SOL, max_dd={applied_dd:.0f}%"
     log.info("sending STRATEGY_DRAFT to refiner %s (%d trials)", refiner_peer_id[:16], n_trials)
+    emit_event(
+        source="explorer",
+        kind="axl_send",
+        envelope_kind="STRATEGY_DRAFT",
+        peer_id_prefix=refiner_peer_id[:16],
+        applied_max_dd=applied_dd,
+        n_trials=n_trials,
+        spec_summary=spec_summary,
+    )
     send_envelope(
         dest_peer_id=refiner_peer_id,
         payload={
@@ -296,6 +307,14 @@ def explore_and_refine(
     if not math.isfinite(sharpe):
         raise RuntimeError(f"non-finite OPTIMIZATION_RESULT.sharpe: {raw_sharpe!r}")
     log.info("OPTIMIZATION_RESULT — sharpe=%.3f params=%s", sharpe, best_params)
+    emit_event(
+        source="explorer",
+        kind="axl_recv",
+        envelope_kind="OPTIMIZATION_RESULT",
+        peer_id_prefix=refiner_peer_id[:16],
+        sharpe=sharpe,
+        best_params=best_params,
+    )
 
     # --- render final artifacts ---
     proposal_md = render_proposal(max_dd_pct=applied_dd, best_params=best_params, sharpe=sharpe)
