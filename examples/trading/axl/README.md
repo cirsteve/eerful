@@ -44,12 +44,15 @@ compute network — it's not part of the AXL topology.
 - `transport.py` — thin httpx wrapper around AXL's `/send` + `/recv`.
 - `toy_backtest.py` — synthetic price data + Sharpe computation.
   Deterministic seed, no external data deps.
-- `forge_attempt.py` — compromised-agent producer. Generates a
-  fresh secp256k1 keypair locally, hand-crafts an `EnhancedReceipt`
-  signed with that key, borrows attestation pointers from a prior
-  valid receipt. Demonstrates §7.1 Step 5b (pubkey ↔ report_data
-  binding) by producing a receipt that passes Steps 1-6 individually
-  but fails Step 5b. Runs on otto.
+- `_forge.py` — shared forgery helper. Mints a single forged
+  `EnhancedReceipt` from a borrow source + bundle, signing with a
+  fresh local secp256k1 keypair. Used by both `agent_multi.py
+  --forge` (the demo's third arc) and `forge_attempt.py` (the
+  standalone utility).
+- `forge_attempt.py` — standalone one-shot forger. Forges a single
+  receipt against a specific bundle. Used for unit-test-style demos;
+  the recording's third arc prefers `agent_multi.py --forge` for
+  structural parity with the first two arcs.
 - `cached_run/` — captured logs + receipts from a known-good run, used
   as the demo recording's safety net.
 
@@ -87,43 +90,65 @@ M1, cannot be implemented under the principal's fixed mandate."*
 A single-gate architecture would have let this through. The two-gate
 architecture is what catches mandate drift.
 
-### 3. Compromised-agent run — forged receipt refuses
+### 3. Compromised-agent run — both gates refuse on forged receipts
+
+```bash
+python examples/trading/axl/agent_multi.py \
+    --tool-response examples/trading/tool_responses/clean.json \
+    --forge --skip-bridge-init
+```
+
+The first two arcs both assumed the agent itself was honest — the TEE
+call really happened, the receipts were real, the only attack was
+corrupted *input*. This arc dramatizes a different threat: an agent
+that's compromised end-to-end. **It runs the full AXL flow** — same
+explorer, same refiner, same Optuna sweep, same artifact files — but
+at the receipt-minting moment it BYPASSES the enclave, generates its
+own secp256k1 keypair locally, and signs hand-crafted high-score
+receipts with that key. Both proposal and implementation are forged
+this way. Borrow sources for the attestation pointers come from the
+most recent clean/poisoned run (whichever just ran), so Steps 2 + 4
++ 5 (compose-hash) all pass.
+
+The receipts pass Steps 1, 2, 3, 4, and 6 each — internally
+consistent (own pubkey, own signature, real borrowed attestation).
+Step 5 (compose-hash gate) reports `gating="skipped"` for these demo
+bundles since `accepted_compose_hashes` is `null`; even if declared,
+borrowing the prior receipt's attestation would satisfy any allowlist
+that authorized that receipt. **Step 5b** is what catches the
+forgery: `eerful gate` derives an EVM address from each receipt's
+`enclave_pubkey` and compares it to the address baked into the
+attestation report's `report_data`. The forger's locally generated
+keys have no such binding, so **both** gate calls refuse with
+`REFUSE_INVALID_RECEIPT`.
+
+This is the cryptographic refusal class, distinct from `REFUSE_SCORE`:
+
+- *Score-based* (poisoned arc): the LLM grader looks at a 30%
+  drawdown and flags the mandate violation. Refuses one of the two
+  receipts (proposal_grade); the implementation gate still passes
+  because the code matches the (poisoned) proposal — that's the
+  two-gate point.
+- *Cryptographic* (compromised-agent arc): the verifier looks at the
+  missing pubkey↔report_data binding. Refuses BOTH receipts because
+  every forged signer fails the same check — there's no "internally
+  consistent" hiding place from a binding refusal.
+
+Both arcs are demoed by `scripts/run_demo.sh`; together they cover
+two complementary attack classes — corrupted input and compromised
+producer.
+
+**Standalone forger** — for unit-test-style demos against a single
+specific bundle without spinning up the full AXL flow,
+`forge_attempt.py` produces a single forged receipt and exits:
 
 ```bash
 python examples/trading/axl/forge_attempt.py \
     --borrow-receipt examples/trading/receipts/proposal.json \
+    --bundle examples/trading/bundles/proposal_grade.json \
     --score 0.95 \
     --out examples/trading/receipts/forged.json
 ```
-
-The first two arcs both assumed the agent itself was honest — the TEE
-call really happened, the receipt was real, the only attack was
-corrupted *input*. This arc dramatizes a different threat: an agent
-that's compromised end-to-end and skips the TEE entirely. It
-generates its own secp256k1 keypair locally, signs a hand-crafted
-response with its own key, and borrows the prior clean run's
-attestation pointers to make the forgery plausible.
-
-Steps 1, 2, 3, 4, and 6 each pass individually — the borrowed
-attestation is real, and the signature recovers to the forger's
-claimed pubkey (internally consistent). Step 5 (compose-hash) reports
-`gating="skipped"` for these demo bundles since
-`accepted_compose_hashes` is `null`; even if it were declared,
-borrowing the prior receipt's attestation would automatically satisfy
-any allowlist that authorized that receipt. **Step 5b** is what
-catches the forgery: `eerful gate` derives an EVM address from the
-receipt's `enclave_pubkey` and compares it to the address baked into
-the attestation report's `report_data` field. The forger's locally
-generated key has no such binding — the addresses don't match, and
-the gate refuses with `REFUSE_INVALID_RECEIPT`.
-
-This is the cryptographic refusal class, distinct from `REFUSE_SCORE`.
-The poisoned arc fires the score-based gate (LLM grader looks at a
-30% drawdown and flags the criteria violation); the forged arc fires
-the cryptographic gate (verifier looks at the missing pubkey
-binding). Both are demoed by `scripts/run_demo.sh`; together they
-cover two complementary attack classes — corrupted input and
-compromised producer.
 
 ## Cat C provider note
 

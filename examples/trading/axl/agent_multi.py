@@ -40,11 +40,13 @@ TRADING_DIR = HERE.parent  # examples/trading/
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(TRADING_DIR))
 
+from _forge import forge_receipt  # noqa: E402
 from agent import _produce_receipt, _PRINCIPAL_MANDATE_MAX_DRAWDOWN_PCT  # noqa: E402
 from eerful._emit import emit_event  # noqa: E402
-from eerful.canonical import Address  # noqa: E402
+from eerful.canonical import Address, tee_signer_address_from_pubkey  # noqa: E402
 from eerful.errors import ComputeError, TrustViolation  # noqa: E402
 from eerful.evaluator import EvaluatorBundle  # noqa: E402
+from eerful.receipt import EnhancedReceipt  # noqa: E402
 from eerful.zg.bridge_init import bridge_init  # noqa: E402
 from eerful.zg.compute import ComputeClient  # noqa: E402
 from eerful.zg.storage import BridgeStorageClient  # noqa: E402
@@ -123,6 +125,33 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip ledger top-up + acknowledge (when already done)",
     )
+    parser.add_argument(
+        "--forge",
+        action="store_true",
+        help=(
+            "compromised-agent mode: run the full AXL flow normally, "
+            "but at the receipt-minting moment SKIP the TEE call and "
+            "mint forged receipts locally. The receipts pass Steps "
+            "1–4, 5 (compose-hash), and 6 individually but fail Step "
+            "5b — pubkey doesn't match the borrowed attestation's "
+            "report_data. Demonstrates the cryptographic refusal "
+            "class for the third demo arc."
+        ),
+    )
+    parser.add_argument(
+        "--forge-borrow-dir",
+        type=Path,
+        default=None,
+        help=(
+            "(only used with --forge) directory holding the prior "
+            "valid receipts the forger steals attestation+evaluator "
+            "pointers from. Reads proposal.json + implementation.json "
+            "(one borrow source per bundle being forged — each forge "
+            "needs its own bundle's evaluator pointers, otherwise the "
+            "gate refuses with REFUSE_BUNDLE_MISMATCH instead of the "
+            "Step 5b binding refusal we want). Defaults to receipts_dir."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.provider:
@@ -137,6 +166,42 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(tool_response, dict):
         print(f"tool response at {args.tool_response} must be a JSON object", file=sys.stderr)
         return 2
+
+    # ---- forge mode: pre-load the borrow sources BEFORE rendering ----
+    # The borrow sources are read first so we can fail fast (missing/
+    # invalid files) without doing the AXL round trip. It's also
+    # important to read before writing — the default borrow paths are
+    # the same paths agent_multi will overwrite when minting.
+    borrow_proposal: EnhancedReceipt | None = None
+    borrow_implementation: EnhancedReceipt | None = None
+    if args.forge:
+        borrow_dir = args.forge_borrow_dir or args.receipts_dir
+        borrow_proposal_path = borrow_dir / "proposal.json"
+        borrow_impl_path = borrow_dir / "implementation.json"
+        for borrow_path, label in (
+            (borrow_proposal_path, "proposal"),
+            (borrow_impl_path, "implementation"),
+        ):
+            if not borrow_path.exists():
+                print(
+                    f"--forge needs a {label} borrow source at {borrow_path} "
+                    "(run the clean arc first to populate it).",
+                    file=sys.stderr,
+                )
+                return 2
+        try:
+            borrow_proposal = EnhancedReceipt.model_validate_json(
+                borrow_proposal_path.read_bytes()
+            )
+            borrow_implementation = EnhancedReceipt.model_validate_json(
+                borrow_impl_path.read_bytes()
+            )
+        except OSError as e:
+            print(f"failed to read borrow receipts in {borrow_dir}: {e}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print(f"borrow receipts do not validate: {e}", file=sys.stderr)
+            return 2
 
     log.info("== AXL multi-agent trading demo ==")
     log.info("tool response: %s", args.tool_response.name)
@@ -209,6 +274,70 @@ def main(argv: list[str] | None = None) -> int:
         (args.bundles_dir / "implementation_grade.json").read_bytes()
     )
 
+    impl_artifact_text = (
+        f"PROPOSAL:\n{artifacts.proposal_md}\n\nCODE:\n{artifacts.implementation_py}\n"
+    )
+
+    if args.forge:
+        # ---- 3b. compromised-agent path: skip TEE, mint forged receipts ----
+        # The agent has gone through honest motions up to this point —
+        # explorer drafted, refiner swept, AXL traffic happened. At the
+        # receipt-minting moment, instead of calling the TEE, the
+        # compromised agent generates its own keypair locally and signs
+        # a hand-crafted high-score receipt. Each receipt steals
+        # attestation+evaluator pointers from a prior valid receipt for
+        # the same bundle — Steps 2/4/5 pass, Step 5b fails.
+        assert borrow_proposal is not None  # populated above when --forge
+        assert borrow_implementation is not None
+        log.info(
+            "FORGE mode — skipping TEE. minting forged receipts using attestation %s...",
+            borrow_proposal.attestation_report_hash[:18],
+        )
+        proposal_receipt = forge_receipt(
+            borrow=borrow_proposal,
+            bundle=proposal_bundle,
+            receipts_dir=args.receipts_dir,
+            out_name="proposal.json",
+        )
+        emit_event(
+            source="agent_multi",
+            kind="receipt_minted",
+            bundle="proposal_grade",
+            receipt_id=proposal_receipt.receipt.receipt_id,
+            score_block=proposal_receipt.receipt.output_score_block,
+            path=str(proposal_receipt.path),
+            forged=True,
+        )
+        implementation_receipt = forge_receipt(
+            borrow=borrow_implementation,
+            bundle=implementation_bundle,
+            receipts_dir=args.receipts_dir,
+            out_name="implementation.json",
+        )
+        emit_event(
+            source="agent_multi",
+            kind="receipt_minted",
+            bundle="implementation_grade",
+            receipt_id=implementation_receipt.receipt.receipt_id,
+            score_block=implementation_receipt.receipt.output_score_block,
+            path=str(implementation_receipt.path),
+            forged=True,
+        )
+        log.info(
+            "forged signer address: %s",
+            tee_signer_address_from_pubkey(proposal_receipt.receipt.enclave_pubkey),
+        )
+        log.info(
+            "borrowed attested signer: %s",
+            "(from report's report_data — won't match)",
+        )
+        log.info("proposal receipt:       %s (FORGED)", proposal_receipt.path)
+        log.info("implementation receipt: %s (FORGED)", implementation_receipt.path)
+        log.info("")
+        log.info("Next: gate each forged receipt against the principal's policy.")
+        log.info("Expect REFUSE_INVALID_RECEIPT at §7.1 Step 5b.")
+        return 0
+
     log.info("calling 0G TEE (proposal_grade + implementation_grade)")
     with ComputeClient(bridge_url=args.bridge_url) as compute, BridgeStorageClient(
         bridge_url=args.bridge_url
@@ -237,9 +366,6 @@ def main(argv: list[str] | None = None) -> int:
                 receipt_id=proposal_receipt.receipt.receipt_id,
                 score_block=proposal_receipt.receipt.output_score_block,
                 path=str(proposal_receipt.path),
-            )
-            impl_artifact_text = (
-                f"PROPOSAL:\n{artifacts.proposal_md}\n\nCODE:\n{artifacts.implementation_py}\n"
             )
             implementation_receipt = _produce_receipt(
                 compute=compute,
