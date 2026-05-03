@@ -293,6 +293,17 @@ def main(argv: list[str] | None = None) -> int:
             "FORGE mode — skipping TEE. minting forged receipts using attestation %s...",
             borrow_proposal.attestation_report_hash[:18],
         )
+        # Discrete event so the demo-UI can flag the moment of compromise
+        # *before* the forged receipt_minted events arrive — without it,
+        # the SPA's idle-vs-working transition between OPTIMIZATION_RESULT
+        # and receipt_minted is identical to the real-TEE path and the
+        # forged 0.95 scores read like a successful inference.
+        emit_event(
+            source="agent_multi",
+            kind="tee_skipped",
+            reason="forge",
+            borrowed_attestation=borrow_proposal.attestation_report_hash,
+        )
         proposal_receipt = forge_receipt(
             borrow=borrow_proposal,
             bundle=proposal_bundle,

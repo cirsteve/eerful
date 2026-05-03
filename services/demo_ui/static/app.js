@@ -16,7 +16,11 @@ function fmtTime(tsSec) {
 function appendEvent(columnId, evt) {
   const col = $(columnId);
   const row = document.createElement("div");
-  row.className = "event-row";
+  // forged receipt_minted events get a `forged` class so CSS can
+  // strike through the score and recolor the chip — without it the
+  // forged 0.95 scores read like a successful TEE call.
+  const isForged = evt.kind === "receipt_minted" && evt.payload && evt.payload.forged === true;
+  row.className = "event-row" + (isForged ? " forged" : "");
 
   const ts = document.createElement("span");
   ts.className = "event-ts";
@@ -24,8 +28,8 @@ function appendEvent(columnId, evt) {
   row.appendChild(ts);
 
   const kind = document.createElement("span");
-  kind.className = "event-kind " + kindClass(evt.kind);
-  kind.textContent = displayKind(evt);
+  kind.className = "event-kind " + kindClass(evt.kind, isForged);
+  kind.textContent = displayKind(evt, isForged);
   row.appendChild(kind);
 
   const detail = document.createElement("span");
@@ -37,18 +41,21 @@ function appendEvent(columnId, evt) {
   col.scrollTop = col.scrollHeight;
 }
 
-function kindClass(kind) {
+function kindClass(kind, isForged = false) {
   if (kind === "axl_send") return "send";
   if (kind === "axl_recv") return "recv";
   if (kind === "run_started") return "run";
-  if (kind === "receipt_minted") return "mint";
+  if (kind === "receipt_minted") return isForged ? "forge" : "mint";
+  if (kind === "tee_skipped") return "forge";
   if (kind === "optuna_progress" || kind === "optuna_started" || kind === "optuna_finished") return "optuna";
   return "";
 }
 
-function displayKind(evt) {
+function displayKind(evt, isForged = false) {
   if (evt.kind === "axl_send") return "→ " + (evt.payload.envelope_kind || "send");
   if (evt.kind === "axl_recv") return "← " + (evt.payload.envelope_kind || "recv");
+  if (evt.kind === "tee_skipped") return "TEE BYPASSED";
+  if (evt.kind === "receipt_minted" && isForged) return "FORGED";
   return evt.kind;
 }
 
@@ -179,6 +186,9 @@ function resetState({ runIdText, runIdLive } = {}) {
   if (dot) dot.classList.add("hidden");
   const lbl = $("wire-label");
   if (lbl) lbl.classList.remove("visible");
+  // Clear forge-active state from any prior compromised-agent run so
+  // the next clean run doesn't inherit red styling.
+  document.body.classList.remove("forge-active");
 }
 
 function clearForNewRun(evt) {
@@ -250,9 +260,22 @@ function handleEvent(evt) {
     }
   }
 
-  // Receipt minted → flip explorer status
+  // TEE bypass — fire when the agent skips the inference call entirely
+  // (forge mode). Comes between OPTIMIZATION_RESULT and the forged
+  // receipt_minted events; without this signal the SPA would render an
+  // ordinary "minting receipt" status and the forged 0.95 scores read
+  // like a successful TEE call.
+  if (evt.kind === "tee_skipped") {
+    setStatus("explorer-status", "TEE BYPASSED — forging locally", true);
+    document.body.classList.add("forge-active");
+  }
+
+  // Receipt minted → flip explorer status. Forged receipts get a
+  // distinct status string so the operator narration can land the
+  // "this is the lie" beat without ambiguity.
   if (evt.kind === "receipt_minted") {
-    setStatus("explorer-status", `receipt minted: ${evt.payload.bundle}`, true);
+    const forgedTag = evt.payload && evt.payload.forged ? " (FORGED)" : "";
+    setStatus("explorer-status", `receipt minted: ${evt.payload.bundle}${forgedTag}`, true);
     setStatus("gate-status", "receipt available — awaiting gate", false);
   }
 
