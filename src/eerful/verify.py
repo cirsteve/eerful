@@ -276,11 +276,12 @@ def verify_step_5_compose_hash_gating(
 
     The §8.2 category is computed either way as a diagnostic.
 
-    This function does NOT yet perform the rest of Step 5 (TDX quote chain
-    against Intel roots, NVIDIA GPU attestation, pubkey-to-receipt
-    binding); those are deferred to the dstack-verifier integration. A
-    receipt that passes the compose-hash gate has not been fully Step-5
-    verified — see this module's docstring.
+    This function performs only the compose-hash subset of Step 5. The
+    pubkey-to-`report_data` binding lives in `verify_step_5b_pubkey_binding`
+    (called from `verify_receipt` immediately after this function); the
+    remaining Step 5 work — full TDX quote chain against Intel roots and
+    NVIDIA GPU evidence verification — requires vendor services and is
+    deferred to a dedicated dstack-verifier integration.
     """
     parsed: ParsedAttestationReport = parse_attestation_report(report_bytes)
     category = categorize_compose(
