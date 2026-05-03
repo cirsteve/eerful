@@ -566,8 +566,14 @@ def test_evaluate_gate_refuses_when_storage_raises_value_error():
 
 def test_evaluate_gate_refuses_when_receipt_fails_step_5_allowlist():
     """Bundle declares allowlist not matching the report's compose →
-    Step 5 fails → REFUSE_INVALID_RECEIPT."""
-    report_bytes, _ = _build_report()
+    Step 5 fails → REFUSE_INVALID_RECEIPT.
+
+    Binds report_data to the receipt's pubkey so Step 5b passes; the
+    failure under test is specifically the allowlist mismatch."""
+    pubkey, sig = _sign_personal("ok")
+    report_bytes, _ = _build_report(
+        report_data_address=tee_signer_address_from_pubkey(pubkey),
+    )
     bundle = EvaluatorBundle(
         version="trading-critic@1.0.0",
         model_identifier="zai-org/GLM-5-FP8",
@@ -577,7 +583,6 @@ def test_evaluate_gate_refuses_when_receipt_fails_step_5_allowlist():
     storage = MockStorageClient()
     bundle_upload = storage.upload_blob(bundle.canonical_bytes())
     report_upload = storage.upload_blob(report_bytes)
-    pubkey, sig = _sign_personal("ok")
     receipt = EnhancedReceipt.build(
         created_at=CREATED,
         evaluator_id=bundle.evaluator_id(),
@@ -602,6 +607,57 @@ def test_evaluate_gate_refuses_when_receipt_fails_step_5_allowlist():
     )
     assert result.outcome == GateOutcome.REFUSE_INVALID_RECEIPT
     assert "Step 5" in result.detail
+
+
+def test_evaluate_gate_refuses_when_receipt_fails_step_5b_pubkey_binding():
+    """The compromised-agent / forged-receipt case. The receipt is
+    self-consistent (own pubkey signs own response, Step 6 would pass)
+    and the attestation is real (Step 4 fetches and parses fine), but
+    the pubkey-derived address doesn't match the attestation's
+    `report_data` — there's no enclave behind this signer.
+
+    Step 5b → VerificationError(step=5) → REFUSE_INVALID_RECEIPT.
+    This is the cryptographic refusal the §8 forgery threat model
+    relies on."""
+    # Real attestation, baked-in signer address from a different key.
+    other_signer = "0x" + "ee" * 20  # not the receipt's signer
+    report_bytes, _ = _build_report(report_data_address=other_signer)
+    bundle = EvaluatorBundle(
+        version="trading-critic@1.0.0",
+        model_identifier="zai-org/GLM-5-FP8",
+        system_prompt="rate it",
+    )
+    storage = MockStorageClient()
+    bundle_upload = storage.upload_blob(bundle.canonical_bytes())
+    report_upload = storage.upload_blob(report_bytes)
+    # Receipt's pubkey/sig pair is internally consistent — Step 6 would
+    # pass. Step 5b is what catches the forgery.
+    pubkey, sig = _sign_personal("ok")
+    receipt = EnhancedReceipt.build(
+        created_at=CREATED,
+        evaluator_id=bundle.evaluator_id(),
+        evaluator_storage_root=bundle_upload.storage_root,
+        evaluator_version=bundle.version,
+        provider_address=_PROVIDER,
+        chat_id="chat-1",
+        response_content="ok",
+        attestation_report_hash=report_upload.content_hash,
+        attestation_storage_root=report_upload.storage_root,
+        enclave_pubkey=pubkey,
+        enclave_signature=sig,
+        output_score_block={"overall": 0.95},  # high score (the lie)
+    )
+    p = _policy(bundle_id=bundle.evaluator_id())
+    result = evaluate_gate(
+        policy=p,
+        tier="low_consequence",
+        bundle_name="proposal_grade",
+        receipts=[receipt],
+        storage=storage,
+    )
+    assert result.outcome == GateOutcome.REFUSE_INVALID_RECEIPT
+    assert "report_data" in result.detail
+    assert "does not match" in result.detail
 
 
 # ---------------- evaluate_gate: REFUSE_CATEGORY ----------------

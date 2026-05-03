@@ -26,6 +26,7 @@ from eerful.verify import (
     verify_step_3_output_schema,
     verify_step_4_attestation_report,
     verify_step_5_compose_hash_gating,
+    verify_step_5b_pubkey_binding,
     verify_step_6_enclave_signature,
     verify_through_step_3,
 )
@@ -433,6 +434,89 @@ def test_step5_result_skipped_without_entry_constructs():
 
 
 # ---------------- end-to-end orchestrator ----------------
+
+
+# ---------------- Step 5b ----------------
+
+
+def test_step_5b_passes_when_pubkey_matches_report_data():
+    """Happy path: receipt's pubkey-derived address equals the address
+    in the attestation's report_data field. Step 5b returns silently."""
+    report_bytes, _ = _build_report()  # default binds to _TEST_SIGNER_ADDRESS
+    r = _receipt(_bundle())  # signs with _TEST_PRIVKEY → address matches
+    verify_step_5b_pubkey_binding(r, report_bytes)
+
+
+def test_step_5b_fails_when_pubkey_mismatches_report_data():
+    """The forgery case: receipt is internally consistent (own pubkey
+    signs own response — Step 6 passes) but report_data binds a
+    different signer's address. Step 5b refuses."""
+    # Real attestation, real signer baked in.
+    report_bytes, _ = _build_report(report_data_address=_TEST_SIGNER_ADDRESS)
+    # Receipt signed with a *different* key — Step 6 will pass for this
+    # receipt in isolation (its own pubkey/sig pair is consistent), but
+    # the pubkey-derived address won't match _TEST_SIGNER_ADDRESS.
+    other_privkey = b"\x99" * 32
+    pubkey, sig = _sign_personal("hello", other_privkey)
+    r = _receipt(
+        _bundle(),
+        response_content="hello",
+        enclave_pubkey=pubkey,
+        enclave_signature=sig,
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_step_5b_pubkey_binding(r, report_bytes)
+    assert exc.value.step == 5
+    assert "does not match" in exc.value.reason
+    assert "report_data" in exc.value.reason
+
+
+def test_step_5b_fails_when_report_data_empty():
+    """Cat B/C providers may legitimately have empty report_data. Step 5b
+    treats that as a hard failure — there's nothing to bind to. Tier
+    policy can soften this later if needed; for now, the binding is
+    required whenever the report is supplied."""
+    report_bytes, _ = _build_report(report_data_address=None)  # empty rd
+    r = _receipt(_bundle())
+    with pytest.raises(VerificationError) as exc:
+        verify_step_5b_pubkey_binding(r, report_bytes)
+    assert exc.value.step == 5
+    assert "empty or unparseable" in exc.value.reason
+
+
+def test_step_5b_fails_when_pubkey_malformed():
+    """A receipt with a wrongly-sized enclave_pubkey — a length mismatch
+    surfaces as Step 5 with a legible error rather than as a raw
+    ValueError from the eth_keys derivation."""
+    report_bytes, _ = _build_report()
+    # 32 bytes (half) — bypasses pydantic's hex-string validation but
+    # fails the keccak derivation in tee_signer_address_from_pubkey.
+    r = _receipt(
+        _bundle(),
+        enclave_pubkey="0x" + "ab" * 32,
+        # Signature won't recover correctly with this pubkey, but Step 5b
+        # runs before Step 6 — we only care that the pubkey-derived
+        # address fails to compute.
+    )
+    with pytest.raises(VerificationError) as exc:
+        verify_step_5b_pubkey_binding(r, report_bytes)
+    assert exc.value.step == 5
+    assert "malformed" in exc.value.reason
+
+
+def test_verify_receipt_runs_step_5b_after_compose_hash_gate():
+    """Integration: when the orchestrator gets a report, both Step 5
+    (compose-hash) and Step 5b (pubkey binding) run. A pubkey mismatch
+    surfaces as VerificationError(step=5) through the same code path."""
+    report_bytes, _ = _build_report(
+        report_data_address="0x" + "ee" * 20,  # arbitrary, not _TEST_SIGNER_ADDRESS
+    )
+    b = _bundle()
+    r = _receipt(b)  # signs with _TEST_PRIVKEY → won't match 0xee*20
+    with pytest.raises(VerificationError) as exc:
+        verify_receipt(r, b.canonical_bytes(), report_bytes)
+    assert exc.value.step == 5
+    assert "report_data" in exc.value.reason
 
 
 # ---------------- Step 6 ----------------
