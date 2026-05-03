@@ -278,15 +278,29 @@ note "response with their own key, the math is internally consistent."
 note "Step 5b checks pubkey-derived address vs the attestation's report_data."
 note "the forger's locally-generated key isn't bound to any enclave."
 note "cryptographic refusal — different from the score-based refusal above."
+# Capture combined stdout+stderr so we can assert the refusal CLASS,
+# not just the exit code. `eerful gate` returns 1 for any REFUSE; if a
+# future bug breaks the binding check but the receipt happens to
+# refuse for some other reason (e.g. REFUSE_SCORE on a low-overall),
+# the demo would silently still appear to "work." The grep pins the
+# expected class.
 set +e
-uv run eerful gate \
+FORGE_OUT="$(uv run eerful gate \
     --policy "$POLICY" --tier "$TIER" \
     --bundle proposal_grade \
-    --receipt examples/trading/receipts/forged.json
+    --receipt examples/trading/receipts/forged.json 2>&1)"
 FORGE_RC=$?
 set -e
+printf '%s\n' "$FORGE_OUT"
 case "$FORGE_RC" in
-    1) ok "${BOLD}forged receipt REFUSED as expected (REFUSE_INVALID_RECEIPT, Step 5b).${RESET}" ;;
+    1)
+        if grep -q 'refuse_invalid_receipt' <<<"$FORGE_OUT"; then
+            ok "${BOLD}forged receipt REFUSED as expected (REFUSE_INVALID_RECEIPT, Step 5b).${RESET}"
+        else
+            fail "UNEXPECTED REFUSE CLASS — expected REFUSE_INVALID_RECEIPT for forged receipt."
+            exit 1
+        fi
+        ;;
     0) fail "UNEXPECTED PASS — forged receipt should have refused at Step 5b."; exit 1 ;;
     *) fail "wiring error (exit $FORGE_RC) — check policy/receipt paths."; exit "$FORGE_RC" ;;
 esac

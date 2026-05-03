@@ -104,12 +104,16 @@ generates its own secp256k1 keypair locally, signs a hand-crafted
 response with its own key, and borrows the prior clean run's
 attestation pointers to make the forgery plausible.
 
-Steps 1, 2, 3, 4, 5 (compose-hash), and 6 each pass individually —
-the borrowed attestation is real, the signature recovers to the
-forger's claimed pubkey, internally consistent. **Step 5b** is what
-catches it: `eerful gate` derives an EVM address from the receipt's
-`enclave_pubkey` and compares it to the address baked into the
-attestation report's `report_data` field. The forger's locally
+Steps 1, 2, 3, 4, and 6 each pass individually — the borrowed
+attestation is real, and the signature recovers to the forger's
+claimed pubkey (internally consistent). Step 5 (compose-hash) reports
+`gating="skipped"` for these demo bundles since
+`accepted_compose_hashes` is `null`; even if it were declared,
+borrowing the prior receipt's attestation would automatically satisfy
+any allowlist that authorized that receipt. **Step 5b** is what
+catches the forgery: `eerful gate` derives an EVM address from the
+receipt's `enclave_pubkey` and compares it to the address baked into
+the attestation report's `report_data` field. The forger's locally
 generated key has no such binding — the addresses don't match, and
 the gate refuses with `REFUSE_INVALID_RECEIPT`.
 

@@ -163,8 +163,14 @@ def main(argv: list[str] | None = None) -> int:
         output_score_block=forged_score,
     )
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(forged.model_dump_json())
+    try:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(forged.model_dump_json())
+    except OSError as e:
+        # Symmetric with the read-side guard at the top of main; a
+        # readonly target dir or full disk shouldn't dump a traceback.
+        print(f"failed to write forged receipt at {args.out}: {e}", file=sys.stderr)
+        return 2
 
     # Operator narration. Goes to stderr so stdout stays clean for any
     # downstream `jq` consumer that wants to read the forged receipt
