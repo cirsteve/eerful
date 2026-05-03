@@ -255,14 +255,50 @@ run uv run eerful gate \
     --policy "$POLICY" --tier "$TIER" \
     --bundle implementation_grade \
     --receipt examples/trading/receipts/implementation.json
+pause
+
+# ─────────────────────────────────────────────────────────────────────
+# COMPROMISED-AGENT PATH (forged receipt)
+# ─────────────────────────────────────────────────────────────────────
+scene "compromised-agent run — agent skips the TEE, signs its own receipt"
+note "the prior arcs assumed an honest TEE call. now imagine the agent itself"
+note "is compromised — it bypasses the enclave, generates its own key, and"
+note "mints a receipt claiming high scores. all locally."
+note "the forger borrows the prior clean run's attestation pointers so Steps"
+note "2/4/5 (compose-hash) all pass; only Step 5b — pubkey ↔ report_data — catches it."
+run uv run python examples/trading/axl/forge_attempt.py \
+    --borrow-receipt examples/trading/receipts/proposal.json \
+    --score 0.95 \
+    --out examples/trading/receipts/forged.json
+pause
+
+scene "compromised-agent — gate (expect REFUSE_INVALID_RECEIPT, §7.1 Step 5b)"
+note "Step 6 (signature → pubkey) passes — the forger signed their own"
+note "response with their own key, the math is internally consistent."
+note "Step 5b checks pubkey-derived address vs the attestation's report_data."
+note "the forger's locally-generated key isn't bound to any enclave."
+note "cryptographic refusal — different from the score-based refusal above."
+set +e
+uv run eerful gate \
+    --policy "$POLICY" --tier "$TIER" \
+    --bundle proposal_grade \
+    --receipt examples/trading/receipts/forged.json
+FORGE_RC=$?
+set -e
+case "$FORGE_RC" in
+    1) ok "${BOLD}forged receipt REFUSED as expected (REFUSE_INVALID_RECEIPT, Step 5b).${RESET}" ;;
+    0) fail "UNEXPECTED PASS — forged receipt should have refused at Step 5b."; exit 1 ;;
+    *) fail "wiring error (exit $FORGE_RC) — check policy/receipt paths."; exit "$FORGE_RC" ;;
+esac
 
 # ─────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────
 echo
 echo "${BOLD}${GREEN}done.${RESET}"
-echo "  clean path:    proposal PASS,   implementation PASS  → executor runs"
-echo "  poisoned path: proposal REFUSE, implementation PASS  → executor refuses"
+echo "  clean path:        proposal PASS,   implementation PASS  → executor runs"
+echo "  poisoned path:     proposal REFUSE, implementation PASS  → mandate-drift caught"
+echo "  compromised-agent: forged receipt REFUSE                 → cryptographic refusal"
 echo
-note "the executor never sees the poisoned trade. that's the rail."
+note "the executor never sees a poisoned trade or a forged receipt. that's the rail."
 note "(architecture-only N=4 high-consequence tier: \`eerful gate --tier high_consequence ...\` against any single receipt → REFUSE_INSUFFICIENT_RECEIPTS)"
