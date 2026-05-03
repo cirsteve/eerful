@@ -258,51 +258,73 @@ run uv run eerful gate \
 pause
 
 # ─────────────────────────────────────────────────────────────────────
-# COMPROMISED-AGENT PATH (forged receipt)
+# COMPROMISED-AGENT PATH (forged receipts)
 # ─────────────────────────────────────────────────────────────────────
-scene "compromised-agent run — agent skips the TEE, signs its own receipt"
+scene "compromised-agent run — full AXL flow, then agent skips the TEE"
 note "the prior arcs assumed an honest TEE call. now imagine the agent itself"
-note "is compromised — it bypasses the enclave, generates its own key, and"
-note "mints a receipt claiming high scores. all locally."
-note "the forger borrows the prior clean run's attestation pointers so Steps"
-note "2/4/5 (compose-hash) all pass; only Step 5b — pubkey ↔ report_data — catches it."
-run uv run python examples/trading/axl/forge_attempt.py \
-    --borrow-receipt examples/trading/receipts/proposal.json \
-    --score 0.95 \
-    --out examples/trading/receipts/forged.json
+note "is compromised — same explorer, same refiner, same AXL traffic — but at"
+note "the receipt-minting moment it BYPASSES the enclave, generates its own"
+note "secp256k1 key locally, and mints two forged receipts claiming high scores."
+note "watch the AXL round trip — identical to runs 1+2 — then the FORGE log line."
+run uv run python "$AGENT" \
+    --tool-response examples/trading/tool_responses/clean.json \
+    --forge \
+    --skip-bridge-init
 pause
 
-scene "compromised-agent — gate (expect REFUSE_INVALID_RECEIPT, §7.1 Step 5b)"
-note "Step 6 (signature → pubkey) passes — the forger signed their own"
-note "response with their own key, the math is internally consistent."
-note "Step 5b checks pubkey-derived address vs the attestation's report_data."
-note "the forger's locally-generated key isn't bound to any enclave."
-note "cryptographic refusal — different from the score-based refusal above."
-# Capture combined stdout+stderr so we can assert the refusal CLASS,
-# not just the exit code. `eerful gate` returns 1 for any REFUSE; if a
-# future bug breaks the binding check but the receipt happens to
-# refuse for some other reason (e.g. REFUSE_SCORE on a low-overall),
-# the demo would silently still appear to "work." The grep pins the
-# expected class.
+# Both forged receipts share the same Step 5b failure (different forged
+# signer per receipt, but both fail to match the borrowed attestation's
+# report_data signer). Gate each in turn — the rails refuse twice for
+# the same cryptographic reason.
+
+scene "compromised-agent — gate proposal_grade  (expect REFUSE_INVALID_RECEIPT, §7.1 Step 5b)"
+note "Step 6 (signature → pubkey) passes — the forger signed their own response."
+note "Step 5b binds the receipt's pubkey to the attestation's report_data."
+note "the forger's locally-generated key isn't bound to any enclave. cryptographic refusal."
 set +e
-FORGE_OUT="$(uv run eerful gate \
+FORGE_PROPOSAL_OUT="$(uv run eerful gate \
     --policy "$POLICY" --tier "$TIER" \
     --bundle proposal_grade \
-    --receipt examples/trading/receipts/forged.json 2>&1)"
-FORGE_RC=$?
+    --receipt examples/trading/receipts/proposal.json 2>&1)"
+FORGE_PROPOSAL_RC=$?
 set -e
-printf '%s\n' "$FORGE_OUT"
-case "$FORGE_RC" in
+printf '%s\n' "$FORGE_PROPOSAL_OUT"
+case "$FORGE_PROPOSAL_RC" in
     1)
-        if grep -q 'refuse_invalid_receipt' <<<"$FORGE_OUT"; then
-            ok "${BOLD}forged receipt REFUSED as expected (REFUSE_INVALID_RECEIPT, Step 5b).${RESET}"
+        if grep -q 'refuse_invalid_receipt' <<<"$FORGE_PROPOSAL_OUT"; then
+            ok "${BOLD}forged proposal REFUSED as expected (REFUSE_INVALID_RECEIPT, Step 5b).${RESET}"
         else
-            fail "UNEXPECTED REFUSE CLASS — expected REFUSE_INVALID_RECEIPT for forged receipt."
+            fail "UNEXPECTED REFUSE CLASS — expected REFUSE_INVALID_RECEIPT on proposal."
             exit 1
         fi
         ;;
-    0) fail "UNEXPECTED PASS — forged receipt should have refused at Step 5b."; exit 1 ;;
-    *) fail "wiring error (exit $FORGE_RC) — check policy/receipt paths."; exit "$FORGE_RC" ;;
+    0) fail "UNEXPECTED PASS — forged proposal should have refused at Step 5b."; exit 1 ;;
+    *) fail "wiring error (exit $FORGE_PROPOSAL_RC)."; exit "$FORGE_PROPOSAL_RC" ;;
+esac
+pause
+
+scene "compromised-agent — gate implementation_grade  (expect REFUSE_INVALID_RECEIPT, Step 5b)"
+note "different forged key per receipt; same Step 5b binding refusal."
+note "this is the cryptographic class — refuses BOTH receipts, score-based refused only one."
+set +e
+FORGE_IMPL_OUT="$(uv run eerful gate \
+    --policy "$POLICY" --tier "$TIER" \
+    --bundle implementation_grade \
+    --receipt examples/trading/receipts/implementation.json 2>&1)"
+FORGE_IMPL_RC=$?
+set -e
+printf '%s\n' "$FORGE_IMPL_OUT"
+case "$FORGE_IMPL_RC" in
+    1)
+        if grep -q 'refuse_invalid_receipt' <<<"$FORGE_IMPL_OUT"; then
+            ok "${BOLD}forged implementation REFUSED as expected (REFUSE_INVALID_RECEIPT, Step 5b).${RESET}"
+        else
+            fail "UNEXPECTED REFUSE CLASS — expected REFUSE_INVALID_RECEIPT on implementation."
+            exit 1
+        fi
+        ;;
+    0) fail "UNEXPECTED PASS — forged implementation should have refused at Step 5b."; exit 1 ;;
+    *) fail "wiring error (exit $FORGE_IMPL_RC)."; exit "$FORGE_IMPL_RC" ;;
 esac
 
 # ─────────────────────────────────────────────────────────────────────
@@ -310,9 +332,9 @@ esac
 # ─────────────────────────────────────────────────────────────────────
 echo
 echo "${BOLD}${GREEN}done.${RESET}"
-echo "  clean path:        proposal PASS,   implementation PASS  → executor runs"
-echo "  poisoned path:     proposal REFUSE, implementation PASS  → mandate-drift caught"
-echo "  compromised-agent: forged receipt REFUSE                 → cryptographic refusal"
+echo "  clean path:        proposal PASS,   implementation PASS    → executor runs"
+echo "  poisoned path:     proposal REFUSE, implementation PASS    → mandate-drift caught (score-based)"
+echo "  compromised-agent: proposal REFUSE, implementation REFUSE  → cryptographic refusal (binding)"
 echo
 note "the executor never sees a poisoned trade or a forged receipt. that's the rail."
 note "(architecture-only N=4 high-consequence tier: \`eerful gate --tier high_consequence ...\` against any single receipt → REFUSE_INSUFFICIENT_RECEIPTS)"
