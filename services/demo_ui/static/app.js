@@ -52,31 +52,54 @@ function displayKind(evt) {
   return evt.kind;
 }
 
+// Coerce any payload field to a string and escape it. Events arrive
+// over the LAN POST endpoint, so even number-shaped fields can be
+// adversarial strings; never interpolate raw payload values into the
+// innerHTML template.
+function safe(v, fallback = "—") {
+  if (v == null) return fallback;
+  return escapeHtml(String(v));
+}
+function safeNum(v, digits, fallback = "—") {
+  if (v == null || typeof v !== "number" || !Number.isFinite(v)) return fallback;
+  return v.toFixed(digits);
+}
+
 function renderDetail(evt) {
   const p = evt.payload || {};
   switch (evt.kind) {
     case "run_started":
-      return `<span class="key">tool:</span> ${escapeHtml(p.tool_response_name || "")}`;
+      return `<span class="key">tool:</span> ${safe(p.tool_response_name, "")}`;
     case "axl_send":
-      return `<span class="key">to</span> ${escapeHtml(short(p.peer_id_prefix))} · <span class="key">trials</span> <span class="num">${p.n_trials ?? "—"}</span>`;
-    case "axl_recv":
-      const sharpe = p.sharpe != null ? Number(p.sharpe).toFixed(3) : "—";
+      return `<span class="key">to</span> ${safe(short(p.peer_id_prefix))} · <span class="key">trials</span> <span class="num">${safe(p.n_trials)}</span>`;
+    case "axl_recv": {
+      // The refiner emits axl_recv for inbound STRATEGY_DRAFTs (no
+      // sharpe yet); the explorer emits it for OPTIMIZATION_RESULT
+      // (sharpe + best_params). Branch on envelope_kind so the row
+      // describes what actually arrived.
+      if (p.envelope_kind === "STRATEGY_DRAFT") {
+        return `<span class="key">from</span> ${safe(short(p.peer_id_prefix))} · <span class="key">trials</span> <span class="num">${safe(p.n_trials)}</span>`;
+      }
+      const sharpe = safeNum(p.sharpe, 3);
       return `<span class="key">sharpe</span> <span class="num">${sharpe}</span> · ${formatParams(p.best_params)}`;
-    case "working_mandate":
-      const dd = Number(p.max_drawdown_pct).toFixed(0);
+    }
+    case "working_mandate": {
+      const dd = safeNum(p.max_drawdown_pct, 0);
       return `<span class="key">working DD</span> <span class="num">${dd}%</span>${p.drift ? ' <span style="color: var(--bad);">DRIFT</span>' : ""}`;
-    case "receipt_minted":
-      const score = (p.score_block && p.score_block.overall != null)
-        ? Number(p.score_block.overall).toFixed(2) : "—";
-      return `<span class="key">${escapeHtml(p.bundle)}</span> · <span class="key">overall</span> <span class="num">${score}</span>`;
+    }
+    case "receipt_minted": {
+      const score = (p.score_block && typeof p.score_block.overall === "number")
+        ? safeNum(p.score_block.overall, 2) : "—";
+      return `<span class="key">${safe(p.bundle)}</span> · <span class="key">overall</span> <span class="num">${score}</span>`;
+    }
     case "optuna_progress":
-      return `<span class="key">trial</span> <span class="num">${p.trial}</span> · <span class="key">best sharpe</span> <span class="num">${Number(p.best_sharpe).toFixed(3)}</span>`;
+      return `<span class="key">trial</span> <span class="num">${safe(p.trial)}</span> · <span class="key">best sharpe</span> <span class="num">${safeNum(p.best_sharpe, 3)}</span>`;
     case "optuna_started":
-      return `<span class="key">trials</span> <span class="num">${p.n_trials ?? "—"}</span>`;
+      return `<span class="key">trials</span> <span class="num">${safe(p.n_trials)}</span>`;
     case "optuna_finished":
-      return `<span class="key">final sharpe</span> <span class="num">${Number(p.sharpe).toFixed(3)}</span>`;
+      return `<span class="key">final sharpe</span> <span class="num">${safeNum(p.sharpe, 3)}</span>`;
     default:
-      return `<span class="key">${escapeHtml(JSON.stringify(p))}</span>`;
+      return `<span class="key">${safe(JSON.stringify(p))}</span>`;
   }
 }
 

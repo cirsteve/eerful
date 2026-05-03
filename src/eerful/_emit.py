@@ -46,7 +46,17 @@ def emit_event(source: str, kind: str, **payload: Any) -> None:
         "kind": kind,
         "payload": payload,
     }
-    line = json.dumps(event, separators=(",", ":")) + "\n"
+
+    # Serialize defensively. `default=str` stringifies non-JSON-native
+    # values (Path, datetime, Decimal, Pydantic models) instead of
+    # raising; `allow_nan=False` rejects NaN/Infinity so the SPA's
+    # JSON.parse doesn't trip on them. Either failure case logs and
+    # drops the event — emit_event must never raise.
+    try:
+        line = json.dumps(event, separators=(",", ":"), default=str, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as e:
+        log.debug("emit_event: serialization failed: %s", e)
+        return
 
     path = Path(os.environ.get("EERFUL_DEMO_UI_NDJSON", _DEFAULT_NDJSON))
     try:

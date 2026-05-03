@@ -17,7 +17,7 @@
 
 body {
   margin: 0;
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   background: var(--bg);
   color: var(--text);
   font-size: 13px;
@@ -129,7 +129,7 @@ main {
 .event-row {
   padding: 4px 0;
   border-bottom: 1px solid rgba(31, 41, 55, 0.5);
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 .event-row:last-child { border-bottom: none; }
 .event-ts { color: var(--muted); margin-right: 6px; }
