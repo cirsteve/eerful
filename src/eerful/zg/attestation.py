@@ -26,14 +26,19 @@ scope for this module.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from eerful.canonical import Bytes32Hex, to_lower_hex
+from eerful.canonical import Address, Bytes32Hex, to_lower_hex
 from eerful.errors import VerificationError
+
+_REPORT_DATA_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 ComposeCategory = Literal["A", "B", "C", "unknown"]
 """§8.2 categorization of an attested compose, as observed by the
@@ -76,6 +81,57 @@ class ParsedAttestationReport(BaseModel):
     app_compose: dict[str, Any]
     """Parsed `app_compose`. Used only for the §8 category diagnostic; the
     cryptographic anchor is `compose_hash`, not this dict."""
+
+    report_data_address: Address | None
+    """The EVM signer address the TEE binds into the TDX quote's
+    `report_data` field, or None if the field is empty/unparseable.
+
+    0G TeeML's convention (per `research/day1_attestation_findings.md`
+    §"What does 0g-compute-cli inference verify actually check?"):
+    `report_data` is base64; decoded to 64 bytes; the first ~42 bytes
+    are an ASCII-encoded `0x...` EVM address; the rest is NUL-padded.
+    `0g-compute-cli inference verify` checks this address against the
+    on-chain `teeSignerAddress`. Spec §7.1 Step 5b uses it to bind the
+    receipt's `enclave_pubkey` to a real attested signer.
+
+    `None` when the field is empty (legitimate for non-Cat-A providers)
+    or unparseable (malformed envelope). Step 5b decides whether a
+    missing binding is fatal — this struct just reports what it found."""
+
+
+def _parse_report_data_address(raw: Any) -> Address | None:
+    """Decode the TDX quote's `report_data` field into an EVM address.
+
+    0G TeeML's broker bakes the enclave's signer address into report_data
+    as base64-encoded ASCII bytes (e.g. base64("0x83df...8cF\\x00\\x00...")).
+    Any of: missing field, non-string type, malformed base64, decoded
+    bytes that don't ASCII-decode, or content that doesn't match the
+    `0x` + 40 hex chars pattern, returns None — Step 5b interprets None
+    as "no binding available" and decides what to do with that.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    # validate=True rejects strings containing characters outside the
+    # base64 alphabet. The lax (validate=False) default silently strips
+    # them, which would let a malformed report_data — something that's
+    # not really base64 but happens to contain enough valid alphabet
+    # bytes — decode to a coincidentally address-shaped string. The
+    # existing whitespace strip also helps in case a broker version
+    # introduces trailing newlines.
+    candidate_b64 = raw.strip()
+    try:
+        decoded = base64.b64decode(candidate_b64, validate=True)
+    except (ValueError, TypeError, binascii.Error):
+        return None
+    try:
+        ascii_str = decoded.decode("ascii", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    # Strip trailing NULs (the broker NUL-pads to 64 bytes).
+    candidate = ascii_str.rstrip("\x00").strip()
+    if not _REPORT_DATA_ADDR_RE.match(candidate):
+        return None
+    return to_lower_hex(candidate)
 
 
 def _coerce_event_log(raw: Any) -> list[dict[str, Any]]:
@@ -227,10 +283,13 @@ def parse_attestation_report(report_bytes: bytes) -> ParsedAttestationReport:
             ),
         )
 
+    report_data_address = _parse_report_data_address(envelope.get("report_data"))
+
     return ParsedAttestationReport(
         compose_hash=declared_hash,
         app_compose_raw=app_compose_raw,
         app_compose=app_compose,
+        report_data_address=report_data_address,
     )
 
 

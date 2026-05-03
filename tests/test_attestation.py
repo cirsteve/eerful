@@ -21,6 +21,7 @@ def _build_report(
     compose_hash_override: str | None = None,
     event_payload_override: str | None = None,
     omit_compose_event: bool = False,
+    report_data_address: str | None = None,
 ) -> bytes:
     """Build a synthetic attestation report whose RTMR3 event log binds a
     compose-hash matching `tcb_info.compose_hash`.
@@ -29,6 +30,13 @@ def _build_report(
     provider; only the fields Step 5 reads are populated. Overrides let
     tests force mismatches between the declared hash and the event-log
     hash to exercise the cross-check.
+
+    `report_data_address` (default None → empty `report_data` field) lets
+    a test bind a specific signer address into the envelope for Step 5b's
+    pubkey-binding check. Pass the EVM address derived from a test's
+    enclave_pubkey via `tee_signer_address_from_pubkey` to make the
+    receipt and the report agree; pass a different address to exercise
+    Step 5b's mismatch failure.
     """
     if app_compose is None:
         app_compose = {
@@ -71,10 +79,21 @@ def _build_report(
         "app_compose": app_compose_raw,
     }
 
+    if report_data_address is not None:
+        import base64
+        addr_str = report_data_address.lower()
+        if not addr_str.startswith("0x"):
+            addr_str = "0x" + addr_str
+        rd_bytes = addr_str.encode("ascii")
+        rd_padded = rd_bytes + b"\x00" * (64 - len(rd_bytes))
+        report_data = base64.b64encode(rd_padded).decode()
+    else:
+        report_data = ""
+
     envelope = {
         "quote": "00" * 16,
         "event_log": json.dumps(event_log),
-        "report_data": "",
+        "report_data": report_data,
         "vm_config": "{}",
         "tcb_info": json.dumps(tcb_info),
         "nvidia_payload": {},

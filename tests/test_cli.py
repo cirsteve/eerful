@@ -13,6 +13,7 @@ in test_verify.py. This file focuses on:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -25,6 +26,7 @@ import pytest
 from eth_keys import keys
 from eth_utils import keccak
 
+from eerful.canonical import tee_signer_address_from_pubkey
 from eerful.cli import _is_loopback_bridge_url, _publish_evaluator, main
 from eerful.errors import StorageError, TrustViolation
 from eerful.evaluator import ComposeHashEntry, EvaluatorBundle
@@ -353,8 +355,17 @@ def _sign_personal(text: str) -> tuple[str, str]:
     return "0x" + pk.public_key.to_bytes().hex(), "0x" + sig.to_bytes().hex()
 
 
-def _build_report_bytes(compose_str: str = "model=zai-org/GLM-5-FP8") -> tuple[bytes, str]:
-    """Build a minimal attestation report and return (bytes, compose_hash)."""
+def _build_report_bytes(
+    compose_str: str = "model=zai-org/GLM-5-FP8",
+    *,
+    report_data_address: str | None = None,
+) -> tuple[bytes, str]:
+    """Build a minimal attestation report and return (bytes, compose_hash).
+
+    `report_data_address` controls Step 5b's pubkey-binding check.
+    Default (None) → empty report_data; pass the address derived from
+    a receipt's pubkey to make Step 5b pass.
+    """
     app_compose = {
         "docker_compose_file": (
             "services:\n  vllm:\n    image: vllm/vllm-openai:nightly\n"
@@ -377,10 +388,18 @@ def _build_report_bytes(compose_str: str = "model=zai-org/GLM-5-FP8") -> tuple[b
         "event_log": event_log,
         "app_compose": raw,
     }
+    if report_data_address is not None:
+        addr = report_data_address.lower()
+        if not addr.startswith("0x"):
+            addr = "0x" + addr
+        rd_bytes = addr.encode("ascii") + b"\x00" * (64 - len(addr))
+        report_data = base64.b64encode(rd_bytes).decode()
+    else:
+        report_data = ""
     envelope = {
         "quote": "00",
         "event_log": json.dumps(event_log),
-        "report_data": "",
+        "report_data": report_data,
         "vm_config": "{}",
         "tcb_info": json.dumps(tcb),
         "nvidia_payload": {},
@@ -413,10 +432,11 @@ def _make_receipt_and_artifacts(
         ]
     bundle = EvaluatorBundle(**bundle_kwargs)
     bundle_canonical = bundle.canonical_bytes()
-    report_bytes, _ = _build_report_bytes()
-    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
-
     pubkey, sig = _sign_personal("hello")
+    report_bytes, _ = _build_report_bytes(
+        report_data_address=tee_signer_address_from_pubkey(pubkey),
+    )
+    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
     receipt = EnhancedReceipt.build(
         created_at=datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc),
         evaluator_id=bundle.evaluator_id(),
@@ -776,9 +796,11 @@ def _make_gate_artifacts(
         system_prompt="rate it",
         accepted_compose_hashes=accepted_compose_hashes,
     )
-    report_bytes, _ = _build_report_bytes()
-    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
     pubkey, sig = _sign_personal("hello")
+    report_bytes, _ = _build_report_bytes(
+        report_data_address=tee_signer_address_from_pubkey(pubkey),
+    )
+    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
     score = output_score_block if output_score_block is not None else {"overall": 0.8}
     receipt = EnhancedReceipt.build(
         created_at=datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
@@ -1109,12 +1131,6 @@ def test_gate_passes_with_n2_distinct_signers(
         model_identifier="zai-org/GLM-5-FP8",
         system_prompt="rate it",
     )
-    report_bytes, _ = _build_report_bytes()
-    rh = "0x" + hashlib.sha256(report_bytes).hexdigest()
-    storage = MockStorageClient()
-    storage.upload_blob(bundle.canonical_bytes())
-    storage.upload_blob(report_bytes)
-
     response_content = "hello"
     pk_a = keys.PrivateKey(b"\x42" * 32)
     pk_b = keys.PrivateKey(b"\x77" * 32)
@@ -1127,6 +1143,22 @@ def test_gate_passes_with_n2_distinct_signers(
     sig_a = "0x" + pk_a.sign_msg_hash(msg_hash).to_bytes().hex()
     sig_b = "0x" + pk_b.sign_msg_hash(msg_hash).to_bytes().hex()
 
+    # Distinct signers → distinct enclaves → distinct attestation reports.
+    report_a, _ = _build_report_bytes(
+        "model=zai-org/GLM-5-FP8",
+        report_data_address=tee_signer_address_from_pubkey(pubkey_a),
+    )
+    report_b, _ = _build_report_bytes(
+        "model=zai-org/GLM-5-FP8-other",
+        report_data_address=tee_signer_address_from_pubkey(pubkey_b),
+    )
+    rh_a = "0x" + hashlib.sha256(report_a).hexdigest()
+    rh_b = "0x" + hashlib.sha256(report_b).hexdigest()
+    storage = MockStorageClient()
+    storage.upload_blob(bundle.canonical_bytes())
+    storage.upload_blob(report_a)
+    storage.upload_blob(report_b)
+
     common: dict[str, Any] = dict(
         created_at=datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc),
         evaluator_id=bundle.evaluator_id(),
@@ -1134,15 +1166,23 @@ def test_gate_passes_with_n2_distinct_signers(
         evaluator_version=bundle.version,
         provider_address="0x" + "b" * 40,
         response_content=response_content,
-        attestation_report_hash=rh,
-        attestation_storage_root=rh,
         output_score_block={"overall": 0.8},
     )
     r1 = EnhancedReceipt.build(
-        chat_id="chat-1", enclave_pubkey=pubkey_a, enclave_signature=sig_a, **common
+        chat_id="chat-1",
+        enclave_pubkey=pubkey_a,
+        enclave_signature=sig_a,
+        attestation_report_hash=rh_a,
+        attestation_storage_root=rh_a,
+        **common,
     )
     r2 = EnhancedReceipt.build(
-        chat_id="chat-2", enclave_pubkey=pubkey_b, enclave_signature=sig_b, **common
+        chat_id="chat-2",
+        enclave_pubkey=pubkey_b,
+        enclave_signature=sig_b,
+        attestation_report_hash=rh_b,
+        attestation_storage_root=rh_b,
+        **common,
     )
     r1_path = tmp_path / "r1.json"
     r2_path = tmp_path / "r2.json"

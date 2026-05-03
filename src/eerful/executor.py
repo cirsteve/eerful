@@ -35,9 +35,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence
 
-from eth_keys import keys
-
-from eerful.canonical import Address, Bytes32Hex, BytesHex, to_lower_hex
+from eerful.canonical import Bytes32Hex, tee_signer_address_from_pubkey
 from eerful.errors import PolicyError, VerificationError
 from eerful.policy import PrincipalPolicy
 from eerful.receipt import EnhancedReceipt
@@ -85,31 +83,6 @@ class GateResult:
     receipts_required: int
     detail: str
     canonical_set_hash: Bytes32Hex | None
-
-
-def tee_signer_address_from_pubkey(pubkey_hex: BytesHex) -> Address:
-    """Derive the EVM address of an enclave's signing key from its pubkey.
-
-    The 0G TeeML attestation report's `report_data` field carries the
-    EVM address of the enclave-born signing key (spec §6.7); the
-    pubkey-to-address derivation is keccak256 of the 64-byte X||Y
-    public key, last 20 bytes. `enclave_pubkey` in the receipt is
-    already in X||Y form (no SEC1 0x04 prefix), so this matches.
-
-    Used by the `distinct_signers` diversity rule. Two enclaves with
-    different signing keys produce different addresses; two on-chain
-    identities sharing one enclave (the Provider 15+16 fixture in
-    `research/day1_attestation_findings.md`) produce the same address —
-    diversity caught.
-    """
-    canonical = to_lower_hex(pubkey_hex)
-    pubkey_bytes = bytes.fromhex(canonical.removeprefix("0x"))
-    if len(pubkey_bytes) != 64:
-        raise ValueError(
-            f"enclave_pubkey must be 64 bytes (X||Y, no SEC1 prefix), got {len(pubkey_bytes)}"
-        )
-    pub = keys.PublicKey(pubkey_bytes)
-    return to_lower_hex(pub.to_canonical_address())
 
 
 def canonical_set_hash(receipts: Sequence[EnhancedReceipt]) -> Bytes32Hex:

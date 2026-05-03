@@ -84,6 +84,27 @@ this; producers and verifiers need to agree on a parser, or the
 bundle's `output_schema` needs to be tight enough that fabricated
 blocks fail Step 3).
 
+**6. Compromised agent forging its own receipt.** A producer that
+skips the TEE entirely — generating a fresh secp256k1 keypair locally,
+signing a hand-crafted `response_content` with a hand-crafted
+`output_score_block`, and pointing the receipt at any real attestation
+report — will produce a receipt whose Steps 1, 2, 3, 4, and 6 each
+pass individually. Step 6 in particular passes because the signature
+recovers to the *claimed* `enclave_pubkey` (the forger's own key,
+internally consistent). What stops this is §7.1 Step 5b: the receipt's
+`enclave_pubkey` is required to derive the EVM signer address baked
+into the attestation report's `report_data` field. The forger's
+locally-generated key has no relationship to any TEE; the binding
+fails closed and the gate refuses with `REFUSE_INVALID_RECEIPT`. This
+is the cryptographic refusal that makes the "enclave-born key" claim
+mean something in single-receipt verification — without it, the
+receipt's authenticity claim survives only at high-consequence tiers
+where `distinct_signers` brings the binding back in via the diversity
+rule. *A forged-receipt demo (`forge_attempt.py` under
+`examples/trading/axl/`) is planned as a follow-on PR; until it
+lands, `tests/test_executor.py::test_evaluate_gate_refuses_when_receipt_fails_step_5b_pubkey_binding`
+exercises the same code path.*
+
 ## What the rails do NOT defend against
 
 **1. The model loaded a different weight bundle than the
@@ -133,6 +154,9 @@ compose-hash is indistinguishable from a benign one at the EER layer.
 ## Defense composition
 
 - **Per-receipt authenticity** — EER §7.1 verification (Steps 1-6)
+- **Signer binding** — Step 5b binds `enclave_pubkey` to the
+  attestation's `report_data` so a forger can't substitute their own
+  key (refuses `REFUSE_INVALID_RECEIPT`)
 - **Compose binding** — `accepted_compose_hashes` (§6.5) gates Step 5
   on publisher-reviewed compose hashes
 - **Category enforcement** — executor's `required_categories` filters
