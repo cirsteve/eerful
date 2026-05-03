@@ -26,7 +26,6 @@ import pytest
 from eth_keys import keys
 from eth_utils import keccak
 
-from eerful.canonical import tee_signer_address_from_pubkey
 from eerful.errors import PolicyError
 from eerful.evaluator import ComposeHashEntry, EvaluatorBundle
 from eerful.executor import (

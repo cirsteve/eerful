@@ -35,13 +35,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence
 
-from eerful.canonical import (
-    Address,
-    Bytes32Hex,
-    BytesHex,
-    tee_signer_address_from_pubkey,
-    to_lower_hex,
-)
+from eerful.canonical import Bytes32Hex, tee_signer_address_from_pubkey
 from eerful.errors import PolicyError, VerificationError
 from eerful.policy import PrincipalPolicy
 from eerful.receipt import EnhancedReceipt
