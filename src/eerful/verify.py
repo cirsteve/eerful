@@ -263,6 +263,8 @@ def fetch_evaluator_bundle_bytes(
 def verify_step_5_compose_hash_gating(
     bundle: EvaluatorBundle,
     report_bytes: bytes,
+    *,
+    parsed: ParsedAttestationReport | None = None,
 ) -> Step5Result:
     """Step 5 (compose-hash subset): enforce §6.5's `accepted_compose_hashes`.
 
@@ -282,8 +284,13 @@ def verify_step_5_compose_hash_gating(
     remaining Step 5 work — full TDX quote chain against Intel roots and
     NVIDIA GPU evidence verification — requires vendor services and is
     deferred to a dedicated dstack-verifier integration.
+
+    `parsed` is an internal optimization for the orchestrator to share
+    one parse across Step 5 and Step 5b — direct callers can ignore it
+    and pass only `report_bytes`.
     """
-    parsed: ParsedAttestationReport = parse_attestation_report(report_bytes)
+    if parsed is None:
+        parsed = parse_attestation_report(report_bytes)
     category = categorize_compose(
         parsed,
         expected_model_identifier=bundle.model_identifier,
@@ -317,6 +324,8 @@ def verify_step_5_compose_hash_gating(
 def verify_step_5b_pubkey_binding(
     receipt: EnhancedReceipt,
     report_bytes: bytes,
+    *,
+    parsed: ParsedAttestationReport | None = None,
 ) -> None:
     """Step 5b: bind `receipt.enclave_pubkey` to the attestation's signer.
 
@@ -338,10 +347,16 @@ def verify_step_5b_pubkey_binding(
       - `report_data` empty or unparseable (Cat B/C providers can
         legitimately have it empty; for high-consequence gating that
         absence IS the failure — there's nothing to bind to).
-      - `enclave_pubkey` malformed (wrong length, not hex).
+      - `enclave_pubkey` malformed or off-curve (wrong length, not
+        hex, or not a valid secp256k1 point).
       - Pubkey-derived address ≠ report_data address (the forgery case).
+
+    `parsed` is an internal optimization for the orchestrator to share
+    one parse across Step 5 and Step 5b — direct callers can ignore it
+    and pass only `report_bytes`.
     """
-    parsed = parse_attestation_report(report_bytes)
+    if parsed is None:
+        parsed = parse_attestation_report(report_bytes)
     if parsed.report_data_address is None:
         raise VerificationError(
             step=5,
@@ -438,13 +453,14 @@ def verify_receipt(
     bundle = verify_through_step_3(receipt, bundle_bytes)
     step5: Step5Result | None = None
     if report_bytes is not None:
-        step5 = verify_step_5_compose_hash_gating(bundle, report_bytes)
-        # Step 5b runs alongside the compose-hash gate when the report is
-        # available — both depend on the parsed attestation. Without 5b,
-        # a forger with a self-consistent (own pubkey, own signature)
-        # receipt slips through the rest of the pipeline; 5b is the
-        # cryptographic binding to a real enclave's attested signer.
-        verify_step_5b_pubkey_binding(receipt, report_bytes)
+        # Parse once and share with both Step 5 (compose-hash gate) and
+        # Step 5b (pubkey binding). Without 5b, a forger with a
+        # self-consistent (own pubkey, own signature) receipt slips
+        # through the rest of the pipeline; 5b is the cryptographic
+        # binding to a real enclave's attested signer.
+        parsed = parse_attestation_report(report_bytes)
+        step5 = verify_step_5_compose_hash_gating(bundle, report_bytes, parsed=parsed)
+        verify_step_5b_pubkey_binding(receipt, report_bytes, parsed=parsed)
     verify_step_6_enclave_signature(receipt)
     return VerificationResult(bundle=bundle, step5=step5)
 

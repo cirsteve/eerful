@@ -27,6 +27,7 @@ scope for this module.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import re
@@ -110,9 +111,17 @@ def _parse_report_data_address(raw: Any) -> Address | None:
     """
     if not isinstance(raw, str) or not raw:
         return None
+    # validate=True rejects strings containing characters outside the
+    # base64 alphabet. The lax (validate=False) default silently strips
+    # them, which would let a malformed report_data — something that's
+    # not really base64 but happens to contain enough valid alphabet
+    # bytes — decode to a coincidentally address-shaped string. The
+    # existing whitespace strip also helps in case a broker version
+    # introduces trailing newlines.
+    candidate_b64 = raw.strip()
     try:
-        decoded = base64.b64decode(raw, validate=False)
-    except (ValueError, TypeError):
+        decoded = base64.b64decode(candidate_b64, validate=True)
+    except (ValueError, TypeError, binascii.Error):
         return None
     try:
         ascii_str = decoded.decode("ascii", errors="strict")

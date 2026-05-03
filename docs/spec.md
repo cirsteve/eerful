@@ -327,10 +327,14 @@ Fetch the attestation report from storage by `receipt.attestation_storage_root` 
 *Failure mode:* report is unavailable at the named locator, or storage returned bytes that don't hash to `receipt.attestation_report_hash`.
 
 **Step 5: Verify the attestation chain.**
-Verify the report's CPU TDX quote against Intel's published root certificates. Verify the report's GPU attestation against NVIDIA's GPU Attestation API. Confirm the hardware meets the protocol's required configuration (Intel TDX + NVIDIA H100/H200 in TEE mode). Extract the report's `compose-hash` measurement (the value extended into RTMR3 by the dstack event log, equal to `sha256(app_compose)`); if the evaluator bundle declares `accepted_compose_hashes`, the report's compose-hash MUST be in that list.
-*Failure mode:* report is forged or vendor-rejected; the hardware doesn't meet the protocol's required configuration; the attested compose-hash is not in the publisher's allowlist when one is declared.
 
-Step 5 enforces the compose-hash subset of attestation verification. The full TDX quote chain (Intel root) and NVIDIA GPU evidence verification require vendor services and are out of scope for offline receipt verification — implementations defer them to a dedicated dstack-verifier integration. What Step 5 enforces here is the §6.5 allowlist gate against `accepted_compose_hashes`; what it doesn't enforce (today) is the cryptographic chain to Intel's roots.
+*Required for full verification.* Verify the report's CPU TDX quote against Intel's published root certificates. Verify the report's GPU attestation against NVIDIA's GPU Attestation API. Confirm the hardware meets the protocol's required configuration (Intel TDX + NVIDIA H100/H200 in TEE mode).
+
+*Currently enforced by the offline verifier.* Extract the report's `compose-hash` measurement (the value extended into RTMR3 by the dstack event log, equal to `sha256(app_compose)`); if the evaluator bundle declares `accepted_compose_hashes`, the report's compose-hash MUST be in that list.
+
+*Failure mode (this verifier path):* the attested compose-hash is not in the publisher's allowlist when one is declared.
+
+The vendor-chain checks (Intel TDX root, NVIDIA GPU evidence) require online vendor services and are out of scope for offline receipt verification — implementations defer them to a dedicated dstack-verifier integration. The compose-hash gate is what's enforced inside `verify_receipt`; full hardware authenticity requires composing this verifier with a dstack-verifier service as in `0g-compute-cli inference verify`.
 
 **Step 5b: Bind enclave_pubkey to the attestation's signer.**
 Decode the attestation report's `report_data` field — base64-encoded bytes whose ASCII content is a `0x`-prefixed EVM address — into a 20-byte signer address `A_attested`. Derive `A_claimed = keccak256(receipt.enclave_pubkey)[-20:]` (the standard EVM-address derivation from a 64-byte X||Y secp256k1 pubkey). Confirm `A_claimed == A_attested`.
@@ -354,8 +358,8 @@ On success, a verifier has confirmed:
 
 - The receipt was constructed correctly (Step 1).
 - The producer was evaluated under the criteria the receipt names, and those criteria are publicly readable (Steps 2–3).
-- The response was produced inside genuine TEE hardware running an attested compose (Steps 4–5).
-- The receipt's `enclave_pubkey` is bound to a signer address baked into that TEE's attestation (Step 5b).
+- The attestation report referenced by the receipt is content-bound and (when the bundle declares one) names a compose-hash in the publisher's allowlist (Steps 4–5). Full hardware-authenticity in the vendor-chain sense (Intel TDX root, NVIDIA GPU evidence) requires the dstack-verifier composition described in Step 5; the offline verifier does not assert it.
+- The receipt's `enclave_pubkey` is bound to a signer address baked into that attestation report (Step 5b).
 - The response in the receipt is the same response the TEE signed (Step 6).
 
 What verification does NOT establish:

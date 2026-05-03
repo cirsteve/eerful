@@ -15,6 +15,7 @@ import re
 from typing import Annotated, Any
 
 from eth_keys import keys
+from eth_keys.exceptions import ValidationError as EthKeysValidationError
 from pydantic import BeforeValidator
 
 
@@ -120,6 +121,11 @@ def tee_signer_address_from_pubkey(pubkey_hex: BytesHex) -> Address:
     different addresses; two on-chain identities sharing one enclave
     (the Provider 15+16 fixture in `research/day1_attestation_findings.md`)
     produce the same address — diversity caught.
+
+    All "this isn't a valid secp256k1 pubkey" failure modes — wrong
+    length, off-curve, or otherwise rejected by `eth_keys.PublicKey`
+    — surface as `ValueError`. Callers wrapping into `VerificationError`
+    or `PolicyError` only need to handle one exception type.
     """
     canonical = to_lower_hex(pubkey_hex)
     pubkey_bytes = bytes.fromhex(canonical.removeprefix("0x"))
@@ -127,5 +133,11 @@ def tee_signer_address_from_pubkey(pubkey_hex: BytesHex) -> Address:
         raise ValueError(
             f"enclave_pubkey must be 64 bytes (X||Y, no SEC1 prefix), got {len(pubkey_bytes)}"
         )
-    pub = keys.PublicKey(pubkey_bytes)
+    try:
+        pub = keys.PublicKey(pubkey_bytes)
+    except EthKeysValidationError as e:
+        # Off-curve points / non-canonical encodings reach this branch.
+        # Surface as ValueError so callers don't have to know the
+        # eth_keys-specific exception type.
+        raise ValueError(f"enclave_pubkey is not a valid secp256k1 point: {e}") from e
     return to_lower_hex(pub.to_canonical_address())
