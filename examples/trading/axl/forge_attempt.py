@@ -11,9 +11,13 @@ and signs a hand-crafted receipt claiming any score it wants.
 What the rails do:
 - Step 4 (attestation fetch): passes — we point at a real attestation
   borrowed from a prior valid receipt.
-- Step 5 (compose-hash): passes when the borrowed attestation's
-  compose-hash satisfies the bundle's allowlist (it does, since the
-  borrowed receipt itself passed Step 5).
+- Step 5 (compose-hash gate): reports `gating="skipped"` for the demo
+  bundles (`proposal_grade.json` / `implementation_grade.json` set
+  `accepted_compose_hashes: null`, so §6.5 prescribes no gating). Even
+  if the bundle DID declare an allowlist, borrowing the prior
+  receipt's attestation would automatically satisfy it — that prior
+  receipt's compose-hash was, by definition, already on whatever
+  allowlist authorized it.
 - Step 6 (signature recovery): passes — the forger signed their own
   response with their own key, the math is internally consistent.
 - Step 5b (pubkey ↔ report_data binding): FAILS. The forger's locally
