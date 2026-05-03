@@ -39,7 +39,7 @@ import jsonschema
 from eth_keys.exceptions import BadSignature, ValidationError as EthKeysValidationError
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from eerful.canonical import Bytes32Hex
+from eerful.canonical import Bytes32Hex, tee_signer_address_from_pubkey
 from eerful.errors import StorageError, TrustViolation, VerificationError
 from eerful.evaluator import ComposeHashEntry, EvaluatorBundle
 from eerful.receipt import EnhancedReceipt, derive_receipt_id
@@ -313,6 +313,59 @@ def verify_step_5_compose_hash_gating(
     )
 
 
+def verify_step_5b_pubkey_binding(
+    receipt: EnhancedReceipt,
+    report_bytes: bytes,
+) -> None:
+    """Step 5b: bind `receipt.enclave_pubkey` to the attestation's signer.
+
+    Without this binding, a forger can mint a self-consistent receipt
+    (own pubkey, own signature over own response, optionally attached
+    to a real attestation report) that passes Steps 1, 2, 3, 4, 5
+    (compose-hash) and 6 individually — the signature recovers to the
+    *claimed* pubkey, but that pubkey isn't tied to any TEE.
+
+    §6.7: 0G TeeML's broker bakes the enclave's signer EVM address into
+    the TDX quote's `report_data` field. We derive the same address
+    from `receipt.enclave_pubkey` via keccak(X||Y)[-20:] and require
+    equality. This is what `0g-compute-cli inference verify` checks
+    against the on-chain `teeSignerAddress`; doing it here means the
+    receipt verifier closes the loop without a chain round-trip.
+
+    Failure modes (all surface as `VerificationError(step=5)` so the
+    gate maps them to `REFUSE_INVALID_RECEIPT`):
+      - `report_data` empty or unparseable (Cat B/C providers can
+        legitimately have it empty; for high-consequence gating that
+        absence IS the failure — there's nothing to bind to).
+      - `enclave_pubkey` malformed (wrong length, not hex).
+      - Pubkey-derived address ≠ report_data address (the forgery case).
+    """
+    parsed = parse_attestation_report(report_bytes)
+    if parsed.report_data_address is None:
+        raise VerificationError(
+            step=5,
+            reason=(
+                "attestation report_data is empty or unparseable — cannot "
+                "bind enclave_pubkey to an attested signer address"
+            ),
+        )
+    try:
+        claimed = tee_signer_address_from_pubkey(receipt.enclave_pubkey)
+    except ValueError as e:
+        raise VerificationError(
+            step=5,
+            reason=f"enclave_pubkey malformed: {e}",
+        ) from e
+    if claimed.lower() != parsed.report_data_address.lower():
+        raise VerificationError(
+            step=5,
+            reason=(
+                f"enclave_pubkey-derived address {claimed} does not match "
+                f"attestation report_data signer address {parsed.report_data_address}"
+            ),
+        )
+
+
 def verify_step_6_enclave_signature(receipt: EnhancedReceipt) -> None:
     """Step 6: enclave_signature is a valid EIP-191 personal_sign over
     response_content under enclave_pubkey.
@@ -385,6 +438,12 @@ def verify_receipt(
     step5: Step5Result | None = None
     if report_bytes is not None:
         step5 = verify_step_5_compose_hash_gating(bundle, report_bytes)
+        # Step 5b runs alongside the compose-hash gate when the report is
+        # available — both depend on the parsed attestation. Without 5b,
+        # a forger with a self-consistent (own pubkey, own signature)
+        # receipt slips through the rest of the pipeline; 5b is the
+        # cryptographic binding to a real enclave's attested signer.
+        verify_step_5b_pubkey_binding(receipt, report_bytes)
     verify_step_6_enclave_signature(receipt)
     return VerificationResult(bundle=bundle, step5=step5)
 

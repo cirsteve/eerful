@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -50,16 +51,29 @@ def _sign_personal(text: str, privkey_bytes: bytes = _TEST_PRIVKEY) -> tuple[str
     return "0x" + pk.public_key.to_bytes().hex(), "0x" + sig.to_bytes().hex()
 
 
+# The signer address derived from `_TEST_PRIVKEY` (= b"\x42" * 32) via
+# `tee_signer_address_from_pubkey`. Hard-coded so `_build_report` can
+# default `report_data` to it without re-importing eth_keys at the
+# fixture level — the value is stable as long as `_TEST_PRIVKEY` is.
+_TEST_SIGNER_ADDRESS = "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025"
+
+
 def _build_report(
     *,
     app_compose: dict[str, Any] | None = None,
     compose_hash_override: str | None = None,
+    report_data_address: str | None = _TEST_SIGNER_ADDRESS,
 ) -> tuple[bytes, str]:
     """Synthesize an attestation report; return `(bytes, compose_hash_lowercase)`.
 
     Mirrors `tests/test_attestation.py::_build_report` but exposes the
     attested compose-hash so step-5 tests can populate
     `accepted_compose_hashes` for hit/miss cases.
+
+    `report_data_address` defaults to the address derived from the
+    fixture's fixed `_TEST_PRIVKEY` so Step 5b's pubkey-binding check
+    passes alongside Step 5's compose-hash gate. Pass a different
+    address (or `None`) to force Step 5b to fail.
     """
     if app_compose is None:
         app_compose = {
@@ -86,10 +100,18 @@ def _build_report(
         "event_log": event_log,
         "app_compose": raw,
     }
+    if report_data_address is not None:
+        addr = report_data_address.lower()
+        if not addr.startswith("0x"):
+            addr = "0x" + addr
+        rd_bytes = addr.encode("ascii") + b"\x00" * (64 - len(addr))
+        report_data = base64.b64encode(rd_bytes).decode()
+    else:
+        report_data = ""
     envelope = {
         "quote": "00",
         "event_log": json.dumps(event_log),
-        "report_data": "",
+        "report_data": report_data,
         "vm_config": "{}",
         "tcb_info": json.dumps(tcb),
         "nvidia_payload": {},
