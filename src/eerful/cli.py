@@ -572,6 +572,28 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         return 2
 
     _print_gate_result(result)
+
+    from eerful._emit import emit_event
+
+    threshold = policy.tiers[args.tier].score_threshold if args.tier in policy.tiers else None
+    overall = None
+    if receipts and receipts[0].output_score_block:
+        candidate = receipts[0].output_score_block.get("overall")
+        if isinstance(candidate, (int, float)):
+            overall = float(candidate)
+    emit_event(
+        source="gate",
+        kind="gate_verdict",
+        bundle=args.bundle,
+        tier=args.tier,
+        outcome=result.outcome.value,
+        detail=result.detail,
+        receipts_supplied=result.receipts_supplied,
+        receipts_required=result.receipts_required,
+        threshold=threshold,
+        overall=overall,
+    )
+
     return 0 if result.outcome == GateOutcome.PASS else 1
 
 
