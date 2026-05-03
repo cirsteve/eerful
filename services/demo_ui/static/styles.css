@@ -147,6 +147,34 @@ main {
 .event-kind.run { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
 .event-kind.mint { background: rgba(110, 231, 183, 0.15); color: var(--accent); }
 .event-kind.optuna { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+.event-kind.forge {
+  background: rgba(239, 68, 68, 0.18);
+  color: var(--red);
+  letter-spacing: 0.08em;
+}
+/* Forged receipts: strike through the score, dim the bundle name —
+   the chip says "FORGED" but the row also has to read as "this is
+   the lie" at a glance, otherwise the high score renders identically
+   to a real one. */
+.event-row.forged .event-detail {
+  text-decoration: line-through;
+  text-decoration-color: var(--red);
+  text-decoration-thickness: 1.5px;
+  opacity: 0.7;
+}
+.event-row.forged .event-detail .num {
+  color: var(--red);
+}
+/* Global tint when forge mode is active. Subtle border on the
+   explorer card so the "compromised" framing is visible even when
+   the forged events scroll out of view. */
+body.forge-active #explorer-card {
+  border-color: var(--red);
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.3);
+}
+body.forge-active .agent-status.working {
+  color: var(--red);
+}
 .event-detail { color: var(--text); font-size: 11px; }
 .event-detail .key { color: var(--muted); }
 .event-detail .num { color: var(--info); }
