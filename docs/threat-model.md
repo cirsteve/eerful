@@ -100,10 +100,8 @@ is the cryptographic refusal that makes the "enclave-born key" claim
 mean something in single-receipt verification — without it, the
 receipt's authenticity claim survives only at high-consequence tiers
 where `distinct_signers` brings the binding back in via the diversity
-rule. *A forged-receipt demo (`forge_attempt.py` under
-`examples/trading/axl/`) is planned as a follow-on PR; until it
-lands, `tests/test_executor.py::test_evaluate_gate_refuses_when_receipt_fails_step_5b_pubkey_binding`
-exercises the same code path.*
+rule. *Demonstrated by [`examples/trading/axl/forge_attempt.py`](../examples/trading/axl/forge_attempt.py)
+— the forged-receipt path that the rails refuse on screen.*
 
 ## What the rails do NOT defend against
 
